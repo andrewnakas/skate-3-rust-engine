@@ -67,7 +67,7 @@ impl Decoder for Recorder {
         self.seen.push((context, chunk.len()));
         Ok(vec![0i16; 1])
     }
-    fn finish(&mut self) -> Result<Vec<i16>, DecodeError> {
+    fn finish_context(&mut self, _context: usize) -> Result<Vec<i16>, DecodeError> {
         self.finished = true;
         Ok(vec![0i16; 2])
     }
@@ -101,6 +101,38 @@ fn a_decoder_error_surfaces_as_decode_not_format() {
     assert!(format!("{wrapped}").contains("boom"));
     assert!(!format!("{wrapped}").contains("container"));
     let _ = Failing;
+}
+
+#[test]
+fn context_widths_pair_channels_and_leave_an_odd_one_mono() {
+    use super::context_widths;
+    // The five-channel ambience bed is the case that matters: 2 + 2 + 1 is what the hardware
+    // sets up and what each block splits into, so a flat ceil(channels/2) x 2 would claim six
+    // channels of PCM out of five channels of input.
+    assert_eq!(context_widths(1), vec![1]);
+    assert_eq!(context_widths(2), vec![2]);
+    assert_eq!(context_widths(5), vec![2, 2, 1]);
+    assert_eq!(context_widths(6), vec![2, 2, 2]);
+}
+
+#[test]
+fn contexts_interleave_by_frame_not_by_concatenation() {
+    use super::interleave_contexts;
+    // Two stereo contexts and one mono, one frame each: the result is L R  Ls Rs  C.
+    let per = vec![vec![1, 2, 11, 12], vec![3, 4, 13, 14], vec![5, 15]];
+    let out = interleave_contexts(&per, &[2, 2, 1]);
+    assert_eq!(out, vec![1, 2, 3, 4, 5, 11, 12, 13, 14, 15]);
+}
+
+#[test]
+fn a_short_context_truncates_the_stream_rather_than_padding_it() {
+    use super::interleave_contexts;
+    // Padding would invent audio; the rear channels of a five-channel bed would drift against
+    // the front ones for the rest of the stream, which is the failure that sounds plausible.
+    let per = vec![vec![1, 2, 11, 12], vec![3, 4]];
+    assert_eq!(interleave_contexts(&per, &[2, 2]), vec![1, 2, 3, 4]);
+    // A width list that disagrees with the context count is a caller bug, not a silent decode.
+    assert!(interleave_contexts(&per, &[2]).is_empty());
 }
 
 #[test]

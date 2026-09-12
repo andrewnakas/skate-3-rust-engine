@@ -48,8 +48,12 @@ pub trait Decoder {
     /// Feed one chunk of one context. Returns interleaved PCM for the samples it produced.
     fn decode_chunk(&mut self, context: usize, chunk: &[u8]) -> Result<Vec<i16>, DecodeError>;
 
-    /// Flush whatever the decoder is still holding at end of stream.
-    fn finish(&mut self) -> Result<Vec<i16>, DecodeError> {
+    /// Flush whatever the decoder is still holding for one context at end of stream.
+    ///
+    /// Per context, not per stream: a multichannel stream has one decoder instance per context
+    /// and each holds its own MDCT tail, so a single flush would drop every context but one.
+    fn finish_context(&mut self, context: usize) -> Result<Vec<i16>, DecodeError> {
+        let _ = context;
         Ok(Vec::new())
     }
 }
@@ -281,13 +285,37 @@ pub fn describe_archive(data: &[u8]) -> Result<Vec<(String, StreamInfo)>, Error>
 /// The chunk order matters and is the container's, not ours: each block splits into one chunk
 /// per decoder context, and the contexts are fed in step. Returns whatever the decoder
 /// produced, concatenated in that order.
+/// The per-context channel widths of a stream: XMA pairs channels, and an odd channel count
+/// leaves the last context mono. Five channels are 2 + 2 + 1, matching the three hardware
+/// contexts `sub_82B4FC00` sets up and the three chunks each block splits into.
+pub fn context_widths(channels: u8) -> Vec<u8> {
+    let mut w = vec![2u8; usize::from(channels / 2)];
+    if channels % 2 == 1 {
+        w.push(1);
+    }
+    w
+}
+
+/// Decode one stream to interleaved 16-bit PCM.
+///
+/// The assembly is the part worth reading. Each context is an **independent** XMA sub-stream
+/// carrying one or two channels, and its chunks arrive one per block. So a context's chunks are
+/// accumulated in order into that context's own PCM, and only at the end are the contexts
+/// interleaved into the stream's channel order. Concatenating a block's contexts as they are
+/// read would put the rear channels' first block where the front channels' second block belongs;
+/// on a stereo stream, where there is one context, the two are indistinguishable, which is
+/// exactly why this needs saying rather than testing on stereo alone.
+///
+/// Contexts are truncated to the shortest, because a stream whose contexts disagree on length
+/// has no sample-aligned interpretation and padding one would invent audio.
 pub fn decode_stream(
     data: &[u8],
     at: usize,
     decoder: &mut dyn Decoder,
 ) -> Result<Vec<i16>, Error> {
     let info = describe(data, at)?;
-    let mut pcm = Vec::new();
+    let widths = context_widths(info.channels);
+    let mut per_context: Vec<Vec<i16>> = vec![Vec::new(); info.contexts];
     for block in eaac::blocks(&data[at..])? {
         let range = block.data_range();
         let payload = &data[at + range.start..at + range.end];
@@ -298,12 +326,41 @@ pub fn decode_stream(
             let out = decoder
                 .decode_chunk(context, chunk.data)
                 .map_err(Error::Decode)?;
-            pcm.extend_from_slice(&out);
+            per_context[context].extend_from_slice(&out);
         }
     }
-    pcm.extend_from_slice(&decoder.finish().map_err(Error::Decode)?);
-    Ok(pcm)
+    for (context, pcm) in per_context.iter_mut().enumerate() {
+        let tail = decoder.finish_context(context).map_err(Error::Decode)?;
+        pcm.extend_from_slice(&tail);
+    }
+    Ok(interleave_contexts(&per_context, &widths))
 }
+
+/// Interleave per-context PCM into one stream. Each context's samples are already interleaved
+/// across its own one or two channels, so a frame of the result is every context's frame in
+/// context order.
+pub fn interleave_contexts(per_context: &[Vec<i16>], widths: &[u8]) -> Vec<i16> {
+    if per_context.is_empty() || widths.len() != per_context.len() {
+        return Vec::new();
+    }
+    let frames = per_context
+        .iter()
+        .zip(widths)
+        .map(|(pcm, &w)| if w == 0 { 0 } else { pcm.len() / usize::from(w) })
+        .min()
+        .unwrap_or(0);
+    let total: usize = widths.iter().map(|&w| usize::from(w)).sum();
+    let mut out = Vec::with_capacity(frames * total);
+    for frame in 0..frames {
+        for (pcm, &w) in per_context.iter().zip(widths) {
+            let w = usize::from(w);
+            out.extend_from_slice(&pcm[frame * w..frame * w + w]);
+        }
+    }
+    out
+}
+
+pub mod ffmpeg;
 
 #[cfg(test)]
 mod tests;
