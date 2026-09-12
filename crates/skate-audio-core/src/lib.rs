@@ -15,6 +15,9 @@
 //! DSP modules will scope `unsafe` to intrinsic calls. Nothing in this file needs it.
 
 pub mod buffers;
+pub mod counter;
+pub mod eval;
+pub mod fp;
 pub mod player;
 pub mod system;
 
@@ -103,6 +106,18 @@ impl Guest {
     pub fn set_u32(&mut self, ea: u32, value: u32) -> Result<()> {
         let (i, o) = self.locate(ea, 4)?;
         self.segments[i].bytes[o..o + 4].copy_from_slice(&value.to_be_bytes());
+        Ok(())
+    }
+
+    pub fn u16(&self, ea: u32) -> Result<u16> {
+        let (i, o) = self.locate(ea, 2)?;
+        let b = &self.segments[i].bytes;
+        Ok(u16::from_be_bytes([b[o], b[o + 1]]))
+    }
+
+    pub fn set_u16(&mut self, ea: u32, value: u16) -> Result<()> {
+        let (i, o) = self.locate(ea, 2)?;
+        self.segments[i].bytes[o..o + 2].copy_from_slice(&value.to_be_bytes());
         Ok(())
     }
 
