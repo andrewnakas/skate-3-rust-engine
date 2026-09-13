@@ -36,9 +36,42 @@ fn main() {
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or(20);
-    if std::env::var("SKATE_AUDIO_PLAY").is_err() {
+    let ambience = std::env::var("SKATE_AMBIENCE").ok();
+    if std::env::var("SKATE_AUDIO_PLAY").is_err() && ambience.is_none() {
         eprintln!("set SKATE_AUDIO_PLAY=<archive>:<entry>:<channels>:<rate>[:<blocks>]");
+        eprintln!("or  SKATE_AMBIENCE=<resident.big>:<payload.big>:<place>  to resolve a bed");
         std::process::exit(2);
+    }
+    // Resolving before the app starts keeps the check honest: a place with no bed should say so
+    // and exit, not sit through the deadline looking like a playback failure.
+    if let Some(spec) = &ambience {
+        let parts: Vec<&str> = spec.rsplitn(3, ':').collect();
+        let (resident, payload, place) = match parts.len() {
+            3 => (parts[2], parts[1], parts[0]),
+            _ => {
+                eprintln!("SKATE_AMBIENCE needs <resident.big>:<payload.big>:<place>");
+                std::process::exit(2);
+            }
+        };
+        match skate_audio::resolve_ambience(
+            std::path::Path::new(resident), std::path::Path::new(payload), place) {
+            Ok(request) => {
+                println!("ambience for {place:?}: {} in {} (looping={})",
+                         request.entry, payload, request.looping);
+                // Hand it to the plugin through the same env hook the rest of this uses.
+                unsafe {
+                    std::env::set_var(
+                        "SKATE_AUDIO_PLAY",
+                        format!("{payload}:{}:{}:{}:{}", request.entry, request.channels,
+                                request.sample_rate, 40),
+                    );
+                }
+            }
+            Err(e) => {
+                println!("no ambience for {place:?}: {e}");
+                std::process::exit(3);
+            }
+        }
     }
     if !skate_audio::decoder_available() {
         eprintln!("no decoder on PATH; set SKATE_FFMPEG");

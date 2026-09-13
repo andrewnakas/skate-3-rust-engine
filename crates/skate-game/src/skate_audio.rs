@@ -132,6 +132,8 @@ pub struct StreamRequest {
     /// Stop after this many blocks; 0 decodes the whole member.
     pub blocks: usize,
     pub volume: f32,
+    /// Ambience beds run about two minutes and are meant to run under everything, so they repeat.
+    pub looping: bool,
 }
 
 impl StreamRequest {
@@ -143,7 +145,13 @@ impl StreamRequest {
             sample_rate,
             blocks: 0,
             volume: 1.0,
+            looping: false,
         }
+    }
+
+    pub fn looping(mut self, looping: bool) -> Self {
+        self.looping = looping;
+        self
     }
 
     pub fn blocks(mut self, blocks: usize) -> Self {
@@ -161,6 +169,64 @@ impl StreamRequest {
 #[derive(Message, Clone, Debug)]
 pub struct PlayStream(pub StreamRequest);
 
+/// Ask for the ambience bed that suits a place, if the archive has one for it.
+///
+/// Resolution is by member name (`skate_data::audio::ambience`), which is a stand-in for the
+/// undecoded audio metadata, so a place with no matching district plays nothing at all rather
+/// than something plausible.
+#[derive(Message, Clone, Debug)]
+pub struct PlayAmbience {
+    /// The archive of `.snr` headers, e.g. `ambienceresident.big`.
+    pub resident: PathBuf,
+    /// The archive of `.sns` payloads, e.g. `ambience.big`.
+    pub payload: PathBuf,
+    pub place: String,
+    pub volume: f32,
+}
+
+/// Resolve a place to a bed, across the pair of archives a bed is stored in.
+///
+/// Ambience is **split in two**: `ambienceresident.big` holds one `.snr` header record per bed,
+/// and `ambience.big` holds the matching `.sns` block chain, paired by the name's stem. Reading a
+/// bed out of the resident archive alone gets a header and no audio -- the block walk then reads
+/// the next member's bytes and reports "block size 0 does not advance", which looks like a corrupt
+/// archive and is really the wrong file.
+///
+/// So the header supplies the channel count and rate, and the payload supplies the blocks.
+pub fn resolve_ambience(
+    resident: &std::path::Path,
+    payload: &std::path::Path,
+    place: &str,
+) -> Result<StreamRequest, String> {
+    let header_data = std::fs::read(resident).map_err(|e| format!("{}: {e}", resident.display()))?;
+    let described = audio::describe_archive(&header_data).map_err(|e| e.to_string())?;
+    let beds: Vec<audio::ambience::Bed> = described
+        .iter()
+        .filter_map(|(name, _)| audio::ambience::parse_bed(name))
+        .collect();
+    if beds.is_empty() {
+        return Err(format!("{} holds no named ambience beds", resident.display()));
+    }
+    let bed = audio::ambience::pick(place, &beds)
+        .ok_or_else(|| format!("no bed matches {place:?} among {} in the archive", beds.len()))?;
+    let info = described
+        .iter()
+        .find(|(name, _)| *name == bed.member)
+        .map(|(_, info)| info.clone())
+        .ok_or_else(|| format!("{} has no header", bed.member))?;
+
+    // The payload member carries the same stem with a .sns extension.
+    let stem = bed.member.strip_suffix(".snr").unwrap_or(&bed.member);
+    let entry = format!("{stem}.sns");
+    let payload_data = std::fs::read(payload).map_err(|e| format!("{}: {e}", payload.display()))?;
+    let archive = skate_audio_formats::eb::Archive::parse(&payload_data)
+        .map_err(|e| e.message.clone())?;
+    if archive.find(&entry).is_none() {
+        return Err(format!("{} has no member {entry}", payload.display()));
+    }
+    Ok(StreamRequest::new(payload, entry, info.channels, info.sample_rate).looping(true))
+}
+
 #[derive(Component)]
 struct Decoding {
     task: Task<Result<StreamPcm, String>>,
@@ -173,8 +239,9 @@ impl Plugin for SkateAudioPlugin {
     fn build(&self, app: &mut App) {
         app.add_audio_source::<StreamPcm>()
             .add_message::<PlayStream>()
+            .add_message::<PlayAmbience>()
             .add_systems(Startup, play_requested_at_startup)
-            .add_systems(Update, (start_decoding, finish_decoding));
+            .add_systems(Update, (resolve_ambience_requests, start_decoding, finish_decoding));
     }
 }
 
@@ -213,6 +280,23 @@ fn parse_spec(spec: &str) -> Result<StreamRequest, String> {
     .blocks(blocks.parse::<usize>().map_err(|e| format!("blocks: {e}"))?))
 }
 
+/// Turn a place into a stream request, or say why it could not be.
+fn resolve_ambience_requests(
+    mut asked: MessageReader<PlayAmbience>,
+    mut streams: MessageWriter<PlayStream>,
+) {
+    for ask in asked.read() {
+        match resolve_ambience(&ask.resident, &ask.payload, &ask.place) {
+            Ok(request) => {
+                info!("skate-audio: ambience for {:?}: {}", ask.place, request.entry);
+                streams.write(PlayStream(request.volume(ask.volume)));
+            }
+            // Not an error worth stopping for: a map with no bed simply has no ambience yet.
+            Err(e) => info!("skate-audio: no ambience for {:?}: {e}", ask.place),
+        }
+    }
+}
+
 fn start_decoding(mut commands: Commands, mut requests: MessageReader<PlayStream>) {
     for PlayStream(request) in requests.read() {
         let job = request.clone();
@@ -238,10 +322,12 @@ fn finish_decoding(
                 );
                 let volume = job.request.volume;
                 let handle = assets.add(pcm);
-                commands.spawn((
-                    AudioPlayer(handle),
-                    PlaybackSettings::DESPAWN.with_volume(Volume::Linear(volume)),
-                ));
+                let settings = if job.request.looping {
+                    PlaybackSettings::LOOP
+                } else {
+                    PlaybackSettings::DESPAWN
+                };
+                commands.spawn((AudioPlayer(handle), settings.with_volume(Volume::Linear(volume))));
             }
             Err(e) => warn!("skate-audio: {} entry {}: {e}", job.request.archive.display(), job.request.entry),
         }
@@ -373,6 +459,7 @@ mod tests {
         let r = StreamRequest::new("/x/ambience.big", "0", 5, 48_000);
         assert_eq!(r.blocks, 0);
         assert_eq!(r.volume, 1.0);
+        assert!(!r.looping, "a one-shot by default; only ambience repeats");
         assert_eq!(r.blocks(8).blocks, 8);
     }
 }
