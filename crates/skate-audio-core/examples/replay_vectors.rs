@@ -19,7 +19,7 @@ use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
     Guest, bitstream, buffers, contributions, counter, eval, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
     player, ring,
-    bus, interleave, layout, output, pitch, routing, voices,
+    bus, interleave, layout, meters, output, pitch, routing, voices,
     scheduler, spatial, stage, system,
 };
 
@@ -946,6 +946,30 @@ fn main() {
                 let sp = v.r1.unwrap_or(0) as u32;
                 g.put(sp.wrapping_sub(bus::MIX_FRAME_BYTES), vec![0u8; bus::MIX_FRAME_BYTES as usize]);
                 bus::mix_source(&mut g, v.r3, v.r4, v.r5, sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
+            // The meters keep their sums and peaks in 320 bytes of red zone below r1, and the tick
+            // puts its 128-byte frame above that. Every red-zone word is written before it is read.
+            "sub_82B373C8" | "sub_82B376B8" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where the meter scratch lives", v.run));
+                }
+                continue;
+            }
+            "sub_82B373C8" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(meters::METER_RED_ZONE), vec![0u8; meters::METER_RED_ZONE as usize]);
+                meters::meter_block(&mut g, v.r3, v.r4, sp)
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B376B8" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                let depth = meters::TICK_FRAME + meters::METER_RED_ZONE;
+                g.put(sp.wrapping_sub(depth), vec![0u8; depth as usize]);
+                meters::meter_tick(&mut g, u64::from(v.r3), v.r4, sp)
                     .map(|r| Some(r as u32))
                     .map_err(|e| e.to_string())
             }

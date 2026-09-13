@@ -44,9 +44,10 @@ than at a misunderstanding of the engine.
 | `filters.rs` | `sub_82B27E20`, `sub_82B26568`, `sub_82B26740`, `sub_82B43D78`, `sub_82B2C658`: the per-channel low-pass and high-pass stages, the per-source high shelf and its coefficient builder, and the peaking equaliser | **4,152 replayed** (576 + 576 + 2,996 + 4), given the ported sine and cosine; the peaking equaliser is **unit-tested only** — its recording session lost its display and never reached gameplay |
 | `bus.rs` | `sub_82B31838` and `sub_82B305C0`: one source's channels into an object's bus blocks — a downmix ramp for modes 1 and 3 or a moved gain, otherwise the routing row mixed flat, then each channel's gain published — and a descriptor's channels into consecutive 1 KB runs, ramped or scaled by mode, keeping each source's last sample. Composes `routing::downmix` and both `dsp` accumulators | unit-tested against direct calls to what they compose, recording pending |
 | `layout.rs` | `sub_82B370E8`: three parameter blocks expanded into the six slots of a speaker layout, `{sentinel, value}` each, group 0 square-rooted | unit-tested, recording pending |
+| `meters.rs` | `sub_82B373C8` and `sub_82B376B8`: per-channel mean-square and peak meters over one quarter of each block — four accumulators fed the same vector, so the sum is four times the squares, as the original computes it — kept in ring histories; and the tick that re-sizes the rings when the rate moves, then runs the meters and the layout expansion | unit-tested, recording pending |
 | `mem.rs` | the write-set contract of `sub_82EDF460` (memcpy) and `sub_82EE5E80` (memset), which six of the bodies above call | not a port; see its module note |
 
-`cargo test` runs 550 unit tests. **Read the next two sections before reading that as one number:
+`cargo test` runs 557 unit tests. **Read the next two sections before reading that as one number:
 the modules are checked in different ways, and only the ones whose table row gives a replay figure
 have one.**
 

@@ -119,6 +119,10 @@ pub mod bus;
 #[cfg(target_arch = "x86_64")]
 pub mod layout;
 
+/// Per-channel mean-square and peak meters over ring histories, and the tick that runs them.
+#[cfg(target_arch = "x86_64")]
+pub mod meters;
+
 /// A voice's pitch ratio and fractional position, single-rounded float work under the flush mode.
 #[cfg(target_arch = "x86_64")]
 pub mod pitch;
