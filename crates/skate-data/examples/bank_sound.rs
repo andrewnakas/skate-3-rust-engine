@@ -35,7 +35,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(bytes) = data.get(entry.range()) else { continue };
         let Ok(abk) = banks::Abk::parse(bytes) else { continue };
         banks_seen += 1;
-        for i in 0..abk.samples.len() {
+        // Only the used prefix of the slot table. The rest hold 0xFFFFFFFF, and counting those
+        // as samples is what made 89,431 slots look like 89,431 sounds of which 94% failed.
+        for i in 0..abk.present() {
             let Some(range) = abk.sample_range(i) else { continue };
             samples_total += 1;
             // A sample is a stream only if its header parses. Anything else is reported, not
@@ -60,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("{banks_seen} banks, {samples_total} samples");
+    println!("{banks_seen} banks, {samples_total} samples in used slots");
     println!("{parsed_as_stream} parsed as EA Audio Core streams");
     if let Some(f) = &first_failure {
         println!("first sample that did not: {f}");

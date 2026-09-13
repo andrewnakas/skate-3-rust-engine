@@ -135,13 +135,33 @@ impl Abk {
         })
     }
 
-    /// Byte range of one sample within the whole bank, or `None` past the end of the
-    /// table. The last sample runs to the end of the sample-bank section.
+    /// An unused slot in the sample table.
+    ///
+    /// Measured across all 376 banks: 89,431 slots hold 5,168 real offsets and 84,263 of this
+    /// value, and **no real offset ever appears after one** — so the table is a fixed-capacity
+    /// array with a used prefix, not a sparse map with holes. Adding this to the section base
+    /// overflows past 4 GB, which is how it was found: a sample range built from it addressed
+    /// `0x10000c17f` and looked like a corrupt bank.
+    pub const SAMPLE_ABSENT: u32 = 0xFFFF_FFFF;
+
+    /// How many slots hold a real sample. Equal to the index of the first absent slot.
+    pub fn present(&self) -> usize {
+        self.samples.iter().take_while(|&&o| o != Self::SAMPLE_ABSENT).count()
+    }
+
+    /// Byte range of one sample within the whole bank, or `None` for an index past the table or
+    /// for an unused slot. The last real sample runs to the end of the sample-bank section.
     pub fn sample_range(&self, i: usize) -> Option<std::ops::Range<usize>> {
-        let start = self.sample_bank_offset + *self.samples.get(i)? as usize;
+        let offset = *self.samples.get(i)?;
+        if offset == Self::SAMPLE_ABSENT {
+            return None;
+        }
+        let start = self.sample_bank_offset + offset as usize;
         let end = match self.samples.get(i + 1) {
-            Some(next) => self.sample_bank_offset + *next as usize,
-            None => self.sample_bank_offset + self.sample_bank_size as usize,
+            // An absent next slot means this is the last real sample, so it runs to the end of
+            // the section. Using the sentinel as an end would give a ~4 GB range.
+            Some(&next) if next != Self::SAMPLE_ABSENT => self.sample_bank_offset + next as usize,
+            _ => self.sample_bank_offset + self.sample_bank_size as usize,
         };
         Some(start..end)
     }
@@ -432,6 +452,29 @@ impl Bnk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_absent_slot_has_no_range_and_does_not_end_the_one_before_it() {
+        // Measured on real data: 84,263 of 89,431 slots hold 0xFFFFFFFF and no real offset ever
+        // follows one. Treating the sentinel as an offset builds a range that overflows past 4 GB;
+        // treating it as the NEXT offset gives a ~4 GB length. Both looked like corrupt banks.
+        let abk = Abk {
+            variant: 0x0503_0001,
+            sample_bank_offset: 0x100,
+            sample_bank_size: 0x400,
+            patch_table_offset: 0x500,
+            export_table_offset: 0x600,
+            samples: vec![12, 0x200, Abk::SAMPLE_ABSENT, Abk::SAMPLE_ABSENT],
+            patches: Vec::new(),
+            exports: Vec::new(),
+        };
+        assert_eq!(abk.present(), 2);
+        assert_eq!(abk.sample_range(0), Some(0x10C..0x300));
+        // The last real sample runs to the end of the section, not to the sentinel.
+        assert_eq!(abk.sample_range(1), Some(0x300..0x500));
+        assert_eq!(abk.sample_range(2), None);
+        assert_eq!(abk.sample_range(9), None);
+    }
 
     fn abk_fixture() -> Vec<u8> {
         // Header, then S10A with one sample, then the patch table, then one export.
