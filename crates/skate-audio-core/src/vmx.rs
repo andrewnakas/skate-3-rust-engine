@@ -992,6 +992,22 @@ pub unsafe fn stvrx128(g: &mut Guest, ea: u32, value: __m128i) -> Result<()> {
 /// **This is a real write to guest memory**, 128 bytes at `ea & ~127`, and it is inside the write
 /// window the C++ ports declare. It is not a prefetch hint and must not be dropped; `dcbt`, which
 /// sits next to it in the same loops, *is* a hint and lifts to nothing at all.
+/// The message a body refuses with when it would splat a constant through a stack frame that is not
+/// 16-byte aligned.
+///
+/// Several originals build a four-lane constant by storing a single four times into their own frame
+/// and reloading it with one `lvx128`, which masks the low four address bits. With a frame on a
+/// 16-byte boundary the reload reads back exactly what was stored, which is the only case the ports
+/// model. With a misaligned frame it would read four bytes somewhere else, so the input is refused
+/// rather than answered with a value that merely looks right.
+pub const SPLAT_FRAME_UNALIGNED: &str =
+    "a vector loop would splat through a stack frame that is not 16-byte aligned; refused rather than modelled";
+
+/// The error for [`SPLAT_FRAME_UNALIGNED`], carrying the offending stack pointer.
+pub fn splat_frame_unaligned(sp: u32) -> crate::Error {
+    crate::Error::new(sp, SPLAT_FRAME_UNALIGNED)
+}
+
 pub fn dcbzl(g: &mut Guest, ea: u32) -> Result<()> {
     g.fill(ea & !127, 0, 128)
 }

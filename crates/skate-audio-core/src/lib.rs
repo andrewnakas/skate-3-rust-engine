@@ -78,6 +78,11 @@ pub mod spatial;
 /// Gated with the rest: the stage is VMX128 work under the guest's flush mode.
 #[cfg(target_arch = "x86_64")]
 pub mod stage;
+/// The two-source crossfade and the mix dispatcher that runs it through a stage descriptor.
+///
+/// Gated with the rest: vector work under the guest's flush mode.
+#[cfg(target_arch = "x86_64")]
+pub mod crossfade;
 
 /// One contiguous span of guest memory.
 #[derive(Clone, Debug)]

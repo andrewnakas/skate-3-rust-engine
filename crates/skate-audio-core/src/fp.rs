@@ -201,6 +201,25 @@ pub fn fctidz(value: f64) -> i64 {
     }
 }
 
+/// `fctid`: round to nearest even, then to a 64-bit integer -- the lifted line branch for branch.
+///
+/// The same edges as [`fctidz`] and for the same reason: at exactly 2^63 the guest yields
+/// `cvtsd2si`'s integer indefinite, `i64::MIN`, where Rust's saturating cast would give
+/// `i64::MAX`. Only the in-range arm differs, rounding half to even as the recomp's MXCSR does.
+#[inline]
+pub fn fctid(value: f64) -> i64 {
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    if value.is_nan() {
+        i64::MIN
+    } else if value > TWO_POW_63 {
+        i64::MAX
+    } else if value >= TWO_POW_63 || value < -TWO_POW_63 {
+        i64::MIN
+    } else {
+        value.round_ties_even() as i64
+    }
+}
+
 /// `fcfid`: a 64-bit integer converted to double, round to nearest even.
 ///
 /// Exact below `2^53` and correctly rounded above it, in the guest and in Rust alike.

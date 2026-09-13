@@ -13,9 +13,9 @@ than at a misunderstanding of the engine.
 | `player.rs` | the three `PacketPlayer` consumers, the FIFO, the liveness scan | **1,679 replayed** |
 | `buffers.rs` | buffer-pair init | **214 replayed** |
 | `fp.rs` | the guest's scalar FP idioms: `lfs`/`lfd`/`stfs`, `fcfid`/`frsp`, the single-rounded forms, `fsqrts`, `fmsubs`, `fabs`/`fneg`, `fsel`, `fctiwz`, `fctidz`, `rlwinm` | unit-tested only |
-| `spatial.rs` | `sub_82B453D8`, `sub_82B269C0`, `sub_82B454B8`, `sub_82B45788`, `sub_82B45B60`: a source's position becoming a gain per speaker — the unit-disc clamp, the panner placement, distance panning, the seven-sector angular pass, and the power-normalised scale | **1,420 replayed** for three of the five (474 + 473 + 473); `sub_82B269C0` and `sub_82B45788` cannot be replayed until the image's sine and cosine are ported |
+| `spatial.rs` | `sub_82B453D8`, `sub_82B269C0`, `sub_82B454B8`, `sub_82B45788`, `sub_82B45B60`: a source's position becoming a gain per speaker — the unit-disc clamp, the panner placement, distance panning, the seven-sector angular pass, and the power-normalised scale | **2,369 replayed**, all five (474 + 473 + 473 + 482 + 467) |
 | `gains.rs` | `sub_82B29AF0` and `sub_82B23B50`: the channel gain matrix and the per-channel gain ramp, both driving `dsp/` kernels over a `+4`/`+14` channel descriptor | **980 replayed** (795 + 185) |
-| `mathlib.rs` | `sub_82F4DE80` (`floor`, 2.87 M calls a boot — the hottest body ported anywhere in this project), and the `Trig` hole where the image's sine and cosine are not portable | **2,000 replayed**, compared by the bits of the returned `f1` |
+| `mathlib.rs` | `sub_82F4DE80` (`floor`, 2.87 M calls a boot — the hottest body ported anywhere in this project), and `Image`, the image's own sine (`sub_82F4DED0`) and cosine (`sub_82F4DFB0`), ported beyond the 216 because four callers here needed them | **4,000 replayed** (2,000 floor + 999 sine + 1,001 cosine), all compared by the bits of the returned `f1` |
 | `counter.rs` | `sub_82B1F360`, the six-word cascading counter the evaluator draws from | verified C++ reference; unit-tested only |
 | `eval/` | the expression evaluator's 40-slot opcode table at guest `0x82FD3600` — **31 slots**, every one that has a verified C++ body | verified C++ reference; unit-tested only |
 | `scheduler.rs` | `sub_82B489D0` and `sub_82B39690`: an instance detaching itself from the scheduler, and the bucket list mechanic that removal runs on | **4 replayed** — two calls each, read the count before quoting it |
@@ -25,15 +25,16 @@ than at a misunderstanding of the engine.
 | `dsp/scale.rs` | `sub_82B3BED8` and `sub_82B44B20`: `dst[i] = src[i]*k` and `dst[i] += src[i]*k`, each on a vector and a scalar path | **734 replayed** (548 + 186) |
 | `dsp/gain_ramp.rs` | `sub_82B3C098`, a gain-ramped copy of a fixed 256-single block | **166 replayed** |
 | `dsp/scale_add.rs` | `sub_82B3CF58`, `z[i] = x[i]·gain + y[i]` alongside a parallel copy `w[i] = x[i]` | **642 replayed** |
-| `dsp/biquad.rs` | `sub_82B43AF8`, a biquad over a run of singles, eight a pass | verified C++ reference; unit-tested only — no call has been recorded for it yet |
+| `dsp/biquad.rs` | `sub_82B43AF8`, a biquad over a run of singles, eight a pass | **1,000 replayed** |
 | `dsp/resample.rs` | `sub_82B43FB8`, linear interpolation walked by a 16.16 phase | **530 replayed** |
 | `ring.rs` | `sub_82B3DB90`, `sub_82B3DC48`, `sub_82B3DF90`, `sub_82B3DEA8`: copy out of the wrapping decode ring, rank and fill the segments, pad the tail with a rodata constant, and write a block back in | **3,943 replayed** (1,200 + 1,052 + 1,046 + 645) |
-| `mix.rs` | `sub_82B34E08`, `sub_82B3C668`, `sub_82B443F8`: flush the mix accumulator, fold the pending deltas into the rows, advance a fill position and clear ahead of it | **1,351 replayed** (1,086 + 265); `sub_82B3C668` has no recorded call yet |
+| `mix.rs` | `sub_82B34E08`, `sub_82B3C668`, `sub_82B443F8`: flush the mix accumulator, fold the pending deltas into the rows, advance a fill position and clear ahead of it | **2,351 replayed** (1,086 + 1,000 + 265) |
 | `stage.rs` | `sub_82B399D0` and `sub_82B39FA0`: the one-pole filter stage over a block, and the dispatcher that runs it through a descriptor or clears the buffer instead | **706 replayed** (353 each), the stage's result compared by the bits of `f1` |
-| `filters.rs` | `sub_82B27E20` and `sub_82B26568`: the per-channel low-pass and high-pass stages | verified C++ reference; unit-tested only — both need the image's sine and cosine |
+| `crossfade.rs` | `sub_82B3D0A8` and `sub_82B3D4F8`: the two-source crossfade with a gain-weighted blend onto an accumulator, and the dispatcher that runs it, or a plain scale-and-add, through a descriptor | **1,248 replayed** (414 + 834) |
+| `filters.rs` | `sub_82B27E20` and `sub_82B26568`: the per-channel low-pass and high-pass stages | **1,152 replayed** (576 + 576), given the ported sine and cosine |
 | `mem.rs` | the write-set contract of `sub_82EDF460` (memcpy) and `sub_82EE5E80` (memset), which six of the bodies above call | not a port; see its module note |
 
-`cargo test` runs 335 unit tests. **Read the next two sections before reading that as one number:
+`cargo test` runs 351 unit tests. **Read the next two sections before reading that as one number:
 the modules are checked in different ways, and only the ones whose table row gives a replay figure
 have one.**
 
@@ -46,10 +47,10 @@ figure. Tier 1 is met for all of them:
 |---|---|---|
 | the queue path | 8,603 | all pass, 0 unreplayable |
 | scheduler and cursors | 3,214 | all pass, 0 unreplayable |
-| ring and mix | 5,294 | all pass, 0 unreplayable |
-| spatial, gains and floor | 4,400 | all pass, 0 unreplayable |
-| DSP kernels and the filter stage | 2,778 | all pass, 0 unreplayable |
-| **total** | **24,289** | **all pass** |
+| ring, mix and crossfade | 7,542 | all pass, 0 unreplayable |
+| spatial, gains and the math leaves | 7,349 | all pass, 0 unreplayable |
+| DSP kernels, the filter stage and the two filters | 4,930 | all pass, 0 unreplayable |
+| **total** | **31,638** | **all pass** |
 
 **These are re-recorded numbers, and the reason matters.** The figure here used to read 8,607,
 recorded before a defect in the recorder was found: it snapshotted the read set *after* the
@@ -122,18 +123,13 @@ composed in the right order. It also leaves seven primitives uncovered — `vrfi
 of which has a unit test against a hand-written model instead, which is weaker. `vmx`'s module
 documentation carries the table.
 
-**Unit-tested against a verified reference** — `fp.rs`, `counter.rs`, `eval/`, `dsp/sine.rs`,
-`dsp/biquad.rs`, `filters.rs`, two of the five `spatial.rs` bodies (`sub_82B269C0` and
-`sub_82B45788`), and `mix`'s `sub_82B3C668`. The C++ body each of these was translated from was
-compared call-for-call against the original under the harness, on real inputs, at zero divergence.
-The Rust has no vectors of its own, for one of four reasons. `fp.rs`, `counter.rs` and `eval/` have
-no direct call site in the lifted tree at all (the evaluator reaches all 40 slots through one
-`bctrl` on a data word), so the harness never bracketed them individually. `filters.rs` and the two
-`spatial.rs` bodies call the image's sine and cosine, which have no verified body in either
-language, and substituting the host's would agree to fifteen digits and differ in the bits the
-caller keeps. `dsp/biquad.rs` and `sub_82B3C668` are recordable, but no session has recorded a call
-yet, because hotter functions spent the vector cap first. And `dsp::sine` is a register-only kernel
-the harness verified over 6,994,118 calls without ever writing it a vector. Either way what this
+**Unit-tested against a verified reference** — `fp.rs`, `counter.rs`, `eval/` and `dsp/sine.rs`. The
+C++ body each of these was translated from was compared call-for-call against the original under the
+harness, on real inputs, at zero divergence. The Rust has no vectors of its own, for one of two
+reasons. `fp.rs`, `counter.rs` and `eval/` have no direct call site in the lifted tree at all (the
+evaluator reaches all 40 slots through one `bctrl` on a data word), so the harness never bracketed
+them individually. And `dsp::sine` is a register-only kernel the harness verified over 6,994,118
+calls without ever writing it a vector. Either way what this
 buys is a much smaller search space — a fault here is a transcription error, not a misreading of
 the engine — and what it does not buy is a number.
 
