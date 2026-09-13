@@ -772,6 +772,41 @@ fn main() {
             "sub_82B20E18" => output::ramp_block(&mut g, v.w[0])
                 .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
+            // The small leaves and command handlers.
+            "sub_82B4F8A8" => leaves::pair_record_size(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B49268" => leaves::publish_float(&mut g, v.r3)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B3D578" => leaves::zero_two_fields(&mut g, v.r3)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B1D840" => leaves::copy_and_mark_filled(&mut g, v.r3, v.r4)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B34B10" => leaves::push_node(&mut g, v.r3)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B23828" => leaves::publish_command(&mut g, v.r3)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            // The header unpacker keeps its bit reader in a 112-byte frame no window declares.
+            // Seeding it with zeroes is sound: both reader words are written before the first read.
+            "sub_82B31D90" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where the bit reader lives", v.run));
+                }
+                continue;
+            }
+            "sub_82B31D90" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(bitstream::HEADER_FRAME_BYTES), vec![0u8; bitstream::HEADER_FRAME_BYTES as usize]);
+                bitstream::unpack_stream_header(&mut g, v.r3, v.r4, sp)
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
             _ => {
                 t.skipped += 1;
                 continue;

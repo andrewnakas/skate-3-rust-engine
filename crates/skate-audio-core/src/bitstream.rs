@@ -14,6 +14,7 @@
 //! | [`run_length_step`] | `sub_82B47010` | 107 | 12,540 | 10,300 |
 //! | [`decode_four`] | `sub_82B47658` | 60 | 2,508 | 2,060 |
 //! | [`advance_bit_cursor`] | `sub_82B50270` | 162 | 6,354 | 5,518 |
+//! | [`unpack_stream_header`] | `sub_82B31D90` | 93 | 745 | 981 |
 //!
 //! Replayed against **20,000 recorded calls, 0 disagreements**, and each compared live against the
 //! original between 481 and 17,668 times in the same session.
@@ -359,6 +360,44 @@ pub fn advance_bit_cursor(g: &mut Guest, base_field: u32, cursor_field: u32) -> 
     }
     g.set_u32(base_field, buffer.wrapping_add(PAGE_BYTES))?; // stw r10,0(r3)
     g.set_u32(cursor_field, advanced - PAGE_BITS) // stw r9,0(r4)
+}
+
+// ------------------------------------------------------------------- the packed stream header
+
+/// `cmplwi cr6,r11,72` — an `'H'` prefix, which makes the header start four bytes later.
+pub const HEADER_TAG: u8 = 72;
+/// `stwu r1,-112(r1)` — the frame the bit reader lives in.
+pub const HEADER_FRAME_BYTES: u32 = 112;
+/// `addi r3,r1,80` — the reader's two words, handed to [`read_bits`] six times.
+pub const HEADER_READER: u32 = 80;
+
+/// Unpack a 64-bit packed stream header into a four-field description (`sub_82B31D90`).
+///
+/// Six fields are read MSB-first with [`read_bits`] — 4, 4, 6, 18, 3 and 29 bits — and four are
+/// kept: the second nibble at `out + 12`, the 6-bit field **plus one** as a byte at `out + 0`, the
+/// 18-bit field at `out + 4`, and the 29-bit field at `out + 8`. The first nibble and the 3-bit field
+/// are read and discarded. An `'H'` tag byte in front skips four bytes.
+///
+/// The frame is reproduced, because the reader is guest memory that [`read_bits`] reads and writes.
+pub fn unpack_stream_header(g: &mut Guest, stream: u32, out: u32, sp: u32) -> Result<()> {
+    // lbz r11,0(r3) ; cmplwi cr6,r11,72 ; bne ; addi r3,r3,4 -- before the frame moves
+    let body = if g.u8(stream)? == HEADER_TAG { stream.wrapping_add(4) } else { stream };
+    let frame = sp.wrapping_sub(HEADER_FRAME_BYTES); // stwu r1,-112(r1)
+    g.set_u32(frame, sp)?;
+    let reader = frame + HEADER_READER;
+    g.set_u32(reader + READER_DATA, body)?; // stw r3,80(r1)
+    g.set_u32(reader + READER_CURSOR, 0)?; // li r11,0 ; stw r11,84(r1)
+
+    read_bits(g, reader, 4)?; // the first nibble, discarded
+    let nibble = read_bits(g, reader, 4)?;
+    g.set_u32(out + 12, nibble as u32)?; // stw r3,12(r31)
+    let count = read_bits(g, reader, 6)?;
+    g.set_u8(out, count.wrapping_add(1) as u8)?; // addi r10,r3,1 ; stb r10,0(r31)
+    let field18 = read_bits(g, reader, 18)?;
+    g.set_u32(out + 4, field18 as u32)?; // stw r3,4(r31)
+    read_bits(g, reader, 3)?; // discarded
+    let field29 = read_bits(g, reader, 29)?;
+    g.set_u32(out + 8, field29 as u32) // stw r3,8(r31)
 }
 
 #[cfg(test)]
@@ -719,5 +758,36 @@ mod tests {
         assert_eq!(divide_by_eight_toward_zero(-1), 0, "toward zero, not floor");
         assert_eq!(divide_by_eight_toward_zero(-9), -1);
         assert_eq!(divide_by_eight_toward_zero(17), 2);
+    }
+
+    // ------------------------------------------------------------------ the packed stream header
+
+    /// Pack the six fields the way the module note describes, MSB first — independent of the reader.
+    fn pack_header(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> [u8; 8] {
+        ((a << 60) | (b << 56) | (c << 50) | (d << 32) | (e << 29) | f).to_be_bytes()
+    }
+
+    #[test]
+    fn the_header_unpacks_its_four_kept_fields_with_and_without_the_tag() {
+        let fields = (0xA, 0x5, 0x2A, 0x2_ABCD, 5, 0x123_4567);
+        let header = pack_header(fields.0, fields.1, fields.2, fields.3, fields.4, fields.5);
+        for tagged in [false, true] {
+            let mut g = Guest::single(BASE, 0x1000);
+            let stream = BASE + 0x100;
+            let mut bytes = if tagged { vec![b'H', 0xEE, 0xEE, 0xEE] } else { Vec::new() };
+            bytes.extend_from_slice(&header);
+            g.set_span(stream, &bytes).unwrap();
+            let (out, sp) = (BASE + 0x40, BASE + 0x800);
+
+            unpack_stream_header(&mut g, stream, out, sp).unwrap();
+
+            assert_eq!(g.u8(out).unwrap(), 0x2B, "tagged {tagged}: the 6-bit field plus one");
+            assert_eq!(g.u32(out + 4).unwrap(), 0x2_ABCD, "tagged {tagged}: 18 bits");
+            assert_eq!(g.u32(out + 8).unwrap(), 0x123_4567, "tagged {tagged}: 29 bits");
+            assert_eq!(g.u32(out + 12).unwrap(), 0x5, "tagged {tagged}: the SECOND nibble");
+            let reader = sp - HEADER_FRAME_BYTES + HEADER_READER;
+            assert_eq!(g.u32(reader + READER_CURSOR).unwrap(), 64, "all 64 bits consumed");
+            assert_eq!(g.u32(sp - HEADER_FRAME_BYTES).unwrap(), sp, "the back chain");
+        }
     }
 }

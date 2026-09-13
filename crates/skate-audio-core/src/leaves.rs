@@ -11,6 +11,12 @@
 //! | [`set_field_460`] | `sub_82B34268` | 11 | 202,510 | 304,676 | a direct `bl` |
 //! | [`fourth_argument`] | `sub_82B2C8E8` | 7 | 123,881 | 225,599 | a pointer slot only |
 //! | [`stream_remaining`] | `sub_82B23C10` | 47 | 122,997 | 214,853 | five direct callers |
+//! | [`pair_record_size`] | `sub_82B4F8A8` | 17 | 1,930 | 2,166 | a direct `bl` |
+//! | [`publish_float`] | `sub_82B49268` | 17 | 745 | 981 | a command-ring record |
+//! | [`zero_two_fields`] | `sub_82B3D578` | 18 | 10 | 11 | a direct `bl` — **thin** |
+//! | [`copy_and_mark_filled`] | `sub_82B1D840` | 40 | 247 | 343 | a direct `bl` |
+//! | [`push_node`] | `sub_82B34B10` | 36 | 284 | 317 | a command-ring record |
+//! | [`publish_command`] | `sub_82B23828` | 77 | 1,910 | 1,495 | a command-ring record |
 //!
 //! **Replayed against the game, 2026-09-13: 6,661 recorded vectors, 0 disagreements**
 //! (3,232 + 230 + 230 + 2,969, sessions `leaves` and `leaves2`). The four were recorded on purpose
@@ -19,6 +25,10 @@
 //! zero divergence. One limit: the recording keeps only the low word of `r3`, so
 //! [`stream_remaining`]'s borrow into the upper word is checked by the tests below and not by any
 //! vector.
+//!
+//! The six added later — [`pair_record_size`] through [`publish_command`] — replay **6,596 recorded
+//! calls, 0 disagreements** (session `leaves3`, 2,619 / 1,404 / 11 / 924 / 397 / 1,241); the thin
+//! [`zero_two_fields`] carries only eleven, which is all a session produces.
 //!
 //! Two of the four objects are unnamed. `docs/rw_audio_structs.h` has no entry for the slot
 //! array at `+0x10`, the `u16` at `+460`, or the stream table [`stream_remaining`] walks, so
@@ -183,6 +193,157 @@ pub fn stream_remaining(g: &Guest, object: u32, index: u8) -> Result<u64> {
     };
 
     Ok(limit.wrapping_sub(cursor)) // subf r3,r10,r11
+}
+
+// --------------------------------------------------------------- more small verified leaves
+
+/// `li r9,16` — the alignment [`pair_record_size`] reports through `r4`.
+pub const PAIR_RECORD_ALIGNMENT: u32 = 16;
+/// `addi r3,r11,88` — the record's fixed header.
+pub const PAIR_RECORD_HEADER: u64 = 88;
+/// `mulli r11,r10,28` — bytes per pair of entries.
+pub const PAIR_RECORD_STRIDE: u64 = 28;
+
+/// The size of a record holding `count` entries two to a slot, after an 88-byte header
+/// (`sub_82B4F8A8`). Stores the alignment, 16, through `out`, and returns `28 * ceil(count/2) + 88`.
+///
+/// The halving is `addi` then a 32-bit logical shift right, so a count of `0xFFFF_FFFF` wraps to zero
+/// slots rather than to 2^31.
+pub fn pair_record_size(g: &mut Guest, count: u32, out: u32) -> Result<u64> {
+    let pairs = count.wrapping_add(1) >> 1; // addi r11,r3,1 ; rlwinm r10,r11,31,1,31
+    g.set_u32(out, PAIR_RECORD_ALIGNMENT)?; // stw r9,0(r4)
+    Ok(u64::from(pairs) * PAIR_RECORD_STRIDE + PAIR_RECORD_HEADER) // mulli ; addi
+}
+
+/// `lis -32234 ; lfs 23056` — the image's zero single, the cell [`crate::mix::ZERO_SINGLE`] names.
+pub const ZERO_CELL: u32 = (((-32234i32 as u32) & 0xFFFF) << 16).wrapping_add(23056);
+const _: () = assert!(ZERO_CELL == 0x8216_5A10, "lis -32234 ; lfs 23056");
+
+/// A publishing command record: `{+0 handler, +4 target, +8 value …}`.
+pub const COMMAND_TARGET: u32 = 4;
+
+/// Publish the single at `record + 8` onto `target + 56`, and return the record size, 12
+/// (`sub_82B49268`). A command-ring handler, like [`stamp_slot`].
+#[cfg(target_arch = "x86_64")]
+pub fn publish_float(g: &mut Guest, record: u32) -> Result<u64> {
+    let target = g.u32(record + COMMAND_TARGET)?; // lwz r11,4(r3)
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional(); // emitted before the lfs
+    let value = fp::load_single(g, record + 8)?; // lfs f0,8(r3)
+    fp::store_single(g, target.wrapping_add(56), value)?; // stfs f0,56(r11)
+    drop(fpscr);
+    Ok(12) // li r3,12
+}
+
+/// Store the image's zero into the two singles at `+16` and `+20` (`sub_82B3D578`, **thin**: ten
+/// calls a session). The cell is read live rather than assumed to be `0.0`.
+#[cfg(target_arch = "x86_64")]
+pub fn zero_two_fields(g: &mut Guest, object: u32) -> Result<()> {
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let zero = fp::load_single(g, ZERO_CELL)?; // lfs f0,23056(r11)
+    fp::store_single(g, object.wrapping_add(16), zero)?; // stfs f0,16(r3)
+    fp::store_single(g, object.wrapping_add(20), zero) // stfs f0,20(r3)
+}
+
+/// `lbz r10,24(r4)` — the destination's element count, re-read after every copied word.
+pub const FILL_COUNT: u32 = 24;
+/// `stb r11,25(r4)` — set to 1 on the way out, whether or not anything was copied.
+pub const FILL_FLAG: u32 = 25;
+/// Where the first copied word lands: `stwu 4(r9)` with `r9 = dest + 24`.
+pub const FILL_FIRST_WORD: u32 = 28;
+
+/// Copy `count` words from `source` into the destination block and mark it filled (`sub_82B1D840`).
+///
+/// A do-while: with a non-zero count the first word is copied before the count is tested, and the
+/// count byte is **re-read after every word**. No store here can reach it — the copy ascends from
+/// `+28` — so the reload is unobservable in practice, and it is kept because the original has it.
+pub fn copy_and_mark_filled(g: &mut Guest, source: u32, dest: u32) -> Result<()> {
+    if g.u8(dest + FILL_COUNT)? != 0 {
+        let (mut from, mut to) = (source, dest.wrapping_add(FILL_FIRST_WORD));
+        let mut copied = 0u32;
+        loop {
+            let word = g.u32(from)?; // lwzu r8,4(r10)
+            g.set_u32(to, word)?; // stwu r8,4(r9)
+            copied += 1;
+            let count = g.u8(dest + FILL_COUNT)?; // lbz r8,24(r4) -- reloaded
+            if copied as i32 >= i32::from(count) {
+                break;
+            }
+            from = from.wrapping_add(4);
+            to = to.wrapping_add(4);
+        }
+    }
+    g.set_u8(dest + FILL_FLAG, 1) // li r11,1 ; stb r11,25(r4)
+}
+
+/// `lis -31988 ; lwz r9,-8520(r10)` — the head of a global singly-linked list.
+pub const LIST_HEAD: u32 = (((-31988i32 as u32) & 0xFFFF) << 16).wrapping_sub(8520);
+const _: () = assert!(LIST_HEAD == 0x830B_DEB8, "lis -31988 ; -8520");
+/// The node on the object: `+44` next, `+48` a second word cleared on push.
+pub const NODE_OFFSET: u32 = 44;
+/// `stb r9,164(r8)` — set once the object is on the list.
+pub const NODE_LINKED: u32 = 164;
+
+/// Push the record's object onto the global list and return the record size, 8 (`sub_82B34B10`).
+///
+/// The head is loaded, the node's two words are written, and then the head is **loaded again** before
+/// the previous head's back-link is set — the compiler could not prove the two stores miss the head
+/// cell. Reproduced; the C++ window builder refuses the one layout where it matters.
+pub fn push_node(g: &mut Guest, record: u32) -> Result<u64> {
+    let object = g.u32(record + COMMAND_TARGET)?; // lwz r8,4(r3)
+    let node = object.wrapping_add(NODE_OFFSET); // addi r11,r8,44
+    let head = g.u32(LIST_HEAD)?; // lwz r9,-8520(r10)
+    g.set_u32(object.wrapping_add(48), 0)?; // stw r7,48(r8)
+    g.set_u32(node, head)?; // stw r9,44(r8)
+    let head_again = g.u32(LIST_HEAD)?; // lwz r9,-8520(r10) -- reloaded
+    if head_again != 0 {
+        g.set_u32(head_again.wrapping_add(4), node)?; // stw r11,4(r9)
+    }
+    g.set_u32(LIST_HEAD, node)?; // stw r11,-8520(r10)
+    g.set_u8(object.wrapping_add(NODE_LINKED), 1)?; // stb r9,164(r8)
+    Ok(8) // li r3,8
+}
+
+/// `lis -32208 ; addi r8,r9,-31232 ; lfd f13,256(r8)` — the double a command's value is tested
+/// against to choose the "clear" form.
+pub const SENTINEL_DOUBLE: u32 = (((-32208i32 as u32) & 0xFFFF) << 16).wrapping_sub(31232) + 256;
+const _: () = assert!(SENTINEL_DOUBLE == 0x822F_8700, "lis -32208 ; addi -31232 ; lfd 256");
+
+/// Publish a command's value onto its target in one of two forms, returning the record size, 32
+/// (`sub_82B23828`).
+///
+/// The record is `{+4 target, +8 double, +16 single A, +20 single B, +24 word}`. When the double
+/// equals the image's sentinel **and** single A equals the image's zero, the "clear" form stores B at
+/// `+108` and zeroes the flag bytes at `+113` and `+112`. Otherwise the "set" form stores the double
+/// at `+56`, A at `+64`, B at `+68`, the word at `+72`, and sets `+112`. The double comparison is
+/// unordered, so a NaN takes the set form; and single A is only read when the double matched.
+#[cfg(target_arch = "x86_64")]
+pub fn publish_command(g: &mut Guest, record: u32) -> Result<u64> {
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional(); // emitted before the lfd
+    let bits = g.u64(record + 8)?; // lfd f0,8(r3)
+    let target = g.u32(record + COMMAND_TARGET)?; // lwz r11,4(r3)
+    let sentinel = fp::load_double(g, SENTINEL_DOUBLE)?; // lfd f13,256(r8)
+
+    if f64::from_bits(bits) == sentinel
+        && fp::load_single(g, record + 16)? == fp::load_single(g, ZERO_CELL)?
+    {
+        let b = fp::load_single(g, record + 20)?;
+        fp::store_single(g, target.wrapping_add(108), b)?; // stfs f0,108(r11)
+        g.set_u8(target.wrapping_add(113), 0)?; // stb r9,113(r11)
+        g.set_u8(target.wrapping_add(112), 0)?; // stb r9,112(r11)
+        return Ok(32);
+    }
+    g.set_u64(target.wrapping_add(56), bits)?; // stfd f0,56(r11)
+    let a = fp::load_single(g, record + 16)?;
+    fp::store_single(g, target.wrapping_add(64), a)?; // stfs f0,64(r11)
+    let b = fp::load_single(g, record + 20)?;
+    fp::store_single(g, target.wrapping_add(68), b)?; // stfs f13,68(r11)
+    let word = g.u32(record + 24)?;
+    g.set_u32(target.wrapping_add(72), word)?; // stw r8,72(r11)
+    g.set_u8(target.wrapping_add(112), 1)?; // stb r9,112(r11)
+    Ok(32) // li r3,32
 }
 
 #[cfg(test)]
@@ -370,5 +531,150 @@ mod tests {
             element_address(&g, DECODER, 255).unwrap(),
             DECODER + TABLE_OFFSET + 255 * 24
         );
+    }
+
+    // ------------------------------------------------------------ more small verified leaves
+
+    const L2: u32 = 0x5000_0000;
+
+    fn small() -> Guest {
+        let mut g = Guest::single(L2, 0x1000);
+        g.put(ZERO_CELL, 0.0f32.to_bits().to_be_bytes().to_vec());
+        g.put(LIST_HEAD, vec![0u8; 4]);
+        g.put(SENTINEL_DOUBLE, (-1.0f64).to_bits().to_be_bytes().to_vec());
+        g
+    }
+
+    #[test]
+    fn the_pair_record_size_rounds_the_count_up_to_pairs() {
+        let mut g = small();
+        for (count, want) in [(0u32, 88u64), (1, 116), (2, 116), (3, 144), (10, 228)] {
+            assert_eq!(pair_record_size(&mut g, count, L2).unwrap(), want, "count {count}");
+            assert_eq!(g.u32(L2).unwrap(), 16, "the alignment, stored through r4");
+        }
+        // addi then a 32-bit shift: 0xFFFFFFFF + 1 wraps to zero pairs.
+        assert_eq!(pair_record_size(&mut g, u32::MAX, L2).unwrap(), 88);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn publish_float_lands_on_the_target_and_returns_twelve() {
+        let mut g = small();
+        let (record, target) = (L2, L2 + 0x100);
+        g.set_u32(record + COMMAND_TARGET, target).unwrap();
+        g.set_u32(record + 8, 0.625f32.to_bits()).unwrap();
+        assert_eq!(publish_float(&mut g, record).unwrap(), 12);
+        assert_eq!(g.f32(target + 56).unwrap(), 0.625);
+        assert_eq!(g.u32(target + 60).unwrap(), 0, "one word, not two");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_two_fields_take_the_image_zero_read_live() {
+        let mut g = small();
+        g.set_u32(ZERO_CELL, 2.5f32.to_bits()).unwrap(); // patch the cell: it is read, not assumed
+        g.set_u32(L2 + 12, 0xDEAD_BEEF).unwrap();
+        g.set_u32(L2 + 24, 0xDEAD_BEEF).unwrap();
+        zero_two_fields(&mut g, L2).unwrap();
+        assert_eq!((g.f32(L2 + 16).unwrap(), g.f32(L2 + 20).unwrap()), (2.5, 2.5));
+        assert_eq!((g.u32(L2 + 12).unwrap(), g.u32(L2 + 24).unwrap()), (0xDEAD_BEEF, 0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn copy_and_mark_filled_copies_count_words_then_sets_the_flag() {
+        let mut g = small();
+        let (source, dest) = (L2, L2 + 0x100);
+        for i in 0..8u32 {
+            g.set_u32(source + 4 * i, 0x1000 + i).unwrap();
+            g.set_u32(dest + FILL_FIRST_WORD + 4 * i, 0xDEAD_BEEF).unwrap();
+        }
+        g.set_u8(dest + FILL_COUNT, 3).unwrap();
+        copy_and_mark_filled(&mut g, source, dest).unwrap();
+        for i in 0..3u32 {
+            assert_eq!(g.u32(dest + FILL_FIRST_WORD + 4 * i).unwrap(), 0x1000 + i);
+        }
+        assert_eq!(g.u32(dest + FILL_FIRST_WORD + 12).unwrap(), 0xDEAD_BEEF, "three words");
+        assert_eq!(g.u8(dest + FILL_FLAG).unwrap(), 1);
+
+        // A zero count copies nothing but still marks the block.
+        let mut g = small();
+        g.set_u32(dest + FILL_FIRST_WORD, 0xDEAD_BEEF).unwrap();
+        copy_and_mark_filled(&mut g, source, dest).unwrap();
+        assert_eq!(g.u32(dest + FILL_FIRST_WORD).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(g.u8(dest + FILL_FLAG).unwrap(), 1);
+    }
+
+    #[test]
+    fn push_node_onto_an_empty_then_a_non_empty_list() {
+        let mut g = small();
+        let (record, first, second) = (L2, L2 + 0x200, L2 + 0x400);
+        g.set_u32(record + COMMAND_TARGET, first).unwrap();
+        g.set_u32(first + 48, 0xDEAD_BEEF).unwrap();
+        assert_eq!(push_node(&mut g, record).unwrap(), 8);
+        assert_eq!(g.u32(LIST_HEAD).unwrap(), first + NODE_OFFSET, "the head is the node, not the object");
+        assert_eq!(g.u32(first + NODE_OFFSET).unwrap(), 0, "an empty list's next is null");
+        assert_eq!(g.u32(first + 48).unwrap(), 0, "and the second word is cleared");
+        assert_eq!(g.u8(first + NODE_LINKED).unwrap(), 1);
+
+        g.set_u32(record + COMMAND_TARGET, second).unwrap();
+        push_node(&mut g, record).unwrap();
+        assert_eq!(g.u32(LIST_HEAD).unwrap(), second + NODE_OFFSET);
+        assert_eq!(g.u32(second + NODE_OFFSET).unwrap(), first + NODE_OFFSET, "next is the old head");
+        assert_eq!(g.u32(first + NODE_OFFSET + 4).unwrap(), second + NODE_OFFSET, "the old head's back-link");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn command(g: &mut Guest, value: f64, a: f32, b: f32, word: u32) -> (u32, u32) {
+        let (record, target) = (L2, L2 + 0x100);
+        g.set_u32(record + COMMAND_TARGET, target).unwrap();
+        g.set_u64(record + 8, value.to_bits()).unwrap();
+        g.set_u32(record + 16, a.to_bits()).unwrap();
+        g.set_u32(record + 20, b.to_bits()).unwrap();
+        g.set_u32(record + 24, word).unwrap();
+        for off in (56..116).step_by(4) {
+            g.set_u32(target + off, 0xDEAD_BEEF).unwrap();
+        }
+        (record, target)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_command_publishes_the_set_form_unless_it_is_the_clear_one() {
+        // Not the sentinel: the set form.
+        let mut g = small();
+        let (record, target) = command(&mut g, 3.5, 1.25, 2.25, 77);
+        assert_eq!(publish_command(&mut g, record).unwrap(), 32);
+        assert_eq!(g.u64(target + 56).unwrap(), 3.5f64.to_bits());
+        assert_eq!((g.f32(target + 64).unwrap(), g.f32(target + 68).unwrap()), (1.25, 2.25));
+        assert_eq!(g.u32(target + 72).unwrap(), 77);
+        assert_eq!(g.u8(target + 112).unwrap(), 1);
+        assert_eq!(g.u32(target + 108).unwrap(), 0xDEAD_BEEF, "+108 is the clear form's field");
+
+        // The sentinel and a zero A: the clear form.
+        let mut g = small();
+        let (record, target) = command(&mut g, -1.0, 0.0, 2.25, 77);
+        assert_eq!(publish_command(&mut g, record).unwrap(), 32);
+        assert_eq!(g.f32(target + 108).unwrap(), 2.25);
+        assert_eq!((g.u8(target + 112).unwrap(), g.u8(target + 113).unwrap()), (0, 0));
+        assert_eq!(g.u32(target + 56).unwrap(), 0xDEAD_BEEF, "the set form's fields are untouched");
+
+        // The sentinel but a non-zero A: still the set form — both halves of the test are needed.
+        let mut g = small();
+        let (record, target) = command(&mut g, -1.0, 0.5, 2.25, 77);
+        publish_command(&mut g, record).unwrap();
+        assert_eq!(g.u8(target + 112).unwrap(), 1);
+
+        // A NaN value is unordered, never equal to the sentinel: the set form.
+        let mut g = small();
+        let (record, target) = command(&mut g, f64::NAN, 0.0, 2.25, 77);
+        publish_command(&mut g, record).unwrap();
+        assert_eq!(g.u8(target + 112).unwrap(), 1);
+    }
+
+    #[test]
+    fn the_new_leaf_addresses_come_from_the_lis_immediates() {
+        assert_eq!(LIST_HEAD, 0x830C_0000 - 8520);
+        assert_eq!(SENTINEL_DOUBLE, 0x8230_0000 - 31232 + 256);
+        assert_eq!(ZERO_CELL, crate::mix::ZERO_SINGLE, "the image's zero, reached again");
     }
 }
