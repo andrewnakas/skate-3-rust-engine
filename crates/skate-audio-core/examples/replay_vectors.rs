@@ -660,6 +660,30 @@ fn main() {
             "sub_82B468C0" => routing::gather_bank(&mut g, v.r3, v.r4, v.r5, v.r6, v.w[4])
                 .map(|_| None)
                 .map_err(|e| e.to_string()),
+            // The allpass stage takes six pointers and flags across r3..r10 and two floats, and its
+            // `c`/`acc` arguments are compared as a 64-bit difference, so it needs the wide columns
+            // plus r9 and r10. Note the recorded return covers r3 only: `v2`, which the harness also
+            // compares because the call site is a tail call, is not in any vector column.
+            "sub_82B389A0" if wide_missing || v.r9.is_none() || v.r10.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs the wide r6/r8, r9 and r10", v.run));
+                }
+                continue;
+            }
+            "sub_82B389A0" => dsp::allpass::allpass_stage(
+                &mut g,
+                v.r3 as i32,
+                v.w[3],
+                v.r7,
+                v.w[5] as u32,
+                v.r9.unwrap_or(0),
+                v.r10.unwrap_or(0) as i32,
+                f64::from_bits(v.f[0]),
+                f64::from_bits(v.f[1]),
+            )
+            .map(|r| Some(r.r3 as u32))
+            .map_err(|e| e.to_string()),
             _ => {
                 t.skipped += 1;
                 continue;

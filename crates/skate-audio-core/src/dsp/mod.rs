@@ -13,6 +13,7 @@
 //! | [`biquad`] | `sub_82B43AF8` | a biquad over a run of singles, eight a pass | verified | 1,152,252 | 1,592,578 |
 //! | [`resample`] | `sub_82B43FB8` | linear interpolation walked by a 16.16 phase | verified | 404,358 | 748,902 |
 //! | [`clip`] | `sub_82B22678` | hard clipper: clamp 256 samples a channel, then swap the pair | verified | 49,325 | 76,864 |
+//! | [`allpass`] | `sub_82B389A0` | four-lane one-multiply allpass over an unaligned tap, accumulated at a gain | verified | 50,570 | 59,894 |
 //! | [`scale_add`] | `sub_82B3CF58` | `z[i] = x[i]·gain + y[i]`, and a copy of `x` into `w` | verified | 179,218 | 339,926 |
 //!
 //! The last two are **scalar**, which is worth saying in a directory named for vector kernels: they
@@ -55,6 +56,7 @@
 //! not others should be checked for NaN in the input run before anything else. Nothing in this
 //! directory may be reasoned about on that point; it stays bit-checked or it stays unknown.
 
+pub mod allpass;
 pub mod biquad;
 pub mod gain_ramp;
 pub mod clip;

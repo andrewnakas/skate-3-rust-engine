@@ -27,6 +27,7 @@ than at a misunderstanding of the engine.
 | `dsp/gain_ramp.rs` | `sub_82B3C098` and `sub_82B44D18`: a gain-ramped copy of a fixed 256-single block, and the same ramp accumulated onto the destination instead of written over it | **197 replayed** (166 + 31) |
 | `dsp/scale_add.rs` | `sub_82B3CF58`, `z[i] = x[i]·gain + y[i]` alongside a parallel copy `w[i] = x[i]` | **642 replayed** |
 | `dsp/biquad.rs` | `sub_82B43AF8`, a biquad over a run of singles, eight a pass | **1,000 replayed** |
+| `dsp/allpass.rs` | `sub_82B389A0`, the four-lane one-multiply allpass stage over an **unaligned** tap, accumulated at a gain — and the strongest check on `vmx.rs` rule 1 in the project: 800 of 800 replay with two-rounding multiply-adds, 99 of 800 with fused ones | **800 replayed** |
 | `dsp/clip.rs` | `sub_82B22678`, the hard clipper: clamp 256 samples a channel into `[-level, level]`, then swap the buffer pair — scalar throughout, and it declines to run at all unless the level is below the pool's 100.0 | **1,485 replayed** |
 | `dsp/resample.rs` | `sub_82B43FB8`, linear interpolation walked by a 16.16 phase | **530 replayed** |
 | `ring.rs` | `sub_82B3DB90`, `sub_82B3DC48`, `sub_82B3DF90`, `sub_82B3DEA8`: copy out of the wrapping decode ring, rank and fill the segments, pad the tail with a rodata constant, and write a block back in | **3,943 replayed** (1,200 + 1,052 + 1,046 + 645) |
