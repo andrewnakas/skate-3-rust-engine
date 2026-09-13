@@ -111,6 +111,14 @@ pub mod output;
 #[cfg(target_arch = "x86_64")]
 pub mod voices;
 
+/// The bus mixers: a source's channels into bus blocks, and a descriptor's into 1 KB runs.
+#[cfg(target_arch = "x86_64")]
+pub mod bus;
+
+/// A speaker layout's parameter blocks expanded into per-channel slots.
+#[cfg(target_arch = "x86_64")]
+pub mod layout;
+
 /// A voice's pitch ratio and fractional position, single-rounded float work under the flush mode.
 #[cfg(target_arch = "x86_64")]
 pub mod pitch;

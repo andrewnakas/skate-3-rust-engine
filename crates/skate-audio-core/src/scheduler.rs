@@ -222,6 +222,77 @@ pub fn detach_instance(g: &mut Guest, system: u64, instance: u32) -> Result<u64>
     Ok(result)
 }
 
+// ------------------------------------------------------------- sub_82B1DC00: release by key
+
+/// `lis -31997 ; addi 28492` — a global list and the record that follows its head.
+pub const KEYED_LIST: u32 = (((-31997i32 as u32) & 0xFFFF) << 16) + 28492;
+/// `lwz r11,8(r8)` — the list head, and the emptiness test.
+pub const KEYED_LIST_HEAD: u32 = 8;
+/// `addi r4,r8,12` — the record [`detach_instance`] is handed when the list empties.
+pub const KEYED_LIST_RECORD: u32 = 12;
+/// `lis -31993 ; lwz 30252` — the word [`detach_instance`] is handed as its system.
+pub const KEYED_OWNER_SLOT: u32 = (((-31993i32 as u32) & 0xFFFF) << 16) + 30252;
+const _: () = assert!(KEYED_LIST == 0x8303_6F4C && KEYED_OWNER_SLOT == 0x8307_762C);
+/// The node sits 80 bytes into its container.
+pub const KEYED_NODE_IN_CONTAINER: u32 = 80;
+/// `lwz r7,60(r10)` — the container's key.
+pub const KEYED_CONTAINER_KEY: u32 = 60;
+/// `lwz r9,8(r9)` — the key the argument asks for.
+pub const KEYED_ARG_KEY: u32 = 8;
+const KEYED_NEXT: u32 = 0;
+const KEYED_PREV: u32 = 4;
+
+/// Find the list entry whose container key matches the argument's, unlink it, and when that empties
+/// the list hand the list's record to [`detach_instance`] (`sub_82B1DC00`). Returns 12 on every path.
+///
+/// The walk is unbounded, as the original's is: it stops at the match or at a null next pointer. The
+/// head word is **reloaded after each fixup store**, and the node's next pointer is re-read after the
+/// previous node's store, so a list whose links alias the head sees the original's values. The
+/// original's 96-byte frame is not reproduced; [`detach_instance`] needs none.
+pub fn release_by_key(g: &mut Guest, arg: u32) -> Result<u64> {
+    let owner = g.u32(KEYED_OWNER_SLOT)?; // lwz r3,30252(r10)
+    let head = g.u32(KEYED_LIST + KEYED_LIST_HEAD)?; // lwz r11,8(r8)
+    let mut found = None;
+    if head != 0 {
+        let key = g.u32(arg.wrapping_add(KEYED_ARG_KEY))?; // lwz r9,8(r9)
+        let mut cursor = head;
+        loop {
+            let container = cursor.wrapping_sub(KEYED_NODE_IN_CONTAINER); // addi r10,r10,-80
+            if g.u32(container.wrapping_add(KEYED_CONTAINER_KEY))? == key {
+                found = Some(cursor); // cmpw cr6,r9,r7 ; beq
+                break;
+            }
+            cursor = g.u32(container.wrapping_add(KEYED_NODE_IN_CONTAINER))?; // lwz r10,80(r10)
+            if cursor == 0 {
+                break;
+            }
+        }
+    }
+    if let Some(node) = found {
+        let mut head_now = head;
+        if node == head {
+            head_now = g.u32(head.wrapping_add(KEYED_NEXT))?; // lwz r11,0(r11)
+            g.set_u32(KEYED_LIST + KEYED_LIST_HEAD, head_now)?; // stw r11,8(r8)
+        }
+        let prev = g.u32(node.wrapping_add(KEYED_PREV))?; // lwz r9,4(r10)
+        if prev != 0 {
+            let next = g.u32(node.wrapping_add(KEYED_NEXT))?;
+            g.set_u32(prev.wrapping_add(KEYED_NEXT), next)?; // stw r11,0(r9)
+            head_now = g.u32(KEYED_LIST + KEYED_LIST_HEAD)?;
+        }
+        let next = g.u32(node.wrapping_add(KEYED_NEXT))?; // lwz r9,0(r10) -- re-read
+        if next != 0 {
+            let prev = g.u32(node.wrapping_add(KEYED_PREV))?;
+            g.set_u32(next.wrapping_add(KEYED_PREV), prev)?; // stw r11,4(r9)
+            head_now = g.u32(KEYED_LIST + KEYED_LIST_HEAD)?;
+        }
+        if head_now == 0 {
+            detach_instance(g, u64::from(owner), KEYED_LIST + KEYED_LIST_RECORD)?; // bl 0x82b489d0
+        }
+    }
+    Ok(12) // li r3,12
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +571,85 @@ mod tests {
         assert!(r3 > u32::MAX as u64, "the high half survives: {r3:#x}");
         // And the low word still addressed bucket 1's manager, 32 bytes into the scheduler.
         assert_eq!(g.u32(SCHEDULER + BUCKET_STRIDE + BUCKET_FREE_HEAD).unwrap(), NODE_B);
+    }
+}
+
+#[cfg(test)]
+mod release_by_key_tests {
+    use super::*;
+    use crate::Segment;
+
+    const SYSTEM: u32 = 0x4000_0000;
+    const ARG: u32 = SYSTEM + 0x700;
+    const RECORD: u32 = KEYED_LIST + KEYED_LIST_RECORD;
+
+    fn node(i: u32) -> u32 {
+        SYSTEM + 0x100 * (i + 1) + KEYED_NODE_IN_CONTAINER
+    }
+
+    /// A doubly linked list with these keys, head first, and the record detached already (bucket 3)
+    /// so that handing it back runs only the closing stores.
+    fn guest(keys: &[u32], wanted: u32) -> Guest {
+        let mut g = Guest::from_segments(vec![
+            Segment { base: SYSTEM, bytes: vec![0u8; 0x800] },
+            Segment { base: KEYED_LIST & !0xFF, bytes: vec![0u8; 0x100] },
+            Segment { base: KEYED_OWNER_SLOT & !0xFF, bytes: vec![0u8; 0x100] },
+        ]);
+        g.set_u32(KEYED_OWNER_SLOT, SYSTEM).unwrap();
+        let n = keys.len() as u32;
+        for (i, &key) in keys.iter().enumerate() {
+            let i = i as u32;
+            g.set_u32(node(i) - KEYED_NODE_IN_CONTAINER + KEYED_CONTAINER_KEY, key).unwrap();
+            g.set_u32(node(i) + KEYED_NEXT, if i + 1 < n { node(i + 1) } else { 0 }).unwrap();
+            g.set_u32(node(i) + KEYED_PREV, if i > 0 { node(i - 1) } else { 0 }).unwrap();
+        }
+        g.set_u32(KEYED_LIST + KEYED_LIST_HEAD, if n == 0 { 0 } else { node(0) }).unwrap();
+        g.set_u32(ARG + KEYED_ARG_KEY, wanted).unwrap();
+        g.set_u32(RECORD + 16, 0xDEAD).unwrap();
+        g.set_u8(RECORD + 20, 3).unwrap();
+        g
+    }
+
+    #[test]
+    fn an_unknown_key_changes_nothing() {
+        let mut g = guest(&[5, 6], 9);
+        let before = g.clone();
+        assert_eq!(release_by_key(&mut g, ARG).unwrap(), 12);
+        for at in [KEYED_LIST + KEYED_LIST_HEAD, node(0), node(0) + 4, node(1), node(1) + 4, RECORD + 16] {
+            assert_eq!(g.u32(at).unwrap(), before.u32(at).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_middle_entry_is_unlinked_and_the_list_kept() {
+        let mut g = guest(&[5, 6, 7], 6);
+        release_by_key(&mut g, ARG).unwrap();
+        assert_eq!(g.u32(node(0) + KEYED_NEXT).unwrap(), node(2));
+        assert_eq!(g.u32(node(2) + KEYED_PREV).unwrap(), node(0));
+        assert_eq!(g.u32(KEYED_LIST + KEYED_LIST_HEAD).unwrap(), node(0));
+        assert_eq!(g.u32(RECORD + 16).unwrap(), 0xDEAD, "the list is not empty");
+    }
+
+    #[test]
+    fn the_head_entry_moves_the_head_on() {
+        let mut g = guest(&[5, 6], 5);
+        release_by_key(&mut g, ARG).unwrap();
+        assert_eq!(g.u32(KEYED_LIST + KEYED_LIST_HEAD).unwrap(), node(1));
+        assert_eq!(g.u32(node(1) + KEYED_PREV).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_last_entry_empties_the_list_and_hands_the_record_back() {
+        let mut g = guest(&[5], 5);
+        assert_eq!(release_by_key(&mut g, ARG).unwrap(), 12);
+        assert_eq!(g.u32(KEYED_LIST + KEYED_LIST_HEAD).unwrap(), 0);
+        assert_eq!(g.u32(RECORD + 16).unwrap(), 0, "detach_instance's closing store");
+        assert_eq!(g.u8(RECORD + 20).unwrap(), 3);
+    }
+
+    #[test]
+    fn an_empty_list_does_not_read_the_key() {
+        let mut g = guest(&[], 5);
+        assert_eq!(release_by_key(&mut g, 0xFFFF_0000).unwrap(), 12, "an unmapped argument is never read");
     }
 }

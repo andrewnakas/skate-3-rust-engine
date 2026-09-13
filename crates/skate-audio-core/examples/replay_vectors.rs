@@ -19,7 +19,7 @@ use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
     Guest, bitstream, buffers, contributions, counter, eval, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
     player, ring,
-    interleave, output, pitch, routing, voices,
+    bus, interleave, layout, output, pitch, routing, voices,
     scheduler, spatial, stage, system,
 };
 
@@ -915,6 +915,40 @@ fn main() {
             "sub_82B2DAC8" => pitch::advance_pitch(&mut g, v.r3, v.r4, v.r6)
                 .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
+            "sub_82B370E8" => layout::expand_layout(&mut g, v.r3)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B2FEA8" => leaves::table_ramp(&mut g, v.r3, v.r4, v.r5, f64::from_bits(v.f[0]))
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B2F798" => leaves::settle_levels(&mut g, v.r3)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B1DC00" => scheduler::release_by_key(&mut g, v.r3)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B49100" => voices::retire_object(&mut g, v.r3, v.r4)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B305C0" => bus::mix_back_channels(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            // The bus mixer builds its two pointer arrays in a 208-byte frame below r1; every word the
+            // downmix and the flat mix read there is written first, so zeroes are a sound seed.
+            "sub_82B31838" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where its pointer arrays live", v.run));
+                }
+                continue;
+            }
+            "sub_82B31838" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(bus::MIX_FRAME_BYTES), vec![0u8; bus::MIX_FRAME_BYTES as usize]);
+                bus::mix_source(&mut g, v.r3, v.r4, v.r5, sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
             // The evaluator's opcode table: every ported slot is `fn(&mut Guest, u32) -> u64` with the
             // operand block in r3, so one arm covers all of them by looking the name up.
             name if eval::TABLE.iter().any(|slot| slot.name == name && slot.port.is_some()) => {

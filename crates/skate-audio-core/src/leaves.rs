@@ -431,6 +431,175 @@ pub fn five_point_ramp(g: &mut Guest, rate_field: u32, out: u32) -> Result<u64> 
     Ok(1) // li r3,1
 }
 
+// ---------------------------------------------------------------- sub_82B2FEA8: the table ramp
+
+const _: () = assert!(RAMP_POOL == 0x822F_8600, "lis -32208 ; addi r6,r10,-31232");
+/// `lfs f8,456(r6)` — scales every ramp point.
+pub const TABLE_INPUT_SCALE: u32 = RAMP_POOL + 456;
+/// `lfs f12,460(r6)` — above this the input is clamped to it and the gain rises.
+pub const TABLE_THRESHOLD: u32 = RAMP_POOL + 460;
+/// `lfs f9,464(r6)` — the gain's scale above the threshold.
+pub const TABLE_HIGH_SCALE: u32 = RAMP_POOL + 464;
+/// `lis -32206 ; lfs f10,-22460(r9)` — the baseline gain, and the bar a gain must clear to rescale.
+pub const TABLE_BASELINE: u32 = (((-32206i32 as u32) & 0xFFFF) << 16).wrapping_sub(22460);
+const _: () = assert!(TABLE_BASELINE == 0x8231_A844);
+/// `lwz r9,1096(r3)` — the ascending table, reloaded every point.
+pub const TABLE_POINTER: u32 = 1096;
+/// `cmpwi cr6,r11,1652`.
+pub const TABLE_ENTRIES: i32 = 1652;
+/// `li r10,6 ; mtctr r10`.
+pub const TABLE_POINTS: u32 = 6;
+
+/// Map a six-point ramp through a 1,652-entry ascending table into six integers (`sub_82B2FEA8`).
+/// Returns 1.
+///
+/// `object` is `r3`, `ramp` the six floats in `r4` (the block [`five_point_ramp`]'s family fills),
+/// `out` the six words in `r5` and `input` `f1`. Only the **last** output word is cleared on entry.
+///
+/// Each point's target is `min(input, threshold) * ramp[k] * scale`, and the point stores the first
+/// table entry above it, truncated to an integer. **The table cursor persists across the points**, so
+/// the whole call is one forward sweep: a later point can never find an entry before an earlier one's,
+/// and once the sweep runs off the end, a point stores nothing. Above the threshold every point is then
+/// rescaled by `input * high_scale` — **read back out of memory**, so a point that stored nothing
+/// rescales whatever its word already held.
+pub fn table_ramp(g: &mut Guest, object: u32, ramp: u32, out: u32, input: f64) -> Result<u64> {
+    g.set_u32(out.wrapping_add(20), 0)?; // stw r11,20(r5)
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let baseline = crate::fp::load_single(g, TABLE_BASELINE)?;
+    let high_scale = crate::fp::load_single(g, TABLE_HIGH_SCALE)?;
+    let threshold = crate::fp::load_single(g, TABLE_THRESHOLD)?;
+    let input_scale = crate::fp::load_single(g, TABLE_INPUT_SCALE)?;
+    let mut index: i32 = 0; // li r11,0 -- across all six points
+    for point in 0..TABLE_POINTS {
+        let slot = out.wrapping_add(4 * point);
+        fpscr.disable_flush_mode_unconditional();
+        let value = crate::fp::load_single(g, ramp.wrapping_add(4 * point))?; // lfsx f0,r7,r8
+        let scaled = crate::fp::mul_single(value, input_scale); // fmuls f11,f0,f8
+        // fcmpu cr6,f1,f12 ; ble -- a NaN input takes the else.
+        let (selected, gain) = if input > threshold {
+            (threshold, crate::fp::mul_single(input, high_scale)) // fmr f0,f12 ; fmuls f13,f1,f9
+        } else {
+            (input, baseline) // fmr f0,f1 ; fmr f13,f10
+        };
+        let table = g.u32(object.wrapping_add(TABLE_POINTER))?; // lwz r9,1096(r3)
+        let target = crate::fp::mul_single(selected, scaled); // fmuls f0,f0,f11
+        if index < TABLE_ENTRIES {
+            let mut cursor = table.wrapping_add((index as u32) << 2);
+            loop {
+                let entry = crate::fp::load_single(g, cursor)?; // lfs f11,0(r10)
+                if entry > target {
+                    // The found entry is reloaded through the index rather than reused from f11.
+                    let found = table.wrapping_add((index as u32) << 2);
+                    index += 1;
+                    let found_value = crate::fp::load_single(g, found)?; // lfsx f0,r10,r9
+                    g.set_u32(slot, crate::fp::fctiwz_low_word(found_value))?; // fctiwz ; stfiwx
+                    break;
+                }
+                index += 1;
+                cursor = cursor.wrapping_add(4);
+                if index >= TABLE_ENTRIES {
+                    break;
+                }
+            }
+        }
+        // loc_82B2FF4C, on both paths.
+        if gain > baseline {
+            let stored = g.u32(slot)? as i32; // lwz r10,0(r8) ; extsw
+            let widened = f64::from(f64::from(stored) as f32); // fcfid f11,f0 ; frsp f7,f11
+            let rescaled = crate::fp::mul_single(widened, gain); // fmuls f6,f7,f13
+            g.set_u32(slot, crate::fp::fctiwz_low_word(rescaled))?; // fctiwz f5,f6 ; stfiwx
+        }
+    }
+    Ok(1) // li r3,1
+}
+
+// ------------------------------------------------------------ sub_82B2F798: settling the levels
+
+/// `lwz r10,12(r31)` — a second object whose level this call accumulates into.
+pub const LEVEL_LINKED: u32 = 12;
+/// `lfs f9,40(r10)` — that object's level.
+pub const LEVEL_LINKED_LEVEL: u32 = 40;
+/// `stfs f6,32(r31)` — this object's level, overwritten with the new sum.
+pub const LEVEL: u32 = 32;
+/// `lwz r11,408(r3)` — the first term's count.
+pub const LEVEL_FIRST_COUNT: u32 = 408;
+/// `lfs f1,460(r3)` — the first term's `log10` argument.
+pub const LEVEL_FIRST_VALUE: u32 = 460;
+/// `addi r11,r31,1060` — the candidates, max-reduced from 0.0.
+pub const LEVEL_CANDIDATES: u32 = 1060;
+/// `addi r9,r31,1072` — the counts, max-reduced from 0.
+pub const LEVEL_COUNTS: u32 = 1072;
+/// `lbz r9,1089(r31)` — the trip count of both reductions.
+pub const LEVEL_CANDIDATE_COUNT: u32 = 1089;
+/// `lis -32231 ; lfs 25572` — 10.0.
+pub const LEVEL_TEN: u32 = (((-32231i32 as u32) & 0xFFFF) << 16) + 25572;
+const _: () = assert!(LEVEL_TEN == 0x8219_63E4);
+
+/// `extsw ; std ; lfd ; fcfid ; frsp` — a signed word to a single.
+fn word_to_single(word: u32) -> f64 {
+    f64::from(f64::from(word as i32) as f32)
+}
+
+/// Settle two level terms and publish them (`sub_82B2F798`). `object` is `r3`.
+///
+/// Each term is `n - 10n / log10(x)`, single-rounded throughout: the first from the object's own
+/// count and value, the second from the largest count and the largest candidate over up to 255 of
+/// each (floors 0 and 0.0, NaN candidates never winning). Their sum becomes the object's level, and the
+/// change from the old level is added into the linked object's.
+///
+/// The linked pointer is loaded only after both `log10` calls, and the linked level is read before
+/// either store, so an object linked to itself sees the original's order: the linked store first, then
+/// this one. The original's 128-byte frame and its conversion scratch are not reproduced; nothing
+/// outside the call reads them.
+pub fn settle_levels(g: &mut Guest, object: u32) -> Result<()> {
+    use crate::fp::{add_single, div_single, load_single, mul_single, store_single, sub_single};
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let first_count = g.u32(object.wrapping_add(LEVEL_FIRST_COUNT))?; // lwz r11,408(r3)
+    let first_value = load_single(g, object.wrapping_add(LEVEL_FIRST_VALUE))?; // lfs f1,460(r3)
+    let n1 = word_to_single(first_count);
+    let log1 = f64::from(crate::mathlib::log10(g, first_value)? as f32); // bl 0x82f55068 ; frsp
+    fpscr.disable_flush_mode_unconditional();
+    let count = g.u8(object.wrapping_add(LEVEL_CANDIDATE_COUNT))?; // lbz r9,1089(r31)
+    let ten = load_single(g, LEVEL_TEN)?;
+    let n1_ten = mul_single(n1, ten); // fmuls f11,f30,f31
+    let mut largest = load_single(g, ZERO_CELL)?; // lfs f1,23056(r7)
+    let term1 = sub_single(n1, div_single(n1_ten, log1)); // fdivs f10 ; fsubs f30
+    if count != 0 {
+        for k in 0..u32::from(count) {
+            let candidate = load_single(g, object.wrapping_add(LEVEL_CANDIDATES + 4 * k))?;
+            if candidate > largest {
+                largest = candidate; // fcmpu ; ble ; fmr f1,f0
+            }
+        }
+    }
+    let mut most = 0i32; // li r10,0
+    if count != 0 {
+        // lbz r11,1089(r31) ; mtctr -- reloaded; nothing has been stored since, so it is `count`.
+        let trips = u32::from(g.u8(object.wrapping_add(LEVEL_CANDIDATE_COUNT))?);
+        for k in 0..trips {
+            let value = g.u32(object.wrapping_add(LEVEL_COUNTS + 4 * k))? as i32;
+            if value > most {
+                most = value; // cmpw ; ble ; mr r10,r11
+            }
+        }
+    }
+    let n2 = word_to_single(most as u32);
+    let log2 = f64::from(crate::mathlib::log10(g, largest)? as f32); // bl 0x82f55068 ; frsp
+    fpscr.disable_flush_mode_unconditional();
+    let level = load_single(g, object.wrapping_add(LEVEL))?; // lfs f11,32(r31)
+    let n2_ten = mul_single(n2, ten); // fmuls f10,f29,f31
+    let linked = g.u32(object.wrapping_add(LEVEL_LINKED))?; // lwz r10,12(r31)
+    let linked_level = load_single(g, linked.wrapping_add(LEVEL_LINKED_LEVEL))?; // lfs f9,40(r10)
+    let term2 = sub_single(n2, div_single(n2_ten, log2)); // fdivs f8 ; fsubs f7
+    let sum = add_single(term2, term1); // fadds f6,f7,f30
+    let delta = sub_single(sum, level); // fsubs f5,f6,f11
+    store_single(g, linked.wrapping_add(LEVEL_LINKED_LEVEL), add_single(delta, linked_level))?;
+    store_single(g, object.wrapping_add(LEVEL), sum)?; // stfs f6,32(r31)
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,5 +999,120 @@ mod tests {
         assert_eq!(pts[5], 100.0, "and spans to the ceiling");
         assert_eq!(pts[1], 3.0 + (100.0 - 3.0) * 0.25);
         assert_eq!(g.f32(BASE).unwrap(), 44_100.0, "the rate field is overwritten a second time");
+    }
+}
+
+#[cfg(test)]
+mod table_ramp_tests {
+    use super::*;
+
+    const BASE: u32 = 0x4000_0000;
+    const OBJECT: u32 = BASE;
+    const RAMP: u32 = BASE + 0x100;
+    const OUT: u32 = BASE + 0x200;
+    const TABLE: u32 = BASE + 0x1000;
+
+    /// Scale 1, threshold 0.5, high scale 4, baseline 1; the table holds `i` at index `i`, and the
+    /// output words are poisoned with -1.
+    fn guest(ramp: [f32; 6]) -> Guest {
+        let mut g = Guest::single(BASE, 0x3000);
+        g.put(TABLE_INPUT_SCALE, [1.0f32, 0.5, 4.0].iter().flat_map(|v| v.to_bits().to_be_bytes()).collect());
+        g.put(TABLE_BASELINE, 1.0f32.to_bits().to_be_bytes().to_vec());
+        g.set_u32(OBJECT + TABLE_POINTER, TABLE).unwrap();
+        for i in 0..TABLE_ENTRIES as u32 {
+            g.set_u32(TABLE + 4 * i, (i as f32).to_bits()).unwrap();
+        }
+        for (k, v) in ramp.iter().enumerate() {
+            g.set_u32(RAMP + 4 * k as u32, v.to_bits()).unwrap();
+            g.set_u32(OUT + 4 * k as u32, u32::MAX).unwrap();
+        }
+        g
+    }
+
+    fn out(g: &Guest) -> Vec<i32> {
+        (0..6).map(|k| g.u32(OUT + 4 * k).unwrap() as i32).collect()
+    }
+
+    #[test]
+    fn each_point_takes_the_first_entry_above_its_target() {
+        let mut g = guest([4.0, 8.0, 12.0, 16.0, 20.0, 24.0]);
+        assert_eq!(table_ramp(&mut g, OBJECT, RAMP, OUT, 0.25).unwrap(), 1);
+        assert_eq!(out(&g), [2, 3, 4, 5, 6, 7], "targets 1..6, each answered by the next entry up");
+    }
+
+    #[test]
+    fn the_sweep_never_goes_back() {
+        let mut g = guest([20.0, 4.0, 4.0, 4.0, 4.0, 4.0]);
+        table_ramp(&mut g, OBJECT, RAMP, OUT, 0.25).unwrap();
+        assert_eq!(out(&g), [6, 7, 8, 9, 10, 11], "target 1 after target 5 still answers 7, not 2");
+    }
+
+    #[test]
+    fn above_the_threshold_the_gain_rescales_the_stored_word() {
+        let mut g = guest([4.0; 6]);
+        table_ramp(&mut g, OBJECT, RAMP, OUT, 1.0).unwrap();
+        // The input clamps to 0.5, so each target is 2; the gain is 1.0 * 4.
+        assert_eq!(out(&g), [12, 16, 20, 24, 28, 32]);
+    }
+
+    #[test]
+    fn a_sweep_off_the_end_stores_nothing_but_still_rescales_what_was_there() {
+        let mut g = guest([4000.0; 6]);
+        table_ramp(&mut g, OBJECT, RAMP, OUT, 1.0).unwrap();
+        assert_eq!(out(&g), [-4, -4, -4, -4, -4, 0], "the poison rescaled; only the last word was cleared");
+    }
+}
+
+#[cfg(test)]
+mod settle_levels_tests {
+    use super::*;
+
+    const BASE: u32 = 0x4000_0000;
+    const OBJECT: u32 = BASE;
+    const LINKED: u32 = BASE + 0x800;
+
+    fn guest(count: u8) -> Guest {
+        let mut g = Guest::single(BASE, 0x1000);
+        crate::mathlib::tests::with_log_pool(&mut g);
+        g.put(LEVEL_TEN, 10.0f32.to_bits().to_be_bytes().to_vec());
+        g.put(ZERO_CELL, 0.0f32.to_bits().to_be_bytes().to_vec());
+        g.set_u32(OBJECT + LEVEL_LINKED, LINKED).unwrap();
+        g.set_u32(OBJECT + LEVEL, 1.0f32.to_bits()).unwrap();
+        g.set_u32(LINKED + LEVEL_LINKED_LEVEL, 0.5f32.to_bits()).unwrap();
+        g.set_u32(OBJECT + LEVEL_FIRST_COUNT, 3).unwrap();
+        g.set_u32(OBJECT + LEVEL_FIRST_VALUE, 100.0f32.to_bits()).unwrap();
+        g.set_u8(OBJECT + LEVEL_CANDIDATE_COUNT, count).unwrap();
+        for (k, v) in [10.0f32, 1000.0, 5.0].iter().enumerate() {
+            g.set_u32(OBJECT + LEVEL_CANDIDATES + 4 * k as u32, v.to_bits()).unwrap();
+        }
+        for (k, v) in [2i32, 7, -1].iter().enumerate() {
+            g.set_u32(OBJECT + LEVEL_COUNTS + 4 * k as u32, *v as u32).unwrap();
+        }
+        g
+    }
+
+    fn log(g: &Guest, x: f32) -> f32 {
+        crate::mathlib::log10(g, f64::from(x)).unwrap() as f32
+    }
+
+    #[test]
+    fn both_terms_are_summed_and_the_change_accumulated_into_the_linked_level() {
+        let mut g = guest(3);
+        settle_levels(&mut g, OBJECT).unwrap();
+        // Single arithmetic on single operands is what the fdivs/fsubs chain computes.
+        let term1 = 3.0f32 - (3.0f32 * 10.0) / log(&g, 100.0);
+        let term2 = 7.0f32 - (7.0f32 * 10.0) / log(&g, 1000.0);
+        let sum = term2 + term1;
+        assert_eq!(g.f32(OBJECT + LEVEL).unwrap(), sum);
+        assert_eq!(g.f32(LINKED + LEVEL_LINKED_LEVEL).unwrap(), (sum - 1.0) + 0.5);
+    }
+
+    #[test]
+    fn with_no_candidates_the_second_term_is_of_zero_and_vanishes() {
+        // largest stays 0.0, log10 of it is -inf, and 0 - 0/-inf is +0.
+        let mut g = guest(0);
+        settle_levels(&mut g, OBJECT).unwrap();
+        let term1 = 3.0f32 - (3.0f32 * 10.0) / log(&g, 100.0);
+        assert_eq!(g.f32(OBJECT + LEVEL).unwrap(), term1);
     }
 }

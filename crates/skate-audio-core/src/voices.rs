@@ -337,6 +337,95 @@ pub fn remove_handle(g: &mut Guest, object: u32) -> Result<u64> {
     Ok(1) // li r3,1
 }
 
+// ---------------------------------------------------------------- sub_82B49100: retirement
+
+/// `addi r11,r3,28` — the object's list node: `+0` next, `+4` prev.
+pub const RETIRE_NODE: u32 = 28;
+/// `stw r30,60(r31)` — zeroed; meaning unknown.
+pub const RETIRE_FIELD_60: u32 = 60;
+/// `lbz r9,68(r31)` — the handle count, reloaded every loop iteration.
+pub const RETIRE_HANDLE_COUNT: u32 = 68;
+/// `lbz r11,71(r3)` — 1 linked on the owner's `+20` list, 2 retired.
+pub const RETIRE_STATE: u32 = 71;
+/// `stw r4,76(r31)` — the argument is parked here; the handles start one word on.
+pub const RETIRE_ARG_SLOT: u32 = 76;
+/// `stw r30,36(r9)` — zeroed on each handle.
+pub const RETIRE_HANDLE_FIELD: u32 = 36;
+/// The owner's list the object leaves.
+pub const OWNER_LINKED_HEAD: u32 = 20;
+/// The owner's list it joins.
+pub const OWNER_RETIRED_HEAD: u32 = 16;
+
+/// Retire an object (`sub_82B49100`): unlink it from its owner's `+20` list if it is on it, reset
+/// the three gains and every handle's field, drop it from the owner's handle array through
+/// [`remove_handle`], then push it onto the owner's `+16` list. `object` is `r3`, `arg` `r4`.
+///
+/// An object already retired is left untouched. The handle count is read before the four reset
+/// stores and **reloaded every iteration**; the owner and the `+16` head are reloaded after
+/// [`remove_handle`], and the head a second time after the node's own two stores. The original's
+/// 112-byte frame is not reproduced: [`remove_handle`] needs none here.
+pub fn retire_object(g: &mut Guest, object: u32, arg: u32) -> Result<()> {
+    let state = g.u8(object.wrapping_add(RETIRE_STATE))?; // lbz r11,71(r3)
+    if state == 2 {
+        return Ok(()); // beq cr6,0x82b491f4 -- already retired
+    }
+    let node = object.wrapping_add(RETIRE_NODE); // addi r11,r3,28
+    if state == 1 {
+        let owner = g.u32(object.wrapping_add(HANDLE_ARRAY_OWNER))?; // lwz r9,16(r3)
+        let head = g.u32(owner.wrapping_add(OWNER_LINKED_HEAD))?; // lwz r10,20(r9)
+        if node == head {
+            let next = g.u32(head)?; // lwz r10,0(r10)
+            g.set_u32(owner.wrapping_add(OWNER_LINKED_HEAD), next)?; // stw r10,20(r9)
+        }
+        let prev = g.u32(node + 4)?; // lwz r10,4(r11)
+        if prev != 0 {
+            let next = g.u32(node)?; // lwz r9,0(r11)
+            g.set_u32(prev, next)?; // stw r9,0(r10)
+        }
+        let next = g.u32(node)?; // lwz r10,0(r11) -- reloaded after the store above
+        if next != 0 {
+            let prev = g.u32(node + 4)?;
+            g.set_u32(next.wrapping_add(4), prev)?; // stw r11,4(r10)
+        }
+    }
+    // loc_82B49170
+    let count = g.u8(object.wrapping_add(RETIRE_HANDLE_COUNT))?; // lbz r9,68(r31)
+    g.set_u32(object.wrapping_add(RETIRE_ARG_SLOT), arg)?; // stw r4,76(r31)
+    g.set_u32(object.wrapping_add(RETIRE_FIELD_60), 0)?; // stw r30,60(r31)
+    g.set_u8(object.wrapping_add(RETIRE_STATE), 2)?; // stb r8,71(r31)
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let zero = crate::fp::load_single(g, crate::leaves::ZERO_CELL)?; // lfs f0,23056(r10)
+    for k in 0..3 {
+        crate::fp::store_single(g, object.wrapping_add(4 * k), zero)?; // stfs f0,0/4/8(r31)
+    }
+    drop(fpscr);
+    if count != 0 {
+        let mut cursor = object.wrapping_add(RETIRE_ARG_SLOT); // addi r10,r31,76
+        let mut index = 0u32;
+        loop {
+            cursor = cursor.wrapping_add(4); // lwzu r9,4(r10)
+            let handle = g.u32(cursor)?;
+            index += 1;
+            g.set_u32(handle.wrapping_add(RETIRE_HANDLE_FIELD), 0)?; // stw r30,36(r9)
+            if index >= u32::from(g.u8(object.wrapping_add(RETIRE_HANDLE_COUNT))?) {
+                break; // lbz r9,68(r31) ; cmplw ; blt
+            }
+        }
+    }
+    remove_handle(g, object)?; // bl 0x82b49438
+    let owner = g.u32(object.wrapping_add(HANDLE_ARRAY_OWNER))?; // lwz r10,16(r31) -- reloaded
+    let first = g.u32(owner.wrapping_add(OWNER_RETIRED_HEAD))?; // lwz r9,16(r10)
+    g.set_u32(node + 4, 0)?; // stw r30,32(r31)
+    g.set_u32(node, first)?; // stw r9,28(r31)
+    let first_again = g.u32(owner.wrapping_add(OWNER_RETIRED_HEAD))?; // lwz r9,16(r10) -- again
+    if first_again != 0 {
+        g.set_u32(first_again.wrapping_add(4), node)?; // stw r11,4(r9)
+    }
+    g.set_u32(owner.wrapping_add(OWNER_RETIRED_HEAD), node)?; // stw r11,16(r10)
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +649,80 @@ mod tests {
         g.set_u32(stranger + HANDLE_ARRAY_OWNER, owner).unwrap();
         assert_eq!(remove_handle(&mut g, stranger).unwrap(), 0);
         assert_eq!(g.u16(owner + HANDLE_COUNT).unwrap(), 3);
+    }
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::*;
+
+    const BASE: u32 = 0x4000_0000;
+    const OBJECT: u32 = BASE + 0x100;
+    const OTHER: u32 = BASE + 0x200;
+    const FIRST: u32 = BASE + 0x300;
+    const OWNER: u32 = BASE + 0x400;
+    const H0: u32 = BASE + 0x800;
+    const H1: u32 = BASE + 0x840;
+    const ARG: u32 = 0x1234_5678;
+
+    /// The object heads its owner's +20 list with OTHER behind it, FIRST alone on the +16 list, two
+    /// handles, and an owner handle array that is empty so the removal finds nothing.
+    fn guest(state: u8) -> Guest {
+        let mut g = Guest::single(BASE, 0x1000);
+        g.put(crate::leaves::ZERO_CELL, 0.0f32.to_bits().to_be_bytes().to_vec());
+        g.set_u32(OBJECT + HANDLE_ARRAY_OWNER, OWNER).unwrap();
+        g.set_u8(OBJECT + RETIRE_STATE, state).unwrap();
+        for k in 0..3 {
+            g.set_u32(OBJECT + 4 * k, 1.5f32.to_bits()).unwrap();
+        }
+        let (node, other) = (OBJECT + RETIRE_NODE, OTHER + RETIRE_NODE);
+        g.set_u32(OWNER + OWNER_LINKED_HEAD, node).unwrap();
+        g.set_u32(node, other).unwrap();
+        g.set_u32(other + 4, node).unwrap();
+        g.set_u32(OWNER + OWNER_RETIRED_HEAD, FIRST + RETIRE_NODE).unwrap();
+        g.set_u8(OBJECT + RETIRE_HANDLE_COUNT, 2).unwrap();
+        g.set_u32(OBJECT + RETIRE_ARG_SLOT + 4, H0).unwrap();
+        g.set_u32(OBJECT + RETIRE_ARG_SLOT + 8, H1).unwrap();
+        g.set_u32(H0 + RETIRE_HANDLE_FIELD, 0x77).unwrap();
+        g.set_u32(H1 + RETIRE_HANDLE_FIELD, 0x77).unwrap();
+        g
+    }
+
+    #[test]
+    fn a_retired_object_is_left_alone() {
+        let mut g = guest(2);
+        retire_object(&mut g, OBJECT, ARG).unwrap();
+        assert_eq!(g.f32(OBJECT).unwrap(), 1.5);
+        assert_eq!(g.u32(H0 + RETIRE_HANDLE_FIELD).unwrap(), 0x77);
+        assert_eq!(g.u32(OWNER + OWNER_RETIRED_HEAD).unwrap(), FIRST + RETIRE_NODE);
+    }
+
+    #[test]
+    fn a_linked_object_moves_from_one_list_to_the_other_and_is_reset() {
+        let mut g = guest(1);
+        retire_object(&mut g, OBJECT, ARG).unwrap();
+        let node = OBJECT + RETIRE_NODE;
+        assert_eq!(g.u32(OWNER + OWNER_LINKED_HEAD).unwrap(), OTHER + RETIRE_NODE, "the head moved on");
+        assert_eq!(g.u32(OTHER + RETIRE_NODE + 4).unwrap(), 0, "and lost its prev");
+        assert_eq!(g.u32(OBJECT + RETIRE_ARG_SLOT).unwrap(), ARG);
+        assert_eq!(g.u32(OBJECT + RETIRE_FIELD_60).unwrap(), 0);
+        assert_eq!(g.u8(OBJECT + RETIRE_STATE).unwrap(), 2);
+        for k in 0..3 {
+            assert_eq!(g.f32(OBJECT + 4 * k).unwrap(), 0.0, "gain {k}");
+        }
+        assert_eq!(g.u32(H0 + RETIRE_HANDLE_FIELD).unwrap(), 0);
+        assert_eq!(g.u32(H1 + RETIRE_HANDLE_FIELD).unwrap(), 0);
+        assert_eq!(g.u32(node).unwrap(), FIRST + RETIRE_NODE, "pushed in front of the old first");
+        assert_eq!(g.u32(node + 4).unwrap(), 0);
+        assert_eq!(g.u32(FIRST + RETIRE_NODE + 4).unwrap(), node);
+        assert_eq!(g.u32(OWNER + OWNER_RETIRED_HEAD).unwrap(), node);
+    }
+
+    #[test]
+    fn an_unlinked_object_leaves_the_first_list_alone() {
+        let mut g = guest(0);
+        retire_object(&mut g, OBJECT, ARG).unwrap();
+        assert_eq!(g.u32(OWNER + OWNER_LINKED_HEAD).unwrap(), OBJECT + RETIRE_NODE);
+        assert_eq!(g.u32(OWNER + OWNER_RETIRED_HEAD).unwrap(), OBJECT + RETIRE_NODE);
     }
 }
