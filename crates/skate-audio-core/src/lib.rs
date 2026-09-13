@@ -16,10 +16,68 @@
 
 pub mod buffers;
 pub mod counter;
+pub mod cursors;
 pub mod eval;
 pub mod fp;
+pub mod mem;
 pub mod player;
+pub mod scheduler;
 pub mod system;
+
+/// The mixer's buffering and clearing layer.
+///
+/// Gated on x86_64 for one reason, and it is not SIMD: every body in these two modules emits
+/// `ctx.fpscr.disableFlushModeUnconditional()` where the original does, through [`vmx::Fpscr`],
+/// which models MXCSR. That is load-bearing rather than decorative — `rex/ppc/context.h` carries
+/// flush-to-zero and denormals-are-zero on the **scalar** side too (see [`fp`]'s module note), so a
+/// port that ran under Rust's default MXCSR would differ from the recomp on any denormal that
+/// reached it. `dsp::biquad` adds a constant to every feed-forward sum for exactly that reason,
+/// which is direct evidence denormals occur in this data.
+///
+/// [`ring::copy_from_ring`] and [`ring::fill_segments`] contain no float work at all and would run
+/// anywhere; they are here because they share a structure with [`ring::fill_tail`], which does.
+#[cfg(target_arch = "x86_64")]
+pub mod mix;
+#[cfg(target_arch = "x86_64")]
+pub mod ring;
+
+/// The VMX128 layer and the DSP kernels that stand on it.
+///
+/// Gated on x86_64 because they are a translation of RexGlue's **x86 lowering**, not of Xenon:
+/// `core::arch::x86_64` has each of RexGlue's SSE4.1/FMA intrinsics one-for-one, which is the
+/// entire reason `docs/vmx128-exactness.md` could measure the translation bit-identical. ARM64 is
+/// out of scope there for the same reason and by the same decision (`docs/PLAN.md` non-goals): its
+/// rule 4 behaviour would have to be re-measured before anything could be claimed about it.
+#[cfg(target_arch = "x86_64")]
+pub mod dsp;
+#[cfg(target_arch = "x86_64")]
+pub mod vmx;
+
+/// The spatial layer, the gain plumbing under it, and the guest math leaves they call.
+///
+/// Gated on x86_64 for the same reason [`mix`] and [`ring`] are, and it is again not SIMD: every
+/// body in these three modules is scalar float work that runs under the guest's flush mode, held
+/// through [`vmx::Fpscr`]. `sub_82B453D8` and `sub_82B45788` both take a `fsqrts` of a sum that can
+/// be denormal, and `sub_82F4DE80` subtracts two doubles whose difference can be; under Rust's
+/// default MXCSR those would keep a denormal the recomp flushes to zero.
+#[cfg(target_arch = "x86_64")]
+pub mod gains;
+#[cfg(target_arch = "x86_64")]
+pub mod mathlib;
+/// The per-channel filter stages, which stand on [`dsp::biquad`] and [`mathlib::Trig`].
+///
+/// Gated with the rest for the same reason: both bodies normalise a cutoff with `fdivs`/`fmuls` and
+/// clear their history with a rodata single, all under the guest's flush mode held through
+/// [`vmx::Fpscr`], and the kernel they call adds a denormal-avoidance bias for that exact reason.
+#[cfg(target_arch = "x86_64")]
+pub mod filters;
+#[cfg(target_arch = "x86_64")]
+pub mod spatial;
+/// The one-pole filter stage and the dispatcher that runs it over a descriptor.
+///
+/// Gated with the rest: the stage is VMX128 work under the guest's flush mode.
+#[cfg(target_arch = "x86_64")]
+pub mod stage;
 
 /// One contiguous span of guest memory.
 #[derive(Clone, Debug)]
@@ -109,6 +167,32 @@ impl Guest {
         Ok(())
     }
 
+    /// `lfd`/`ld`: eight big-endian bytes.
+    ///
+    /// Added for [`fp::load_double`], which `mathlib::floor` needs: `sub_82F4DE80` reaches its two
+    /// pool constants with `lfd`, and splitting that into two `u32` reads would invent a byte order
+    /// for the halves that the guest does not have.
+    pub fn u64(&self, ea: u32) -> Result<u64> {
+        let (i, o) = self.locate(ea, 8)?;
+        let b = &self.segments[i].bytes;
+        Ok(u64::from_be_bytes([
+            b[o],
+            b[o + 1],
+            b[o + 2],
+            b[o + 3],
+            b[o + 4],
+            b[o + 5],
+            b[o + 6],
+            b[o + 7],
+        ]))
+    }
+
+    pub fn set_u64(&mut self, ea: u32, value: u64) -> Result<()> {
+        let (i, o) = self.locate(ea, 8)?;
+        self.segments[i].bytes[o..o + 8].copy_from_slice(&value.to_be_bytes());
+        Ok(())
+    }
+
     pub fn u16(&self, ea: u32) -> Result<u16> {
         let (i, o) = self.locate(ea, 2)?;
         let b = &self.segments[i].bytes;
@@ -148,6 +232,17 @@ impl Guest {
     pub fn span(&self, base: u32, len: usize) -> Result<&[u8]> {
         let (i, o) = self.locate(base, len)?;
         Ok(&self.segments[i].bytes[o..o + len])
+    }
+
+    /// Write a block of bytes at `ea`, all or nothing.
+    ///
+    /// The byte-granular counterpart of [`Guest::span`], added for [`crate::vmx`]: a `stvx128` is
+    /// sixteen bytes at one address and a `stvlx128` is a run of one to sixteen, neither of which
+    /// decomposes into word stores without inventing an order the guest does not have.
+    pub fn set_span(&mut self, ea: u32, bytes: &[u8]) -> Result<()> {
+        let (i, o) = self.locate(ea, bytes.len())?;
+        self.segments[i].bytes[o..o + bytes.len()].copy_from_slice(bytes);
+        Ok(())
     }
 }
 

@@ -15,7 +15,10 @@
 //! on the command line. Deriving them from the expected bytes would be using the answer to
 //! check the answer.
 
-use skate_audio_core::{Guest, buffers, player, system};
+use skate_audio_core::{
+    Guest, buffers, cursors, dsp, gains, mathlib, mix, player, ring, scheduler, spatial, stage,
+    system,
+};
 
 struct Vector {
     name: String,
@@ -26,6 +29,20 @@ struct Vector {
     r6: u32,
     r7: u32,
     ret_r3: u32,
+    /// Entry `f1`..`f8` as raw bit patterns. A DSP kernel's scale factor arrives in `f1`, and the
+    /// one-pole stage's recursion state in `f5`, so without these a call cannot be replayed.
+    f: [u64; 8],
+    /// Entry `r3`..`r8`, full width. The fixed columns keep only the low word, and a port whose
+    /// argument genuinely carries 64 bits -- or whose sixth argument is `r8`, which the fixed
+    /// columns omit entirely -- cannot be replayed from those alone.
+    w: [u64; 6],
+    /// `f1` as the original left it, for the bodies whose result is a float and not a word.
+    ret_f1: Option<u64>,
+    /// Entry r1, r9 and r10. None when the recording predates them, which is different from zero:
+    /// a body that reads its ninth argument off the caller's frame cannot be replayed without r1.
+    r1: Option<u64>,
+    r9: Option<u64>,
+    r10: Option<u64>,
     /// The read set: memory the function saw but does not write.
     inputs: Vec<(u32, Vec<u8>)>,
     /// The write set: entry bytes, and what the original lifted body produced.
@@ -44,18 +61,67 @@ fn parse(line: &str) -> Option<Vector> {
     let hex = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0);
     let mut inputs = Vec::new();
     let mut windows = Vec::new();
+    let mut fprs = [0u64; 8];
+    let (mut r1, mut r9, mut r10) = (None, None, None);
+    let mut wide = [None; 6];
+    let mut ret_f1 = None;
     for tok in &f[8..] {
         let p: Vec<&str> = tok.split(':').collect();
         match (p.first(), p.len()) {
             (Some(&"I"), 4) => inputs.push((hex(p[1]), unhex(p[3]))),
             (Some(&"W"), 5) => windows.push((hex(p[1]), unhex(p[3]), unhex(p[4]))),
+            // Vectors recorded before the float columns existed simply have none, and every
+            // function that needs one fails loudly rather than replaying against a zero.
+            (Some(&"Fr"), 3) => {
+                if p[1] == "1" {
+                    ret_f1 = u64::from_str_radix(p[2], 16).ok();
+                }
+            }
+            (Some(&"R64"), 3) => {
+                if let (Ok(i), Ok(bits)) = (p[1].parse::<usize>(), u64::from_str_radix(p[2], 16)) {
+                    if (3..=8).contains(&i) {
+                        wide[i - 3] = Some(bits);
+                    }
+                    match i {
+                        1 => r1 = Some(bits),
+                        9 => r9 = Some(bits),
+                        10 => r10 = Some(bits),
+                        _ => {}
+                    }
+                }
+            }
+            (Some(&"F"), 3) => {
+                if let (Ok(i), Ok(bits)) = (p[1].parse::<usize>(), u64::from_str_radix(p[2], 16)) {
+                    if (1..=8).contains(&i) {
+                        fprs[i - 1] = bits;
+                    }
+                }
+            }
             _ => {}
         }
     }
-    if windows.is_empty() {
-        return None; // a vector with no write set compares nothing; counted as malformed
+    // A vector with no write set usually compares nothing and is malformed. The exception is a
+    // register-only body: the four-lane sine and the float-to-integer leaves write no memory at
+    // all, and their whole result is a register. Dropping those would silently exclude the
+    // functions the harness gained a result mask for in the first place.
+    if windows.is_empty() && ret_f1.is_none() {
+        return None;
+    }
+    // Older files have no wide columns; fall back to the zero-extended low word, which is right
+    // whenever the high half was zero and wrong silently when it was not -- so the wide columns
+    // are what a new recording should carry.
+    let narrow = [hex(f[2]), hex(f[3]), hex(f[4]), hex(f[5]), hex(f[6]), 0];
+    let mut w = [0u64; 6];
+    for i in 0..6 {
+        w[i] = wide[i].unwrap_or(u64::from(narrow[i]));
     }
     Some(Vector {
+        f: fprs,
+        w,
+        ret_f1,
+        r1,
+        r9,
+        r10,
         name: f[0].to_string(),
         run: f[1].parse().unwrap_or(0),
         r3: hex(f[2]),
@@ -69,20 +135,63 @@ fn parse(line: &str) -> Option<Vector> {
     })
 }
 
-/// Build guest memory holding exactly what was recorded: the read set as the function saw it,
-/// and the write set at its entry bytes. Each span is its own segment, because a real vector
-/// puts an object on the stack at 0x7018E110 and its buffers on the heap at 0x401736D0.
+/// Build guest memory holding exactly what was recorded, as the function saw it **on entry**.
 ///
 /// Nothing is invented. An address the function reaches that was not recorded stays uncovered
 /// and the vector is reported `unreplayable`, never zero-filled: feeding the port fabricated
 /// inputs would turn a failure into a meaningless pass.
+///
+/// Two things this has to get right, both found by replaying the scheduler and cursor vectors:
+///
+/// **The `W:` entry bytes are authoritative wherever they overlap an `I:` span.** The recorder
+/// used to snapshot the read set *after* the original body had run, so any cell both read and
+/// written was recorded holding the post-call value: across `sched_cursors.tsv`, 4,454 bytes sit
+/// under both an `I:` and a `W:` span with differing entry and expected bytes, and in **4,454 of
+/// 4,454** the `I:` byte is the *expected* one. That is fixed at the recorder, and a file made
+/// since shows the reverse, 4,454 of 4,454 holding the entry byte. Laying the `W:` entry bytes
+/// down last keeps files made before the fix replaying correctly and costs nothing on newer ones,
+/// where the two agree.
+///
+/// **Spans are merged byte-wise, not stored one segment each.** Overlap is common — a window
+/// often sits inside a larger read span, and sometimes shares its base — and a whole-segment
+/// model resolves it by whichever segment `Guest::locate` happens to reach first, which is
+/// insertion order. That silently fed `sub_82B489D0` a bucket byte from the read set while its
+/// own store landed in the window segment the comparison then read, and it truncated
+/// `sub_82B39690`'s 16-byte node span to the 8 bytes of a window sharing its base, losing the
+/// `which` byte four bytes past the end. Merging into one map and coalescing runs of adjacent
+/// recorded bytes removes both, without covering a single byte that was not recorded.
 fn guest_of(v: &Vector) -> Guest {
-    let mut g = Guest::default();
+    let mut cells: std::collections::BTreeMap<u32, u8> = Default::default();
     for (addr, bytes) in &v.inputs {
-        g.put(*addr, bytes.clone());
+        for (i, b) in bytes.iter().enumerate() {
+            cells.insert(addr.wrapping_add(i as u32), *b);
+        }
     }
+    // Laid down second, so the entry bytes overwrite the read set's post-call copy.
     for (addr, entry, _) in &v.windows {
-        g.put(*addr, entry.clone());
+        for (i, b) in entry.iter().enumerate() {
+            cells.insert(addr.wrapping_add(i as u32), *b);
+        }
+    }
+
+    let mut g = Guest::default();
+    let mut run: Vec<u8> = Vec::new();
+    let mut base = 0u32;
+    let mut last = 0u32;
+    for (addr, byte) in cells {
+        if !run.is_empty() && addr == last.wrapping_add(1) && addr != 0 {
+            run.push(byte);
+        } else {
+            if !run.is_empty() {
+                g.put(base, std::mem::take(&mut run));
+            }
+            base = addr;
+            run.push(byte);
+        }
+        last = addr;
+    }
+    if !run.is_empty() {
+        g.put(base, run);
     }
     g
 }
@@ -124,6 +233,10 @@ fn main() {
         total += 1;
         let t = by_name.entry(v.name.clone()).or_default();
         let mut g = guest_of(&v);
+        // Set by an arm whose result is a float; compared against the recorded `Fr:1` below.
+        let mut float_result: Option<u64> = None;
+        // Whether this record predates the wide argument columns.
+        let wide_missing = !line.contains("\tR64:");
 
         // Dispatch. A name with no Rust port is skipped and counted, never dropped.
         let outcome: std::result::Result<Option<u32>, String> = match v.name.as_str() {
@@ -153,6 +266,161 @@ fn main() {
                     t.partial += 1;
                 }
                 system::enqueue(&mut g, v.r3, v.r4, v.r5, &c)
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
+            // The scheduler and cursor ports, addressed by their guest names. Each argument's
+            // register is the one its module doc states; getting one wrong would not fail
+            // gracefully, it would compare a different call.
+            "sub_82B32550" => cursors::claim_ring_slot(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B349A8" => cursors::advance_ring_cursor(&mut g, v.r3)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B3C9D8" => cursors::advance_segment_position(&mut g, v.r3, v.r4)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B39690" => scheduler::recycle_node(&mut g, v.r3, v.r4)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B489D0" => scheduler::detach_instance(&mut g, v.w[0], v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            // The DSP kernels. `count` is r6, not r5, and the scale arrives in f1 -- both
+            // straight from the module docs, both easy to get wrong in a way that still runs.
+            "sub_82B3BED8" => dsp::scale::scale(&mut g, v.r3, v.r4, v.r6, f64::from_bits(v.f[0]))
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B44B20" => {
+                dsp::scale::scale_accumulate(&mut g, v.r3, v.r4, v.r6, f64::from_bits(v.f[0]))
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B3C098" => dsp::gain_ramp::gain_ramp_copy(
+                &mut g, v.r3, v.r4, f64::from_bits(v.f[0]), f64::from_bits(v.f[1]))
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            // The ring, mix and per-block DSP ports. Several of these take genuinely 64-bit
+            // arguments, so they are fed the wide columns rather than a zero-extended low word.
+            "sub_82B3DB90" => ring::copy_from_ring(&mut g, v.w[0], v.w[1], v.w[2], v.w[3], v.w[4])
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B3DC48" => {
+                ring::fill_segments(&mut g, v.w[0], v.w[1], v.w[2] as u32, v.w[3])
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B3DF90" => ring::fill_tail(&mut g, v.r3, v.r4, v.r5)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B43AF8" => dsp::biquad::biquad(&mut g, v.r3, v.r4, v.r5, v.r6, v.r7)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            // r8 is the step, and the fixed columns stop at r7 -- a vector without the wide
+            // columns would feed zero and make every address wrong, so it is refused instead.
+            "sub_82B43FB8" => {
+                if wide_missing {
+                    t.unreplayable += 1;
+                    if t.first_gap.is_none() {
+                        t.first_gap = Some(format!(
+                            "run {}: needs r8, which this recording predates", v.run));
+                    }
+                    continue;
+                }
+                dsp::resample::resample(&mut g, v.r3, v.r4, v.r5, v.r6, v.r7, v.w[5])
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B34E08" => mix::flush_accumulator(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B3C668" => mix::fold_deltas(&mut g, v.r3, v.r4, v.r5)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B443F8" => mix::advance_and_clear(&mut g, v.r3, v.r4, v.r5, v.r6)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            // The spatial chain. place_panner and add_angular are absent on purpose: both need
+            // the guest's sine and cosine, which have no port in either language, and substituting
+            // the host's would agree to fifteen digits and disagree in the bits the caller keeps.
+            "sub_82B453D8" => spatial::clamp_to_unit_disc(
+                &mut g, v.r3, f64::from_bits(v.f[0]), f64::from_bits(v.f[1]))
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B454B8" => {
+                spatial::pan_distance(&mut g, v.r3, v.r4, v.r6, f64::from_bits(v.f[0]))
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B45B60" => spatial::scale_gains(
+                &mut g, v.r3, v.r6, f64::from_bits(v.f[0]), f64::from_bits(v.f[1]),
+                f64::from_bits(v.f[2]))
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B29AF0" => gains::apply_gain_matrix(&mut g, v.r3, v.r4, v.r5)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            // The guest returns a constant 1 here, so comparing it against the recording is a
+            // real check that this port took the path the original took.
+            "sub_82B23B50" => gains::ramp_channels(&mut g, v.r3, v.r4, v.w[2])
+                .map(|_| Some(1u32))
+                .map_err(|e| e.to_string()),
+            // A register-only leaf: its whole result is f1, so the word comparison below has
+            // nothing to check and the float comparison is the test.
+            "sub_82F4DE80" => match mathlib::floor(&g, f64::from_bits(v.f[0])) {
+                Ok(r) => {
+                    float_result = Some(r.to_bits());
+                    Ok(None)
+                }
+                Err(e) => Err(e.to_string()),
+            },
+            // n is r3, the addend r5, the source r6, and the two outputs r7 and r8.
+            "sub_82B3CF58" => dsp::scale_add::scale_add_with_copy(
+                &mut g, v.r3, v.r5, v.r6, v.r7, v.w[5] as u32, f64::from_bits(v.f[0]))
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B3DEA8" => ring::write_into_ring(&mut g, v.w[0], v.w[1], v.w[2], v.w[3])
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            // The two stage functions need r1, r9 and r10, which older recordings lack. Refused
+            // rather than fed zeros: a zero stack pointer or source makes every address wrong.
+            "sub_82B399D0" | "sub_82B39FA0" if v.r1.is_none() || v.r10.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1/r9/r10, predates them", v.run));
+                }
+                continue;
+            }
+            "sub_82B399D0" => match stage::one_pole_stage(
+                &mut g,
+                v.w[0],
+                v.r9.unwrap_or(0),
+                v.r10.unwrap_or(0),
+                v.r1.unwrap_or(0) as u32,
+                f64::from_bits(v.f[0]),
+                f64::from_bits(v.f[1]),
+                f64::from_bits(v.f[2]),
+                f64::from_bits(v.f[3]),
+                f64::from_bits(v.f[4]),
+            ) {
+                Ok(r) => {
+                    float_result = Some(r.to_bits());
+                    Ok(None)
+                }
+                Err(e) => Err(e.to_string()),
+            },
+            // The dispatcher opens a 128-byte frame below r1 and passes the kernel three arguments
+            // through it. Its window builder leaves that frame undeclared on purpose -- it is the
+            // call's own stack, which the harness never rewinds -- so no recording holds it, and
+            // every vector used to stop at the frame's base as unreplayable. Seeding it with zeroes
+            // is sound rather than invented input: the port writes the back chain and all three
+            // argument slots before the kernel reads any of them, and the kernel loads only those
+            // three words out of its 20-byte span, so no seeded byte can reach the result.
+            "sub_82B39FA0" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(stage::FRAME_BYTES), vec![0u8; stage::FRAME_BYTES as usize]);
+                stage::run_stage(&mut g, v.r3, v.w[1], v.w[2], v.r7, sp)
                     .map(|_| None)
                     .map_err(|e| e.to_string())
             }
@@ -196,6 +464,17 @@ fn main() {
                     }
                     if bad.is_some() {
                         break;
+                    }
+                }
+                if bad.is_none() {
+                    // A float result is compared by bits, not by value: the point of porting
+                    // these is that the bits agree, and two different bit patterns can compare
+                    // equal as numbers.
+                    if let (Some(got), Some(want)) = (float_result, v.ret_f1) {
+                        if got != want {
+                            bad = Some(format!(
+                                "run {}: f1 returned {got:016X}, expected {want:016X}", v.run));
+                        }
                     }
                 }
                 if bad.is_none() {
