@@ -684,6 +684,27 @@ fn main() {
             )
             .map(|r| Some(r.r3 as u32))
             .map_err(|e| e.to_string()),
+            // The row re-fold builds two pointer arrays in its own 176-byte frame and hands them to
+            // the gather, so the frame is real guest memory no window declares. Seeding it with
+            // zeroes is sound for the same reason the stage dispatcher's is: the loops write every
+            // word the gather then reads, for the counts the call actually carries.
+            "sub_82B2C8F0" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where its pointer arrays live", v.run));
+                }
+                continue;
+            }
+            "sub_82B2C8F0" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(
+                    sp.wrapping_sub(mix::REFOLD_FRAME_BYTES),
+                    vec![0u8; mix::REFOLD_FRAME_BYTES as usize],
+                );
+                mix::refold_rows(&mut g, v.r3, v.r4, sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
             _ => {
                 t.skipped += 1;
                 continue;

@@ -11,6 +11,10 @@
 //! | [`flush_accumulator`] | `sub_82B34E08` | verified | 176 | 722,892 | 845,754 |
 //! | [`fold_deltas`] | `sub_82B3C668` | verified | 292 | 4,266 | 4,560 |
 //! | [`advance_and_clear`] | `sub_82B443F8` | verified | 122 | 500,817 | 541,975 |
+//! | [`refold_rows`] | `sub_82B2C8F0` | verified | 143 | 48,658 | 147,982 |
+//!
+//! [`refold_rows`] is replayed against **800 recorded calls, 0 disagreements**, alongside 36,457 live
+//! comparisons in the same session.
 //!
 //! [`fold_deltas`] is here because [`flush_accumulator`] calls it and nothing else in the corpus
 //! does. Porting it separately would have left the flush with a hole on exactly the path that makes
@@ -404,6 +408,115 @@ pub fn advance_and_clear(
     Ok(1) // li r3,1
 }
 
+// ------------------------------------------------------- re-folding the rows for a new channel count
+
+/// `stb r6,41(r3)` — the mixer's mirror of the count the pair was last folded for, written only when
+/// the pair has no row length yet.
+pub const MIRRORED_COUNT: u32 = 41;
+/// `lwz r7,48(r4)` — the pair's row length **in floats**. Zero means there are no rows to remap.
+pub const PAIR_ROW_LENGTH: u32 = 48;
+/// `lbz r6,60(r4)` — the channel count the pair was last folded for.
+pub const PAIR_FOLD_COUNT: u32 = 60;
+/// `stwu r1,-176(r1)` — the frame the two pointer arrays live in.
+pub const REFOLD_FRAME_BYTES: u32 = 176;
+/// `addi r4,r1,80` — eight source row pointers.
+pub const REFOLD_SOURCE_ARRAY: u32 = 80;
+/// `addi r3,r1,112` — eight destination row pointers.
+pub const REFOLD_DEST_ARRAY: u32 = 112;
+/// Both arrays hold eight words, which is what clamps the source list.
+pub const REFOLD_ARRAY_WORDS: u32 = 8;
+
+/// Re-fold the mix rows for a new channel count (`sub_82B2C8F0`).
+///
+/// `mixer` is `r3`, `pair` is `r4`, and `sp` is the guest `r1` on entry. Returns the constant 1 the
+/// original leaves in `r3`.
+///
+/// When the mixer's channel count differs from the count the owner pair was last folded for, this
+/// builds both owners' row pointers into frame scratch, hands the remap to
+/// [`crate::routing::gather_bank`], then exchanges the two owners and records the new count. When the
+/// counts agree it does nothing at all — except that a pair with **no row length** still mirrors its
+/// count into the mixer's `+41`, which happens before the comparison and on every call.
+///
+/// Four details that are the original's rather than a tidy reading:
+///
+/// - **The channel count is read three times** — once for the comparison, once as the destination
+///   loop's trip count, once for the byte finally recorded — and a store between them would be
+///   visible. The reads happen where the original has them.
+/// - **The source list is clamped to eight, unsigned** — and that matters more than it looks, because
+///   the two frame arrays abut: eight source words at `+80`, the destination words from `+112`. A
+///   ninth source pointer would be written straight onto the first *destination* pointer. The C++
+///   window builder declines calls with a count above eight outright.
+/// - **A zero count skips its loop entirely**, because `mtctr` with zero would run 2^32 times.
+/// - **The row pitch is a `rotlwi ...,2` of a `u16`** — the stride is in singles and the pitch in
+///   bytes — and the row walk is 64-bit with only the store truncating.
+///
+/// The frame is reproduced here, unlike [`crate::routing::scatter_mix`]'s: the two pointer arrays are
+/// real guest memory that [`crate::routing::gather_bank`] reads back, so they have to be written
+/// where the original writes them.
+pub fn refold_rows(g: &mut Guest, mixer: u32, pair: u32, sp: u32) -> Result<u64> {
+    // stwu r1,-176(r1) -- the back chain, inside this function's own frame.
+    let frame = sp.wrapping_sub(REFOLD_FRAME_BYTES);
+    g.set_u32(frame, sp)?;
+
+    let length = g.u32(pair + PAIR_ROW_LENGTH)?; // lwz r7,48(r4)
+    let old_count = u32::from(g.u8(pair + PAIR_FOLD_COUNT)?); // lbz r6,60(r4)
+
+    if length == 0 {
+        // stb r6,41(r3) -- before the comparison, so this happens even when nothing else does.
+        g.set_u8(mixer + MIRRORED_COUNT, old_count as u8)?;
+    }
+
+    // loc_82B2C920
+    let new_count = u32::from(g.u8(mixer + CHANNELS)?); // lbz r5,42(r30)
+    if old_count != new_count {
+        if length != 0 {
+            let back = g.u32(pair + PAIR_BACK)?; // lwz r11,28(r31)
+            let front = g.u32(pair + PAIR_FRONT)?; // lwz r4,32(r31)
+            // cmplwi cr6,r6,8 ; ble ; li r10,8 -- unsigned, so the source list stops at eight.
+            let sources = old_count.min(REFOLD_ARRAY_WORDS);
+
+            if sources != 0 {
+                let pitch = u64::from(u32::from(g.u16(back + ROW_STRIDE)?).rotate_left(2));
+                let mut row = u64::from(g.u32(back + ROW_BASE)?); // lwz r11,4(r11)
+                for i in 0..sources {
+                    g.set_u32(frame + REFOLD_SOURCE_ARRAY + 4 * i, row as u32)?; // stwu r11,4(r10)
+                    row += pitch; // add r11,r9,r11 -- 64-bit; only the store truncates
+                }
+            }
+
+            if new_count != 0 {
+                let trips = u32::from(g.u8(mixer + CHANNELS)?); // lbz r8,42(r30) -- reloaded
+                let pitch = u64::from(u32::from(g.u16(front + ROW_STRIDE)?).rotate_left(2));
+                let mut row = u64::from(g.u32(front + ROW_BASE)?); // lwz r11,4(r4)
+                for i in 0..trips {
+                    g.set_u32(frame + REFOLD_DEST_ARRAY + 4 * i, row as u32)?;
+                    row += pitch;
+                }
+            }
+
+            // loc_82B2C9A4: the destination array is r3 and the source array r4.
+            crate::routing::gather_bank(
+                g,
+                frame + REFOLD_DEST_ARRAY,
+                frame + REFOLD_SOURCE_ARRAY,
+                new_count,
+                old_count,
+                u64::from(length),
+            )?;
+        }
+
+        // loc_82B2C9B0 -- both owners reloaded, then exchanged.
+        let front_now = g.u32(pair + PAIR_FRONT)?; // lwz r11,32(r31)
+        let back_now = g.u32(pair + PAIR_BACK)?; // lwz r10,28(r31)
+        g.set_u32(pair + PAIR_BACK, front_now)?; // stw r11,28(r31)
+        g.set_u32(pair + PAIR_FRONT, back_now)?; // stw r10,32(r31)
+        let recorded = g.u8(mixer + CHANNELS)?; // lbz r9,42(r30) -- the third read
+        g.set_u8(pair + PAIR_FOLD_COUNT, recorded)?; // stb r9,60(r31)
+    }
+
+    Ok(1) // li r3,1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +535,163 @@ mod tests {
         g.put(TAP_TABLE, vec![0u8; 4 * TAP_COUNT]);
         g.put(ZERO_SINGLE, vec![0u8; 4]);
         g
+    }
+
+    // -------------------------------------------------------------------- the row re-fold
+
+    const MIXER: u32 = BASE + 0x300;
+    const SP: u32 = BASE + 0x9000;
+    const SRC_ROWS: u32 = BASE + 0x3000;
+    const DST_ROWS: u32 = BASE + 0x4000;
+    /// Row pitch in singles, deliberately not the row length, so the pitch is visible.
+    const PITCH_SINGLES: u16 = 64;
+    /// Row length in floats.
+    const ROW_FLOATS: u32 = 8;
+    const REFOLD_POISON: u32 = 0xFEED_FACE;
+
+    /// Owner A holds the source rows, owner B the destination rows; the frame is seeded the way the
+    /// replay seeds it, so a word the loops never wrote is visible.
+    fn refold_guest(old_count: u8, new_count: u8, length: u32) -> Guest {
+        let mut g = Guest::single(BASE, 0xA000);
+        g.put(crate::routing::UNITY_GAIN, 1.0f32.to_bits().to_be_bytes().to_vec());
+        g.set_u8(MIXER + CHANNELS, new_count).unwrap();
+        g.set_u8(MIXER + MIRRORED_COUNT, 0xFF).unwrap();
+        g.set_u32(PAIR + PAIR_BACK, OWNER_A).unwrap();
+        g.set_u32(PAIR + PAIR_FRONT, OWNER_B).unwrap();
+        g.set_u32(PAIR + PAIR_ROW_LENGTH, length).unwrap();
+        g.set_u8(PAIR + PAIR_FOLD_COUNT, old_count).unwrap();
+        g.set_u32(OWNER_A + ROW_BASE, SRC_ROWS).unwrap();
+        g.set_u16(OWNER_A + ROW_STRIDE, PITCH_SINGLES).unwrap();
+        g.set_u32(OWNER_B + ROW_BASE, DST_ROWS).unwrap();
+        g.set_u16(OWNER_B + ROW_STRIDE, PITCH_SINGLES).unwrap();
+        for row in 0..8u32 {
+            for i in 0..ROW_FLOATS {
+                let src = SRC_ROWS + row * 4 * u32::from(PITCH_SINGLES) + i * 4;
+                let dst = DST_ROWS + row * 4 * u32::from(PITCH_SINGLES) + i * 4;
+                g.set_u32(src, ((row + 1) as f32 * 10.0 + i as f32).to_bits()).unwrap();
+                g.set_u32(dst, REFOLD_POISON).unwrap();
+            }
+        }
+        // The frame, seeded: 176 bytes below SP.
+        for w in 0..(REFOLD_FRAME_BYTES / 4) {
+            g.set_u32(SP - REFOLD_FRAME_BYTES + w * 4, REFOLD_POISON).unwrap();
+        }
+        g
+    }
+
+    fn src_row(row: u32) -> Vec<f32> {
+        (0..ROW_FLOATS).map(|i| (row + 1) as f32 * 10.0 + i as f32).collect()
+    }
+    fn dst_row(g: &Guest, row: u32) -> Vec<f32> {
+        (0..ROW_FLOATS)
+            .map(|i| g.f32(DST_ROWS + row * 4 * u32::from(PITCH_SINGLES) + i * 4).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_pair_with_no_rows_mirrors_its_count_into_the_mixer() {
+        // The `stb r6,41(r3)` happens before the comparison, so it lands even when the counts differ
+        // and the remap is skipped.
+        let mut g = refold_guest(2, 4, 0);
+        assert_eq!(refold_rows(&mut g, MIXER, PAIR, SP).unwrap(), 1);
+        assert_eq!(g.u8(MIXER + MIRRORED_COUNT).unwrap(), 2, "the old count was mirrored");
+        // No rows were touched, but the owners still swapped and the new count was recorded.
+        assert_eq!(dst_row(&g, 0), vec![f32::from_bits(REFOLD_POISON); ROW_FLOATS as usize]);
+        assert_eq!(g.u32(PAIR + PAIR_BACK).unwrap(), OWNER_B, "owners exchanged");
+        assert_eq!(g.u32(PAIR + PAIR_FRONT).unwrap(), OWNER_A);
+        assert_eq!(g.u8(PAIR + PAIR_FOLD_COUNT).unwrap(), 4);
+    }
+
+    #[test]
+    fn equal_counts_leave_everything_alone() {
+        let mut g = refold_guest(4, 4, ROW_FLOATS);
+        assert_eq!(refold_rows(&mut g, MIXER, PAIR, SP).unwrap(), 1);
+        assert_eq!(g.u8(MIXER + MIRRORED_COUNT).unwrap(), 0xFF, "a pair with rows mirrors nothing");
+        assert_eq!(g.u32(PAIR + PAIR_BACK).unwrap(), OWNER_A, "no swap");
+        assert_eq!(g.u8(PAIR + PAIR_FOLD_COUNT).unwrap(), 4, "and no count write");
+        assert_eq!(dst_row(&g, 0), vec![f32::from_bits(REFOLD_POISON); ROW_FLOATS as usize]);
+    }
+
+    #[test]
+    fn it_remaps_the_rows_then_swaps_the_owners_and_records_the_count() {
+        // 3 -> 5 is not a standard-layout pair, so the gather copies row by row at unity gain and
+        // zeroes the destinations the sources ran out for.
+        let mut g = refold_guest(3, 5, ROW_FLOATS);
+        assert_eq!(refold_rows(&mut g, MIXER, PAIR, SP).unwrap(), 1);
+
+        for row in 0..3u32 {
+            assert_eq!(dst_row(&g, row), src_row(row), "row {row} copied");
+        }
+        for row in 3..5u32 {
+            assert_eq!(dst_row(&g, row), vec![0.0f32; ROW_FLOATS as usize], "row {row} zeroed");
+        }
+        // The sixth row is outside the new count and keeps its poison.
+        assert_eq!(dst_row(&g, 5), vec![f32::from_bits(REFOLD_POISON); ROW_FLOATS as usize]);
+        assert_eq!(g.u32(PAIR + PAIR_BACK).unwrap(), OWNER_B);
+        assert_eq!(g.u32(PAIR + PAIR_FRONT).unwrap(), OWNER_A);
+        assert_eq!(g.u8(PAIR + PAIR_FOLD_COUNT).unwrap(), 5);
+    }
+
+    #[test]
+    fn the_row_pointers_are_built_with_the_stride_as_a_byte_pitch() {
+        // The stride is in singles and the pitch is `rotlwi ...,2` of it, so row n sits
+        // 4*stride bytes on. The frame words the loops wrote say so directly.
+        let mut g = refold_guest(3, 5, ROW_FLOATS);
+        refold_rows(&mut g, MIXER, PAIR, SP).unwrap();
+        let frame = SP - REFOLD_FRAME_BYTES;
+        for i in 0..3u32 {
+            let want = SRC_ROWS + i * 4 * u32::from(PITCH_SINGLES);
+            assert_eq!(g.u32(frame + REFOLD_SOURCE_ARRAY + i * 4).unwrap(), want, "source {i}");
+        }
+        for i in 0..5u32 {
+            let want = DST_ROWS + i * 4 * u32::from(PITCH_SINGLES);
+            assert_eq!(g.u32(frame + REFOLD_DEST_ARRAY + i * 4).unwrap(), want, "dest {i}");
+        }
+        // The fourth source word was never written: only `old_count` of them are.
+        assert_eq!(g.u32(frame + REFOLD_SOURCE_ARRAY + 3 * 4).unwrap(), REFOLD_POISON);
+        // And the back chain is in the frame's first word.
+        assert_eq!(g.u32(frame).unwrap(), SP);
+    }
+
+    #[test]
+    fn the_source_list_stops_at_eight_which_is_where_the_destination_array_starts() {
+        // The two arrays **abut**: eight source words at +80, then the destination words at +112. So
+        // a ninth source pointer would land on the first *destination* pointer, and the unsigned
+        // clamp is what stops it. Observed with a new count of zero, because then the destination
+        // loop does not run and cannot cover the evidence.
+        let mut g = refold_guest(10, 0, ROW_FLOATS);
+        refold_rows(&mut g, MIXER, PAIR, SP).unwrap();
+        let frame = SP - REFOLD_FRAME_BYTES;
+        for i in 0..8u32 {
+            let want = SRC_ROWS + i * 4 * u32::from(PITCH_SINGLES);
+            assert_eq!(g.u32(frame + REFOLD_SOURCE_ARRAY + i * 4).unwrap(), want, "source {i}");
+        }
+        assert_eq!(REFOLD_SOURCE_ARRAY + 4 * REFOLD_ARRAY_WORDS, REFOLD_DEST_ARRAY, "they abut");
+        assert_eq!(
+            g.u32(frame + REFOLD_DEST_ARRAY).unwrap(),
+            REFOLD_POISON,
+            "an unclamped ninth source would have written the first destination pointer here"
+        );
+    }
+
+    #[test]
+    fn ten_sources_for_two_destinations_feeds_both_and_zeroes_nothing() {
+        let mut g = refold_guest(10, 2, ROW_FLOATS);
+        refold_rows(&mut g, MIXER, PAIR, SP).unwrap();
+        assert_eq!(dst_row(&g, 0), src_row(0));
+        assert_eq!(dst_row(&g, 1), src_row(1));
+    }
+
+    #[test]
+    fn a_new_count_of_zero_writes_no_destination_pointers() {
+        let mut g = refold_guest(2, 0, ROW_FLOATS);
+        refold_rows(&mut g, MIXER, PAIR, SP).unwrap();
+        let frame = SP - REFOLD_FRAME_BYTES;
+        assert_eq!(g.u32(frame + REFOLD_DEST_ARRAY).unwrap(), REFOLD_POISON, "loop skipped");
+        assert_eq!(dst_row(&g, 0), vec![f32::from_bits(REFOLD_POISON); ROW_FLOATS as usize]);
+        // The swap and the count still happen.
+        assert_eq!(g.u32(PAIR + PAIR_BACK).unwrap(), OWNER_B);
+        assert_eq!(g.u8(PAIR + PAIR_FOLD_COUNT).unwrap(), 0);
     }
 
     fn taps(g: &mut Guest, values: &[f32; TAP_COUNT]) {
