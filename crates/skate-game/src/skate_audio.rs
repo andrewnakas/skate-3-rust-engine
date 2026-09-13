@@ -252,7 +252,15 @@ fn finish_decoding(
 fn decode(request: &StreamRequest) -> Result<StreamPcm, String> {
     let data = std::fs::read(&request.archive).map_err(|e| format!("{e}"))?;
     let (at, end) = locate(&data, &request.entry)?;
-    let widths = audio::context_widths(request.channels);
+    // A member may carry its own stream header -- the named wheel and grain sounds do -- or be a
+    // bare block chain whose format lives in the metadata, as the ambience beds are. Prefer the
+    // header when there is one, and skip it: its low 24 bits are the sample rate, so reading it
+    // as a block header looks like a 48,000-byte block and fails far from the real mistake.
+    let (chain, channels, rate) = match audio::describe(&data, at) {
+        Ok(info) => (at + audio::STREAM_HEADER, info.channels, info.sample_rate),
+        Err(_) => (at, request.channels, request.sample_rate),
+    };
+    let widths = audio::context_widths(channels);
     let contexts = widths.len();
     if contexts == 0 {
         return Err("a stream with no channels".into());
@@ -260,12 +268,12 @@ fn decode(request: &StreamRequest) -> Result<StreamPcm, String> {
 
     let mut chains: Vec<Vec<Vec<u8>>> = vec![Vec::new(); contexts];
     let mut seen = 0usize;
-    for block in eaac::blocks(&data[at..end]).map_err(|e| e.message.clone())? {
+    for block in eaac::blocks(&data[chain..end]).map_err(|e| e.message.clone())? {
         if request.blocks != 0 && seen >= request.blocks {
             break;
         }
         let range = block.data_range();
-        let payload = &data[at + range.start..at + range.end];
+        let payload = &data[chain + range.start..chain + range.end];
         for (context, chunk) in eaac::split_block(payload, contexts)
             .map_err(|e| e.message.clone())?
             .into_iter()
@@ -277,16 +285,15 @@ fn decode(request: &StreamRequest) -> Result<StreamPcm, String> {
     }
 
     let mut per_context = Vec::with_capacity(contexts);
-    for (context, chain) in chains.iter().enumerate() {
+    for (context, chunks) in chains.iter().enumerate() {
         per_context.push(
-            audio::ffmpeg::decode_chain(chain, widths[context], request.sample_rate)
-                .map_err(|e| e.message)?,
+            audio::ffmpeg::decode_chain(chunks, widths[context], rate).map_err(|e| e.message)?,
         );
     }
     Ok(StreamPcm {
         samples: Arc::new(audio::interleave_contexts(&per_context, &widths)),
-        channels: u16::from(request.channels),
-        sample_rate: request.sample_rate,
+        channels: u16::from(channels),
+        sample_rate: rate,
     })
 }
 

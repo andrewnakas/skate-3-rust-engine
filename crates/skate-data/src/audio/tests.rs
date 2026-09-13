@@ -104,6 +104,18 @@ fn a_decoder_error_surfaces_as_decode_not_format() {
 }
 
 #[test]
+fn the_stream_header_is_skipped_before_the_block_chain() {
+    use super::STREAM_HEADER;
+    // The trap this guards: a 48 kHz header's first word is 0x0300bb80, whose low 24 bits are
+    // 48000, so reading it as a block header yields a plausible 48,000-byte block. The walk then
+    // lands mid-audio and fails far away from the real mistake.
+    let header = header_bytes(1, 48_000, 710_784);
+    assert_eq!(STREAM_HEADER, 8);
+    let word = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    assert_eq!(word & 0x00FF_FFFF, 48_000, "the trap itself");
+}
+
+#[test]
 fn context_widths_pair_channels_and_leave_an_odd_one_mono() {
     use super::context_widths;
     // The five-channel ambience bed is the case that matters: 2 + 2 + 1 is what the hardware

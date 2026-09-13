@@ -98,6 +98,14 @@ impl From<skate_audio_formats::Error> for Error {
     }
 }
 
+/// Bytes of the EA Audio Core stream header that precede the block chain.
+///
+/// Skipping it is not optional and getting it wrong is quiet rather than loud: the header's first
+/// word carries the sample rate in its low 24 bits, so a 48 kHz stream read as a block header
+/// announces a block of exactly 48,000 bytes. The walk then advances into the middle of the audio
+/// and fails somewhere downstream, which reads like a corrupt archive rather than an off-by-eight.
+pub const STREAM_HEADER: usize = 8;
+
 /// Describe the stream beginning at `at` without decoding any of it.
 pub fn describe(data: &[u8], at: usize) -> Result<StreamInfo, Error> {
     let header = eaac::Header::parse(data, at)?;
@@ -316,9 +324,11 @@ pub fn decode_stream(
     let info = describe(data, at)?;
     let widths = context_widths(info.channels);
     let mut per_context: Vec<Vec<i16>> = vec![Vec::new(); info.contexts];
-    for block in eaac::blocks(&data[at..])? {
+    // The chain follows the header this call just parsed.
+    let chain = at + STREAM_HEADER;
+    for block in eaac::blocks(&data[chain..])? {
         let range = block.data_range();
-        let payload = &data[at + range.start..at + range.end];
+        let payload = &data[chain + range.start..chain + range.end];
         for (context, chunk) in eaac::split_block(payload, info.contexts)?
             .into_iter()
             .enumerate()
