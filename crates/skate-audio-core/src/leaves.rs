@@ -10,6 +10,8 @@
 //! | [`stamp_slot`] | `sub_82B463A8` | 31 | 761,054 | 1,137,330 | a command-ring record's handler slot |
 //! | [`set_field_460`] | `sub_82B34268` | 11 | 202,510 | 304,676 | a direct `bl` |
 //! | [`fourth_argument`] | `sub_82B2C8E8` | 7 | 123,881 | 225,599 | a pointer slot only |
+//! | [`set_field_364`] | `sub_82B29278` | 11 | 1,684 | 1,685 | a direct `bl` |
+//! | [`five_point_ramp`] | `sub_82B2FE00` | 113 | 8 | 8 | a direct `bl` — **thin** |
 //! | [`stream_remaining`] | `sub_82B23C10` | 47 | 122,997 | 214,853 | five direct callers |
 //! | [`pair_record_size`] | `sub_82B4F8A8` | 17 | 1,930 | 2,166 | a direct `bl` |
 //! | [`publish_float`] | `sub_82B49268` | 17 | 745 | 981 | a command-ring record |
@@ -116,6 +118,17 @@ pub fn stamp_slot(g: &mut Guest, record: u32) -> Result<u64> {
 /// detail a rewrite from the role line alone gets wrong.
 pub fn set_field_460(g: &mut Guest, object: u32, value: u16) -> Result<u64> {
     g.set_u16(object + FIELD_460, value)?; // sth r6,460(r11)
+    Ok(0) // li r3,0
+}
+
+/// `sub_82B29278`'s only store. The same shape as [`set_field_460`], at `+364` (`0x16C`); nothing
+/// names either offset.
+pub const FIELD_364: u32 = 364;
+
+/// Store `value` as a `u16` at `object + 364`, and return 0 (`sub_82B29278`) — [`set_field_460`]'s
+/// twin: `sth r6,364(r11)` and `li r3,0`, with the value in the guest's fourth argument.
+pub fn set_field_364(g: &mut Guest, object: u32, value: u16) -> Result<u64> {
+    g.set_u16(object + FIELD_364, value)?; // sth r6,364(r11)
     Ok(0) // li r3,0
 }
 
@@ -344,6 +357,78 @@ pub fn publish_command(g: &mut Guest, record: u32) -> Result<u64> {
     g.set_u32(target.wrapping_add(72), word)?; // stw r8,72(r11)
     g.set_u8(target.wrapping_add(112), 1)?; // stb r9,112(r11)
     Ok(32) // li r3,32
+}
+
+// ------------------------------------------------------------------ the five-point ramp (thin)
+
+/// `lis -32208 ; addi -31232` — the pool three of the ramp's constants sit in.
+const RAMP_POOL: u32 = (((-32208i32 as u32) & 0xFFFF) << 16).wrapping_sub(31232);
+/// `lfs f13,468(r11)` — the rate's upper limit.
+pub const RAMP_UPPER_LIMIT: u32 = RAMP_POOL + 468;
+/// `lfs f0,472(r11)` — where the ramp starts when the span hits the ceiling.
+pub const RAMP_BASE: u32 = RAMP_POOL + 472;
+/// `lfs f12,476(r11)` — the rate written back when the span hits the ceiling.
+pub const RAMP_START: u32 = RAMP_POOL + 476;
+/// `lis -32250 ; lfs 3152` — the rate's lower limit.
+pub const RAMP_LOWER_LIMIT: u32 = (((-32250i32 as u32) & 0xFFFF) << 16) + 3152;
+/// `lis -32247 ; lfs -32180` — the rate-to-first-point scale.
+pub const RAMP_SCALE_A: u32 = (((-32247i32 as u32) & 0xFFFF) << 16).wrapping_sub(32180);
+/// `lis -32222 ; lfs 18868` — the first-point-to-span scale. **0x49B4, not 0x4BB4**: reading this
+/// immediate by eye produced the project's first shadow divergence, which is why it is computed.
+pub const RAMP_SCALE_B: u32 = (((-32222i32 as u32) & 0xFFFF) << 16) + 18868;
+/// `lis -32241 ; lfs -10884` — the span's ceiling (the clipper's 100.0 cell).
+pub const RAMP_CEILING: u32 = (((-32241i32 as u32) & 0xFFFF) << 16).wrapping_sub(10884);
+/// `lis -32246 ; lfs -28032` — the step scale.
+pub const RAMP_STEP_SCALE: u32 = (((-32246i32 as u32) & 0xFFFF) << 16).wrapping_sub(28032);
+const _: () = assert!(RAMP_POOL == 0x822F_8600 && RAMP_UPPER_LIMIT == 0x822F_87D4);
+const _: () = assert!(RAMP_SCALE_A == 0x8208_824C && RAMP_SCALE_B == 0x8222_49B4);
+const _: () = assert!(RAMP_CEILING == 0x820E_D57C && RAMP_STEP_SCALE == 0x8209_9280);
+const _: () = assert!(RAMP_LOWER_LIMIT == 0x8206_0C50);
+
+/// Clamp a rate into range, then fill a five-point ramp plus its span (`sub_82B2FE00`, **thin**:
+/// eight calls a session). `rate_field` is `r3`, `out` is `r4`; returns 1.
+///
+/// The rate is clamped in place — above the upper limit to it, and below the lower limit **or NaN**
+/// to the lower limit, since the second compare is `bge` and an unordered rate fails it. Then the rate
+/// is **re-read** from memory, scaled into a first point and a span, and if the span passes the
+/// ceiling the ramp restarts from the pool's own base and the rate field is overwritten a second
+/// time. The five points are an arithmetic progression from `first`, each `fadds` single-rounded from
+/// the one before rather than computed as `first + k*step`, and the span is stored at `+20` before the
+/// points are.
+#[cfg(target_arch = "x86_64")]
+pub fn five_point_ramp(g: &mut Guest, rate_field: u32, out: u32) -> Result<u64> {
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let rate = fp::load_single(g, rate_field)?; // lfs f0,0(r3)
+    let mut limit = fp::load_single(g, RAMP_UPPER_LIMIT)?; // lfs f13,468(r11)
+    let mut clamp = rate > limit; // fcmpu ; bgt
+    if !clamp {
+        limit = fp::load_single(g, RAMP_LOWER_LIMIT)?; // lfs f13,3152(r10)
+        clamp = !(rate >= limit); // bge -- so a NaN clamps, to the lower limit
+    }
+    if clamp {
+        fp::store_single(g, rate_field, limit)?; // stfs f13,0(r3)
+    }
+    let clamped = fp::load_single(g, rate_field)?; // lfs f13,0(r3) -- reloaded
+    let mut first = fp::mul_single(clamped, fp::load_single(g, RAMP_SCALE_A)?); // fmuls f0,f13,f0
+    let mut span = fp::mul_single(first, fp::load_single(g, RAMP_SCALE_B)?); // fmuls f13,f0,f13
+    let ceiling = fp::load_single(g, RAMP_CEILING)?; // lfs f12,-10884(r8)
+    if span > ceiling {
+        span = ceiling; // fmr f13,f12
+        let start = fp::load_single(g, RAMP_START)?; // lfs f12,476(r11)
+        first = fp::load_single(g, RAMP_BASE)?; // lfs f0,472(r11)
+        fp::store_single(g, rate_field, start)?; // stfs f12,0(r3)
+    }
+    let width = fp::sub_single(span, first); // fsubs f12,f13,f0
+    fp::store_single(g, out.wrapping_add(20), span)?; // stfs f13,20(r4)
+    fp::store_single(g, out, first)?; // stfs f0,0(r4)
+    let step = fp::mul_single(width, fp::load_single(g, RAMP_STEP_SCALE)?); // fmuls f11,f12,f13
+    let mut point = first;
+    for k in 1..5u32 {
+        point = fp::add_single(if k == 1 { step } else { point }, if k == 1 { first } else { step });
+        fp::store_single(g, out.wrapping_add(4 * k), point)?; // fadds ; stfs +4, +8, +12, +16
+    }
+    Ok(1) // li r3,1
 }
 
 #[cfg(test)]
@@ -676,5 +761,74 @@ mod tests {
         assert_eq!(LIST_HEAD, 0x830C_0000 - 8520);
         assert_eq!(SENTINEL_DOUBLE, 0x8230_0000 - 31232 + 256);
         assert_eq!(ZERO_CELL, crate::mix::ZERO_SINGLE, "the image's zero, reached again");
+    }
+
+    #[test]
+    fn the_field_at_364_is_two_bytes_and_the_result_is_zero() {
+        let mut g = Guest::single(BASE, 0x400);
+        g.set_u32(BASE + FIELD_364, POISON).unwrap();
+        assert_eq!(set_field_364(&mut g, BASE, 0xABCD).unwrap(), 0);
+        assert_eq!(g.u16(BASE + FIELD_364).unwrap(), 0xABCD);
+        assert_eq!(g.u16(BASE + FIELD_364 + 2).unwrap(), 0xBEEF, "two bytes, not four");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn ramp_guest(rate: f32) -> Guest {
+        let mut g = Guest::single(BASE, 0x400);
+        for (addr, v) in [
+            (RAMP_UPPER_LIMIT, 48000.0f32), (RAMP_BASE, 3.0), (RAMP_START, 44100.0),
+            (RAMP_LOWER_LIMIT, 2.0), (RAMP_SCALE_A, 0.001), (RAMP_SCALE_B, 4.0),
+            (RAMP_CEILING, 100.0), (RAMP_STEP_SCALE, 0.25),
+        ] {
+            g.put(addr, v.to_bits().to_be_bytes().to_vec());
+        }
+        g.set_u32(BASE, rate.to_bits()).unwrap();
+        g
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn ramp_points(g: &Guest) -> Vec<f32> {
+        (0..6u32).map(|k| g.f32(BASE + 0x40 + 4 * k).unwrap()).collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_ramp_is_an_arithmetic_progression_from_the_scaled_rate() {
+        let mut g = ramp_guest(10_000.0);
+        assert_eq!(five_point_ramp(&mut g, BASE, BASE + 0x40).unwrap(), 1);
+        let first = 10_000.0f32 * 0.001; // 10
+        let span = first * 4.0; // 40, under the ceiling
+        let step = (span - first) * 0.25; // 7.5
+        assert_eq!(ramp_points(&g), vec![first, first + step, first + 2.0 * step, first + 3.0 * step, first + 4.0 * step, span]);
+        assert_eq!(g.f32(BASE).unwrap(), 10_000.0, "an in-range rate is left alone");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_rate_clamps_both_ways_and_a_nan_takes_the_lower_limit() {
+        for (rate, want) in [(90_000.0f32, 48_000.0f32), (1.0, 2.0), (f32::NAN, 2.0)] {
+            let mut g = ramp_guest(rate);
+            five_point_ramp(&mut g, BASE, BASE + 0x40).unwrap();
+            // 48000 * 0.001 * 4 = 192 is past the ceiling, so the upper clamp is then overwritten by
+            // the pool's start value; the other two stay at the lower limit.
+            let stored = g.f32(BASE).unwrap();
+            if rate > 48_000.0 {
+                assert_eq!(stored, 44_100.0, "rate {rate}: the ceiling path rewrites it");
+            } else {
+                assert_eq!(stored, want, "rate {rate}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_span_past_the_ceiling_restarts_from_the_pool_base() {
+        let mut g = ramp_guest(40_000.0); // first 40, span 160 > 100
+        five_point_ramp(&mut g, BASE, BASE + 0x40).unwrap();
+        let pts = ramp_points(&g);
+        assert_eq!(pts[0], 3.0, "the ramp starts from the pool's base");
+        assert_eq!(pts[5], 100.0, "and spans to the ceiling");
+        assert_eq!(pts[1], 3.0 + (100.0 - 3.0) * 0.25);
+        assert_eq!(g.f32(BASE).unwrap(), 44_100.0, "the rate field is overwritten a second time");
     }
 }

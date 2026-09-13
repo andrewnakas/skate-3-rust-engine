@@ -17,7 +17,7 @@
 
 use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
-    Guest, bitstream, buffers, contributions, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
+    Guest, bitstream, buffers, contributions, counter, eval, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
     player, ring,
     interleave, output, routing, voices,
     scheduler, spatial, stage, system,
@@ -863,6 +863,24 @@ fn main() {
             "sub_82B2C658" => filters::peaking_stage(&mut g, &mut mathlib::Image, v.w[0], v.r4)
                 .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
+            // The six-word cascading counter: no arguments, and its whole result is the 64-bit sum in
+            // r3, of which the recording keeps the low word. Ported long before it had an arm.
+            "sub_82B1F360" => counter::advance(&mut g).map(|r| Some(r as u32)).map_err(|e| e.to_string()),
+            "sub_82B29278" => leaves::set_field_364(&mut g, v.r3, v.r6 as u16)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B2FE00" => leaves::five_point_ramp(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            // The evaluator's opcode table: every ported slot is `fn(&mut Guest, u32) -> u64` with the
+            // operand block in r3, so one arm covers all of them by looking the name up.
+            name if eval::TABLE.iter().any(|slot| slot.name == name && slot.port.is_some()) => {
+                let op = eval::TABLE.iter().find(|slot| slot.name == name).and_then(|slot| slot.port);
+                match op {
+                    Some(op) => op(&mut g, v.r3).map(|r| Some(r as u32)).map_err(|e| e.to_string()),
+                    None => Err(format!("{name}: no port in eval::TABLE")),
+                }
+            }
             _ => {
                 t.skipped += 1;
                 continue;
