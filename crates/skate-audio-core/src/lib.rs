@@ -91,6 +91,13 @@ pub mod crossfade;
 #[cfg(target_arch = "x86_64")]
 pub mod routing;
 
+/// Planar channels into interleaved frames, the last shuffle before the driver.
+///
+/// Gated with the rest because every sample passes through an `lfs`/`stfs` pair under the guest's
+/// flush mode, held through [`vmx::Fpscr`] by the kernels around it.
+#[cfg(target_arch = "x86_64")]
+pub mod interleave;
+
 /// One contiguous span of guest memory.
 #[derive(Clone, Debug)]
 pub struct Segment {

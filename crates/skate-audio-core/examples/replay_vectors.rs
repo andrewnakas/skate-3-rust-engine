@@ -18,7 +18,7 @@
 use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
     Guest, buffers, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix, player, ring,
-    routing,
+    interleave, routing,
     scheduler, spatial, stage, system,
 };
 
@@ -633,6 +633,19 @@ fn main() {
             "sub_82B426D0" => routing::scatter_mix(
                 &mut g, v.r3, v.r4, v.r5, v.r6, v.r7, v.w[5] as u32)
                 .map(|_| None)
+                .map_err(|e| e.to_string()),
+            // The planar-to-interleaved shuffle. Its cursor argument and its result are both the
+            // full 64-bit r3 — the recorded return compares the low word — so it needs the wide
+            // columns rather than the truncated one.
+            "sub_82B46B30" if wide_missing => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs the wide r3 cursor", v.run));
+                }
+                continue;
+            }
+            "sub_82B46B30" => interleave::interleave_six(&mut g, v.w[0], v.r4)
+                .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
             _ => {
                 t.skipped += 1;
