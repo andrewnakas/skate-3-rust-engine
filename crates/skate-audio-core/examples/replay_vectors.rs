@@ -17,9 +17,9 @@
 
 use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
-    Guest, buffers, contributions, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
+    Guest, bitstream, buffers, contributions, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
     player, ring,
-    interleave, routing,
+    interleave, output, routing,
     scheduler, spatial, stage, system,
 };
 
@@ -710,6 +710,67 @@ fn main() {
             // writes; on the correction path it reaches log10, whose pool the recording now carries.
             "sub_82B225A0" => contributions::republish(&mut g, v.r3)
                 .map(|_| None)
+                .map_err(|e| e.to_string()),
+            // The packet stream's decoders. The bit reader's count is r4 at full width.
+            "sub_82B26B70" if wide_missing => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs the wide r4 bit count", v.run));
+                }
+                continue;
+            }
+            "sub_82B26B70" => bitstream::read_bits(&mut g, v.r3, v.w[1])
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B4F5F8" => bitstream::decode_unsigned(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B46EA0" => bitstream::decode_signed(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B46FB0" => bitstream::decode_signed_into(&mut g, v.r3)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B47010" => bitstream::run_length_step(&mut g, v.r3)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B47658" => bitstream::decode_four(&mut g, v.r3, v.r4)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B50270" => bitstream::advance_bit_cursor(&mut g, v.r3, v.r4)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            // The output stage. Both functions open frames that hold real guest memory — the
+            // pass's two pointer arrays — which no window declares because they are the call's own
+            // stack. Seeding them with zeroes is sound: the loops write every pointer word the
+            // scatter-mixer then reads, for the output count the call carries.
+            "sub_82B21D98" | "sub_82B21F58" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where the pointer arrays live", v.run));
+                }
+                continue;
+            }
+            "sub_82B21D98" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(output::MIX_FRAME_BYTES), vec![0u8; output::MIX_FRAME_BYTES as usize]);
+                output::mix_and_clamp(&mut g, v.r3, sp).map(|_| None).map_err(|e| e.to_string())
+            }
+            "sub_82B21F58" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                let depth = output::PASS_FRAME_BYTES + output::MIX_FRAME_BYTES;
+                g.put(sp.wrapping_sub(depth), vec![0u8; depth as usize]);
+                output::output_pass(&mut g, v.r3, sp).map(|r| Some(r as u32)).map_err(|e| e.to_string())
+            }
+            "sub_82B20E18" if wide_missing => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs the wide r3", v.run));
+                }
+                continue;
+            }
+            "sub_82B20E18" => output::ramp_block(&mut g, v.w[0])
+                .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
             _ => {
                 t.skipped += 1;

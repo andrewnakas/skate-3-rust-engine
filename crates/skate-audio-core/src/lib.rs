@@ -14,6 +14,7 @@
 //! Unsafe is not forbidden crate-wide the way it is in `skate-audio-formats`, because the
 //! DSP modules will scope `unsafe` to intrinsic calls. Nothing in this file needs it.
 
+pub mod bitstream;
 pub mod buffers;
 pub mod counter;
 pub mod cursors;
@@ -97,6 +98,12 @@ pub mod routing;
 /// mode, held through [`vmx::Fpscr`].
 #[cfg(target_arch = "x86_64")]
 pub mod contributions;
+
+/// The output stage — route, interleave, ramp once, clamp — which composes the modules around it.
+///
+/// Gated with them, because it calls them.
+#[cfg(target_arch = "x86_64")]
+pub mod output;
 
 /// Planar channels into interleaved frames, the last shuffle before the driver.
 ///
