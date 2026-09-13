@@ -12,6 +12,14 @@
 //! | [`lowpass_stage`] | `sub_82B27E20` | verified | 214 | 183,427 | 291,143 |
 //! | [`highpass_stage`] | `sub_82B26568` | verified | 287 | 171,012 | 276,388 |
 //! | [`build_lowpass_coefficients`] | `sub_82B43CC0` | verified | 111 | 4,400 | 3,226 |
+//! | [`shelf_stage`] | `sub_82B26740` | verified | 263 | 24,936 | 29,673 |
+//! | [`build_shelf_coefficients`] | `sub_82B43D78` | thin | 163 | 82 | 514 |
+//! | [`peaking_stage`] | `sub_82B2C658` | verified | 386 | 61,716 | 90,841 |
+//!
+//! The shelf pair is replayed against **3,000 recorded calls, 0 disagreements** — 2,996 for the stage
+//! and only 4 for the thin builder, which rebuilds coefficients that rarely; its unit tests carry the
+//! rest. The peaking equaliser is **unit-tested only** for now: its recording session lost its display
+//! (the frame clock stopped, no audio thread came up) and never reached gameplay.
 //!
 //! Every one of those `.inc` headers leads with `// STATUS: verified` and `docs/ports.md` agrees on
 //! all three — checked before translating, because a header reading `thin`, `partial` or `gate-`
@@ -582,6 +590,391 @@ pub fn highpass_stage<T: Trig>(
     // loc_82B266AC
     filter_channels_and_swap(g, object, stream_low)?;
     Ok(1) // loc_82B26724: li r3,1
+}
+
+// ============================================================ sub_82B43D78 + sub_82B26740: the shelf
+
+/// `lis -32208 ; addi -31232 ; lfs 2128` — measured 0.70710653, the alpha scale of an RBJ shelf at
+/// slope S = 1. Next to the low-pass's pool cells, and read live like them.
+pub const SHELF_ALPHA_SCALE: u32 = 0x822F_8E50;
+/// `lis -32250 ; lfs 3152` — 2.0.
+pub const SHELF_TWO: u32 = (((-32250i32 as u32) & 0xFFFF) << 16) + 3152;
+/// `lis -32247 ; lfs 16760` — −2.0.
+pub const SHELF_MINUS_TWO: u32 = (((-32247i32 as u32) & 0xFFFF) << 16) + 16760;
+/// `lis -32206 ; lfs -22460` — 1.0, which is also the "no shelf" gain the stage bypasses on.
+pub const SHELF_ONE: u32 = (((-32206i32 as u32) & 0xFFFF) << 16).wrapping_sub(22460);
+const _: () = assert!(SHELF_ALPHA_SCALE == 0x822F_0000 + 0x8E50);
+const _: () = assert!(SHELF_TWO == 0x8206_0C50 && SHELF_MINUS_TWO == 0x8209_4178 && SHELF_ONE == 0x8231_A844);
+
+/// `f32` at `+60` — the shelf gain, handed to the builder as its linear amplitude squared.
+pub const SHELF_GAIN: u32 = 60;
+/// `f32[4]` per channel from `+64` — the biquad histories.
+pub const SHELF_HISTORY: u32 = 64;
+/// `s32` at `+192` — 1 while the shelf is running, 0 once its histories have been cleared.
+pub const SHELF_ENGAGED: u32 = 192;
+/// `f32[5]` at `+196` — the builder's `[a1, a2, b0, b1, b2] / a0`.
+pub const SHELF_COEFFICIENTS: u32 = 196;
+/// `f32` at `+216` — the corner the coefficients were built for.
+pub const SHELF_CACHED_CORNER: u32 = 216;
+/// `f32` at `+220` — the gain they were built for.
+pub const SHELF_CACHED_GAIN: u32 = 220;
+
+/// Build the five normalised high-shelf coefficients at `coefficients` (`sub_82B43D78`, **thin**).
+///
+/// `angle` is `f1` and `gain` is `f2`. With `A = sqrt(gain)` and `alpha = sin(angle) * 0.70710653`
+/// this is the RBJ high shelf at slope 1, divided through by `a0`. Written in the lifted order and
+/// precision, with two details kept that a tidier version drops: `sqrt(A)` is taken **four separate
+/// times** (four `fsqrts` of the same value), and every multiply-add is a scalar `fmadds` or
+/// `fnmsubs` — one rounding — which is not the same as the separate multiply and add a reader of the
+/// formula would write.
+pub fn build_shelf_coefficients<T: Trig>(
+    g: &mut Guest,
+    trig: &mut T,
+    coefficients: u32,
+    angle: f64,
+    gain: f64,
+) -> Result<()> {
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional(); // stfd f29,-40(r1)
+    let sine_raw = trig.sine(g, angle)?; // bl 0x82f4ded0
+    fpscr.disable_flush_mode_unconditional();
+    let sine = fp::frsp(sine_raw); // frsp f29,f1
+    let cosine_raw = trig.cosine(g, angle)?; // fmr f1,f30 ; bl 0x82f4dfb0
+    fpscr.disable_flush_mode_unconditional();
+
+    let a = fp::sqrt_single(gain); // fsqrts f10,f31
+    let one = fp::load_single(g, SHELF_ONE)?;
+    let alpha_scale = fp::load_single(g, SHELF_ALPHA_SCALE)?;
+    let two = fp::load_single(g, SHELF_TWO)?;
+    let minus_two = fp::load_single(g, SHELF_MINUS_TWO)?;
+    let cosine = fp::frsp(cosine_raw); // frsp f9,f1
+    let a_plus = fp::add_single(a, one); // fadds f8,f10,f13
+    let a_minus = fp::sub_single(a, one); // fsubs f7,f10,f13
+    let alpha = fp::mul_single(sine, alpha_scale); // fmuls f6,f29,f12
+
+    let beta0 = fp::mul_single(fp::sqrt_single(a), alpha); // fsqrts f5 ; fmuls f4,f5,f6
+    let a0_base = fp::nmsub_single(a_minus, cosine, a_plus); // fnmsubs f3,f7,f9,f8
+    let beta1 = fp::sqrt_single(a); // fsqrts f2,f10
+    let a0 = fp::fmadd_single(beta0, two, a0_base); // fmadds f1,f4,f0,f3
+    let beta2 = fp::mul_single(beta1, alpha); // fmuls f12,f2,f6
+    let a_minus_cos = fp::mul_single(a_minus, cosine); // fmuls f5,f7,f9
+    let beta3 = fp::sqrt_single(a); // fsqrts f4,f10
+    let inv_a0 = fp::div_single(one, a0); // fdivs f3,f13,f1
+    let beta4 = fp::sqrt_single(a); // fsqrts f2,f10
+    let b0_mid = fp::fmadd_single(beta2, two, a_minus_cos); // fmadds f1,f12,f0,f5
+    let b1_base = fp::fmadd_single(a_plus, cosine, a_minus); // fmadds f13,f8,f9,f7
+    let b2_base = fp::fmadd_single(a_minus, cosine, a_plus); // fmadds f12,f7,f9,f8
+    let beta5 = fp::mul_single(beta3, alpha); // fmuls f5,f4,f6
+    let a1_base = fp::nmsub_single(a_plus, cosine, a_minus); // fnmsubs f4,f8,f9,f7
+    let a2_base = fp::nmsub_single(a_minus, cosine, a_plus); // fnmsubs f9,f7,f9,f8
+    let beta6 = fp::mul_single(beta4, alpha); // fmuls f7,f2,f6
+    let b0_sum = fp::add_single(b0_mid, a_plus); // fadds f6,f1,f8
+    let b1_norm = fp::mul_single(b1_base, inv_a0); // fmuls f2,f13,f3
+    let b2_sum = fp::nmsub_single(beta5, two, b2_base); // fnmsubs f1,f5,f0,f12
+    let a1_norm = fp::mul_single(a1_base, inv_a0); // fmuls f13,f4,f3
+    let a2_sum = fp::nmsub_single(beta6, two, a2_base); // fnmsubs f12,f7,f0,f9
+    let b0_norm = fp::mul_single(b0_sum, inv_a0); // fmuls f9,f6,f3
+    let b1_scaled = fp::mul_single(b1_norm, a); // fmuls f8,f2,f10
+    let b2_norm = fp::mul_single(b2_sum, inv_a0); // fmuls f7,f1,f3
+
+    let at = |k: u32| coefficients.wrapping_add(k);
+    fp::store_single(g, at(dsp::biquad::COEFF_A1), fp::mul_single(a1_norm, two))?;
+    fp::store_single(g, at(dsp::biquad::COEFF_A2), fp::mul_single(a2_sum, inv_a0))?;
+    fp::store_single(g, at(dsp::biquad::COEFF_B0), fp::mul_single(b0_norm, a))?;
+    fp::store_single(g, at(dsp::biquad::COEFF_B1), fp::mul_single(b1_scaled, minus_two))?;
+    fp::store_single(g, at(dsp::biquad::COEFF_B2), fp::mul_single(b2_norm, a))
+}
+
+/// `mullw ; rlwinm 2,0,29 ; add` — one channel's float array. `mullw` is the 64-bit product of two
+/// sign-extended words, the shift is 32-bit, and the add is 64-bit on zero-extended words; the callee
+/// uses only the low half.
+fn shelf_channel_address(stride: u16, index: u32, buffer: u32) -> u64 {
+    let elements = i64::from(i32::from(stride)) * i64::from(index as i32);
+    u64::from((elements as u32) << 2) + u64::from(buffer)
+}
+
+/// Run the per-source shelf filter (`sub_82B26740`): `object` is `r3`, `pair` the buffer-descriptor
+/// pair in `r4`. Returns 1 on every path.
+///
+/// The corner is the low-pass's normalised cutoff over the same pool cells ([`normalised_cutoff`],
+/// [`CUTOFF_CEILING`], [`CUTOFF_FLOOR`] — one test pins that they are the same addresses). Then:
+///
+/// - **At or past the ceiling, or at unity gain, the shelf is bypassed.** A NaN corner is unordered
+///   and bypasses too; a NaN gain compares unequal to 1.0 and keeps filtering. On the bypass the
+///   histories are cleared once — only when the engaged flag is exactly 1 — and the flag drops to 0.
+/// - **Otherwise it filters**: the engaged flag is set, the corner is floored, the coefficients are
+///   rebuilt only when the (corner, gain) pair moved, every channel runs through the biquad, and the
+///   pair's two words are exchanged.
+///
+/// Both paths publish the cache, and on both the gain is **reloaded** from `+60` for it rather than
+/// reused. The channel count is re-read after every channel, and the descriptor fields every
+/// iteration, as the original does.
+pub fn shelf_stage<T: Trig>(g: &mut Guest, trig: &mut T, object: u32, pair: u32) -> Result<u64> {
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional(); // stfd f31,-64(r1)
+    let format = g.u32(pair.wrapping_add(STREAM_FORMAT))?; // lwz r10,40(r4)
+    let mut corner = normalised_cutoff(g, object, format)?;
+    let limit = fp::load_single(g, CUTOFF_CEILING)?; // lfs f13,2176(r11)
+
+    let mut gain = 0.0;
+    let mut filter = false;
+    if corner < limit {
+        gain = fp::load_single(g, object.wrapping_add(SHELF_GAIN))?; // lfs f2,60(r3)
+        filter = gain != fp::load_single(g, SHELF_ONE)?; // fcmpu ; beq -- unity is a no-op
+    }
+
+    if filter {
+        if g.u32(object.wrapping_add(SHELF_ENGAGED))? as i32 == 0 {
+            g.set_u32(object.wrapping_add(SHELF_ENGAGED), 1)?; // li r10,1 ; stw r10,192(r3)
+        }
+        let floor_value = fp::load_single(g, CUTOFF_FLOOR)?; // lfs f0,2172(r11)
+        if corner < floor_value {
+            corner = floor_value; // fmr f31,f0
+        }
+        let cached_corner = fp::load_single(g, object.wrapping_add(SHELF_CACHED_CORNER))?;
+        let unchanged = corner == cached_corner
+            && gain == fp::load_single(g, object.wrapping_add(SHELF_CACHED_GAIN))?;
+        if !unchanged {
+            build_shelf_coefficients(g, trig, object.wrapping_add(SHELF_COEFFICIENTS), corner, gain)?;
+            fpscr.disable_flush_mode_unconditional();
+            let published = fp::load_single(g, object.wrapping_add(SHELF_GAIN))?; // reloaded
+            fp::store_single(g, object.wrapping_add(SHELF_CACHED_CORNER), corner)?;
+            fp::store_single(g, object.wrapping_add(SHELF_CACHED_GAIN), published)?;
+        }
+
+        let mut channels = u32::from(g.u8(object.wrapping_add(CHANNEL_COUNT))?); // lbz r11,42(r30)
+        let input_desc = g.u32(pair.wrapping_add(STREAM_BUFFER_A))?; // lwz r29,28(r26)
+        let output_desc = g.u32(pair.wrapping_add(STREAM_BUFFER_B))?; // lwz r28,32(r26)
+        if channels != 0 {
+            let coefficients = object.wrapping_add(SHELF_COEFFICIENTS);
+            let mut history = object.wrapping_add(SHELF_HISTORY);
+            let mut index = 0u32;
+            loop {
+                // All four descriptor fields are re-read on every iteration.
+                let in_stride = g.u16(input_desc.wrapping_add(DESC_STRIDE))?;
+                let out_stride = g.u16(output_desc.wrapping_add(DESC_STRIDE))?;
+                let in_base = g.u32(input_desc.wrapping_add(DESC_BASE))?;
+                let out_base = g.u32(output_desc.wrapping_add(DESC_BASE))?;
+                let output = shelf_channel_address(out_stride, index, out_base) as u32;
+                let input = shelf_channel_address(in_stride, index, in_base) as u32;
+                dsp::biquad::biquad(g, history, output, input, coefficients, BLOCK_FRAMES)?;
+                channels = u32::from(g.u8(object.wrapping_add(CHANNEL_COUNT))?); // reloaded
+                index += 1;
+                history = history.wrapping_add(16);
+                if index >= channels {
+                    break; // cmplw ; blt
+                }
+            }
+        }
+        // loc_82B26858 -- the swap, with both words reloaded.
+        let swap_out = g.u32(pair.wrapping_add(STREAM_BUFFER_B))?;
+        let swap_in = g.u32(pair.wrapping_add(STREAM_BUFFER_A))?;
+        g.set_u32(pair.wrapping_add(STREAM_BUFFER_A), swap_out)?;
+        g.set_u32(pair.wrapping_add(STREAM_BUFFER_B), swap_in)?;
+        return Ok(1);
+    }
+
+    // loc_82B26878 -- bypassed. cmpwi cr6,r11,1: only exactly 1 clears.
+    if g.u32(object.wrapping_add(SHELF_ENGAGED))? as i32 == 1 {
+        let mut channels = u32::from(g.u8(object.wrapping_add(CHANNEL_COUNT))?);
+        if channels != 0 {
+            let zero = fp::load_single(g, crate::leaves::ZERO_CELL)?; // lfs f0,23056(r9)
+            let mut cursor = object.wrapping_add(SHELF_GAIN); // addi r11,r30,60
+            let mut done = 0u32;
+            loop {
+                fp::store_single(g, cursor.wrapping_add(4), zero)?; // stfs f0,4(r11)
+                done += 1;
+                fp::store_single(g, cursor.wrapping_add(8), zero)?; // stfs f0,8(r11)
+                fp::store_single(g, cursor.wrapping_add(12), zero)?; // stfs f0,12(r11)
+                cursor = cursor.wrapping_add(16); // stfsu f0,16(r11)
+                fp::store_single(g, cursor, zero)?;
+                channels = u32::from(g.u8(object.wrapping_add(CHANNEL_COUNT))?); // reloaded
+                if done >= channels {
+                    break;
+                }
+            }
+        }
+        g.set_u32(object.wrapping_add(SHELF_ENGAGED), 0)?; // stw r11,192(r30)
+    }
+    let published = fp::load_single(g, object.wrapping_add(SHELF_GAIN))?; // lfs f0,60(r30)
+    fp::store_single(g, object.wrapping_add(SHELF_CACHED_CORNER), corner)?;
+    fp::store_single(g, object.wrapping_add(SHELF_CACHED_GAIN), published)?;
+    Ok(1)
+}
+
+// ============================================================ sub_82B2C658: the peaking equaliser
+
+/// `f32` at `+68` — the peak's Q. Clamped for the arithmetic, cached **unclamped**.
+pub const PEAK_QUALITY: u32 = 68;
+/// `f32[4]` per channel from `+72` — the biquad histories.
+pub const PEAK_HISTORY: u32 = 72;
+/// `s32` at `+200` — 1 while filtering, 0 once a bypass has cleared the histories.
+pub const PEAK_FILTERING: u32 = 200;
+/// `f32[5]` at `+204` — `[a1, a2, b0, b1, b2] / a0`.
+pub const PEAK_COEFFICIENTS: u32 = 204;
+/// `f32` at `+224` — the clamped angle the coefficients were built at.
+pub const PEAK_CACHED_WARP: u32 = 224;
+/// `f32` at `+228` — the gain they were built at.
+pub const PEAK_CACHED_GAIN: u32 = 228;
+/// `f32` at `+232` — the Q they were built at, as stored rather than as clamped.
+pub const PEAK_CACHED_QUALITY: u32 = 232;
+/// `lis -32246 ; lfs -28032` — the lowest Q the arithmetic uses.
+pub const QUALITY_FLOOR: u32 = (((-32246i32 as u32) & 0xFFFF) << 16).wrapping_sub(28032);
+/// `lis -32246 ; lfs -26900` — the highest.
+pub const QUALITY_CEILING: u32 = (((-32246i32 as u32) & 0xFFFF) << 16).wrapping_sub(26900);
+const _: () = assert!(QUALITY_FLOOR == 0x8209_9280 && QUALITY_CEILING == 0x8209_96EC);
+
+/// Run the per-channel peaking equaliser over a 256-frame block (`sub_82B2C658`). `object` is `r3`
+/// at full width, `stream` the descriptor pair in `r4`. Returns 1 on every path.
+///
+/// The same family as the shelf and the low-pass, and different from both in ways the tests pin:
+///
+/// - **The angle is clamped, never bypassed on.** Below the floor it rises to it, above the ceiling it
+///   falls to it; only a gain of exactly 1.0 bypasses. A NaN angle is kept as it is, and a NaN gain
+///   is "not equal" and filters.
+/// - **Q is clamped for the arithmetic but cached as stored.** The cache check compares the raw `+68`
+///   against the raw cache, so a Q outside the clamp does not force a rebuild every block.
+/// - **The coefficients are the RBJ peak**: `alpha = sin / 2Q`, and with `A = sqrt(gain)` the
+///   numerator uses `alpha * A` and the denominator `alpha / A`. `b1` and `a1` are the same product,
+///   computed twice.
+/// - On the bypass the histories are cleared once — only when the flag reads exactly 1 — and the
+///   descriptor pair is **not** swapped.
+pub fn peaking_stage<T: Trig>(g: &mut Guest, trig: &mut T, object: u64, stream: u32) -> Result<u64> {
+    let obj = object as u32;
+    let at = |k: u32| obj.wrapping_add(k);
+    let format = g.u32(stream.wrapping_add(STREAM_FORMAT))?; // lwz r10,40(r4)
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let mut warp = normalised_cutoff(g, obj, format)?; // fdivs ; fmuls -- two roundings
+    let warp_floor = fp::load_single(g, CUTOFF_FLOOR)?; // lfs f0,2172(r11)
+    if warp < warp_floor {
+        warp = warp_floor; // fmr f29,f0
+    } else {
+        let warp_ceiling = fp::load_single(g, CUTOFF_CEILING)?; // lfs f0,2176(r11)
+        if warp > warp_ceiling {
+            warp = warp_ceiling;
+        }
+    }
+
+    let gain = fp::load_single(g, at(SHELF_GAIN))?; // lfs f28,60(r30)
+    let unit = fp::load_single(g, SHELF_ONE)?; // lfs f31,-22460(r11)
+    let filtering = g.u32(at(PEAK_FILTERING))? as i32; // lwz r11,200(r30)
+
+    if gain == unit {
+        // The first bypassed block clears the histories, once.
+        if filtering == 1 {
+            let mut channels = u32::from(g.u8(at(CHANNEL_COUNT))?);
+            if channels != 0 {
+                let zero = fp::load_single(g, crate::leaves::ZERO_CELL)?;
+                let mut cursor = at(PEAK_QUALITY); // addi r11,r30,68
+                let mut done = 0u32;
+                loop {
+                    fp::store_single(g, cursor.wrapping_add(4), zero)?;
+                    done += 1;
+                    fp::store_single(g, cursor.wrapping_add(8), zero)?;
+                    fp::store_single(g, cursor.wrapping_add(12), zero)?;
+                    cursor = cursor.wrapping_add(16); // stfsu f0,16(r11)
+                    fp::store_single(g, cursor, zero)?;
+                    channels = u32::from(g.u8(at(CHANNEL_COUNT))?); // reloaded
+                    if done >= channels {
+                        break;
+                    }
+                }
+            }
+            g.set_u32(at(PEAK_FILTERING), 0)?;
+        }
+        let gain_now = fp::load_single(g, at(SHELF_GAIN))?;
+        let quality_now = fp::load_single(g, at(PEAK_QUALITY))?;
+        fp::store_single(g, at(PEAK_CACHED_WARP), warp)?;
+        fp::store_single(g, at(PEAK_CACHED_GAIN), gain_now)?;
+        fp::store_single(g, at(PEAK_CACHED_QUALITY), quality_now)?;
+        return Ok(1); // no kernel, no swap
+    }
+
+    if filtering == 0 {
+        g.set_u32(at(PEAK_FILTERING), 1)?; // tested on the value loaded above
+    }
+    let mut unchanged = warp == fp::load_single(g, at(PEAK_CACHED_WARP))?;
+    if unchanged {
+        unchanged = gain == fp::load_single(g, at(PEAK_CACHED_GAIN))?;
+    }
+    if unchanged {
+        let quality_now = fp::load_single(g, at(PEAK_QUALITY))?;
+        unchanged = quality_now == fp::load_single(g, at(PEAK_CACHED_QUALITY))?;
+    }
+    if !unchanged {
+        let mut quality = fp::load_single(g, at(PEAK_QUALITY))?; // lfs f30,68(r30)
+        let quality_floor = fp::load_single(g, QUALITY_FLOOR)?;
+        if quality < quality_floor {
+            quality = quality_floor;
+        } else {
+            let quality_ceiling = fp::load_single(g, QUALITY_CEILING)?;
+            if quality > quality_ceiling {
+                quality = quality_ceiling;
+            }
+        }
+        let sine_raw = trig.sine(g, warp)?; // fmr f1,f29 ; bl 0x82f4ded0
+        fpscr.disable_flush_mode_unconditional();
+        let sine = fp::frsp(sine_raw); // frsp f26,f1
+        let cosine_raw = trig.cosine(g, warp)?; // bl 0x82f4dfb0
+        fpscr.disable_flush_mode_unconditional();
+        let amplitude = fp::sqrt_single(gain); // fsqrts f12,f28
+        let gain_now = fp::load_single(g, at(SHELF_GAIN))?;
+        let quality_now = fp::load_single(g, at(PEAK_QUALITY))?;
+        fp::store_single(g, at(PEAK_CACHED_GAIN), gain_now)?; // stfs f11,228(r30)
+        fp::store_single(g, at(PEAK_CACHED_QUALITY), quality_now)?; // stfs f10,232(r30)
+        let two = fp::load_single(g, SHELF_TWO)?;
+        let minus_two = fp::load_single(g, SHELF_MINUS_TWO)?;
+        fp::store_single(g, at(PEAK_CACHED_WARP), warp)?; // stfs f29,224(r30)
+        let two_q = fp::mul_single(quality, two); // fmuls f9,f30,f0
+        let cosine = fp::frsp(cosine_raw); // frsp f8,f1
+        let alpha = fp::div_single(sine, two_q); // fdivs f7,f26,f9
+        let cos_term = fp::mul_single(cosine, minus_two); // fmuls f6,f8,f13
+        let alpha_over_a = fp::div_single(alpha, amplitude); // fdivs f5,f7,f12
+        let alpha_times_a = fp::mul_single(amplitude, alpha); // fmuls f4,f12,f7
+        let a0 = fp::add_single(alpha_over_a, unit); // fadds f3,f5,f31
+        let a2 = fp::sub_single(unit, alpha_over_a); // fsubs f2,f31,f5
+        let b0 = fp::add_single(alpha_times_a, unit); // fadds f1,f4,f31
+        let b2 = fp::sub_single(unit, alpha_times_a); // fsubs f0,f31,f4
+        let inv = fp::div_single(unit, a0); // fdivs f13,f31,f3
+        let c = at(PEAK_COEFFICIENTS);
+        fp::store_single(g, c, fp::mul_single(inv, cos_term))?; // stfs 204 -- a1
+        fp::store_single(g, c + 4, fp::mul_single(a2, inv))?; // stfs 208 -- a2
+        fp::store_single(g, c + 8, fp::mul_single(b0, inv))?; // stfs 212 -- b0
+        fp::store_single(g, c + 12, fp::mul_single(inv, cos_term))?; // stfs 216 -- b1, again
+        fp::store_single(g, c + 16, fp::mul_single(b2, inv))?; // stfs 220 -- b2
+    }
+
+    // loc_82B2C834 -- every channel through the biquad, reading A and writing B.
+    let mut channels = u32::from(g.u8(at(CHANNEL_COUNT))?);
+    let src_desc = g.u32(stream.wrapping_add(STREAM_BUFFER_A))?;
+    let dst_desc = g.u32(stream.wrapping_add(STREAM_BUFFER_B))?;
+    if channels != 0 {
+        let coefficients = (object + u64::from(PEAK_COEFFICIENTS)) as u32;
+        let mut history = (object + u64::from(PEAK_HISTORY)) as u32;
+        let mut index = 0u32;
+        loop {
+            let src_stride = g.u16(src_desc.wrapping_add(DESC_STRIDE))?;
+            let dst_stride = g.u16(dst_desc.wrapping_add(DESC_STRIDE))?;
+            let src_base = g.u32(src_desc.wrapping_add(DESC_BASE))?;
+            let dst_base = g.u32(dst_desc.wrapping_add(DESC_BASE))?;
+            let src = shelf_channel_address(src_stride, index, src_base) as u32;
+            let dst = shelf_channel_address(dst_stride, index, dst_base) as u32;
+            dsp::biquad::biquad(g, history, dst, src, coefficients, BLOCK_FRAMES)?;
+            channels = u32::from(g.u8(at(CHANNEL_COUNT))?); // reloaded
+            index += 1;
+            history = history.wrapping_add(16); // on the r3 the kernel left, which it never writes
+            if index >= channels {
+                break;
+            }
+        }
+    }
+    // loc_82B2C89C -- the swap, both loads before both stores.
+    let new_a = g.u32(stream.wrapping_add(STREAM_BUFFER_B))?;
+    let new_b = g.u32(stream.wrapping_add(STREAM_BUFFER_A))?;
+    g.set_u32(stream.wrapping_add(STREAM_BUFFER_A), new_a)?;
+    g.set_u32(stream.wrapping_add(STREAM_BUFFER_B), new_b)?;
+    Ok(1)
 }
 
 #[cfg(test)]
@@ -1180,5 +1573,328 @@ mod tests {
             }
             assert_eq!(crate::vmx::get_mxcsr(), before);
         }
+    }
+
+    // ------------------------------------------------------------------------------ the shelf
+
+    const SH_BASE: u32 = 0x4000_0000;
+    const SH_OBJ: u32 = SH_BASE + 0x100;
+    const SH_PAIR: u32 = SH_BASE + 0x400;
+    const SH_FORMAT: u32 = SH_BASE + 0x440;
+    const SH_IN_DESC: u32 = SH_BASE + 0x480;
+    const SH_OUT_DESC: u32 = SH_BASE + 0x4C0;
+    const SH_IN: u32 = SH_BASE + 0x1000;
+    const SH_OUT: u32 = SH_BASE + 0x3000;
+    const SH_COEFFS_SCRATCH: u32 = SH_BASE + 0x800;
+    const SH_POISON: u32 = 0xDEAD_BEEF;
+
+    fn shelf_trig() -> crate::mathlib::tests::Scripted {
+        crate::mathlib::tests::Scripted { sine: 0.3, cosine: 0.95, ..Default::default() }
+    }
+
+    fn shelf_guest(channels: u8, nominal: f32, gain: f32) -> Guest {
+        let mut g = Guest::single(SH_BASE, 0x6000);
+        for (addr, v) in [
+            (CUTOFF_SCALE, 1.0f32),
+            (CUTOFF_CEILING, 0.45),
+            (CUTOFF_FLOOR, 0.001),
+            (SHELF_ONE, 1.0),
+            (SHELF_ALPHA_SCALE, 0.707_106_53),
+            (SHELF_TWO, 2.0),
+            (SHELF_MINUS_TWO, -2.0),
+            (crate::leaves::ZERO_CELL, 0.0),
+            (dsp::biquad::DENORM_BIAS, 0.0),
+        ] {
+            g.put(addr, v.to_bits().to_be_bytes().to_vec());
+        }
+        g.set_u8(SH_OBJ + CHANNEL_COUNT, channels).unwrap();
+        g.set_u32(SH_OBJ + CUTOFF_INPUT, nominal.to_bits()).unwrap();
+        g.set_u32(SH_OBJ + SHELF_GAIN, gain.to_bits()).unwrap();
+        g.set_u32(SH_OBJ + SHELF_CACHED_CORNER, (-1.0f32).to_bits()).unwrap();
+        g.set_u32(SH_OBJ + SHELF_CACHED_GAIN, (-1.0f32).to_bits()).unwrap();
+        for w in 0..(16 * 8 / 4) {
+            g.set_u32(SH_OBJ + SHELF_HISTORY + 4 * w, SH_POISON).unwrap();
+        }
+        g.set_u32(SH_PAIR + STREAM_FORMAT, SH_FORMAT).unwrap();
+        g.set_u32(SH_FORMAT + FORMAT_SAMPLE_RATE, 1.0f32.to_bits()).unwrap();
+        g.set_u32(SH_PAIR + STREAM_BUFFER_A, SH_IN_DESC).unwrap();
+        g.set_u32(SH_PAIR + STREAM_BUFFER_B, SH_OUT_DESC).unwrap();
+        for (desc, buf) in [(SH_IN_DESC, SH_IN), (SH_OUT_DESC, SH_OUT)] {
+            g.set_u32(desc + DESC_BASE, buf).unwrap();
+            g.set_u16(desc + DESC_STRIDE, 256).unwrap();
+        }
+        for c in 0..u32::from(channels) {
+            for i in 0..BLOCK_FRAMES {
+                let v = (c as f32 + 1.0) * 0.1 * ((i % 7) as f32 - 3.0);
+                g.set_u32(SH_IN + 1024 * c + 4 * i, v.to_bits()).unwrap();
+            }
+        }
+        g
+    }
+
+    fn coeff(g: &Guest, at: u32, k: u32) -> f32 {
+        g.f32(at + k).unwrap()
+    }
+
+    #[test]
+    fn a_unity_gain_shelf_is_flat() {
+        // A = 1 makes the numerator equal the denominator: b0 = 1, b1 = a1, b2 = a2. That is a
+        // property of the RBJ shelf, not of this code, so it checks the arithmetic independently.
+        let mut g = shelf_guest(1, 0.1, 1.0);
+        let mut trig = shelf_trig();
+        build_shelf_coefficients(&mut g, &mut trig, SH_COEFFS_SCRATCH, 0.5, 1.0).unwrap();
+        let c = |k| coeff(&g, SH_COEFFS_SCRATCH, k);
+        assert!((c(dsp::biquad::COEFF_B0) - 1.0).abs() < 1e-6, "b0 = {}", c(dsp::biquad::COEFF_B0));
+        assert!((c(dsp::biquad::COEFF_B1) - c(dsp::biquad::COEFF_A1)).abs() < 1e-6);
+        assert!((c(dsp::biquad::COEFF_B2) - c(dsp::biquad::COEFF_A2)).abs() < 1e-6);
+        assert_eq!(trig.asked, vec![('s', 0.5), ('c', 0.5)], "sine then cosine, of one angle");
+    }
+
+    #[test]
+    fn the_shelf_coefficients_match_the_rbj_formula() {
+        // The textbook high shelf at slope 1, in f64, with the same sine, cosine and alpha scale.
+        let gain = 4.0f64;
+        let mut g = shelf_guest(1, 0.1, gain as f32);
+        build_shelf_coefficients(&mut g, &mut shelf_trig(), SH_COEFFS_SCRATCH, 0.5, gain).unwrap();
+        let (s, c) = (0.3f64, 0.95f64);
+        let a = gain.sqrt();
+        let alpha = s * f64::from(0.707_106_53f32);
+        let sa = a.sqrt();
+        let a0 = (a + 1.0) - (a - 1.0) * c + 2.0 * sa * alpha;
+        let want = [
+            2.0 * ((a - 1.0) - (a + 1.0) * c) / a0,
+            ((a + 1.0) - (a - 1.0) * c - 2.0 * sa * alpha) / a0,
+            a * ((a + 1.0) + (a - 1.0) * c + 2.0 * sa * alpha) / a0,
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * c) / a0,
+            a * ((a + 1.0) + (a - 1.0) * c - 2.0 * sa * alpha) / a0,
+        ];
+        let keys = [
+            dsp::biquad::COEFF_A1,
+            dsp::biquad::COEFF_A2,
+            dsp::biquad::COEFF_B0,
+            dsp::biquad::COEFF_B1,
+            dsp::biquad::COEFF_B2,
+        ];
+        for (k, w) in keys.iter().zip(want) {
+            let got = f64::from(coeff(&g, SH_COEFFS_SCRATCH, *k));
+            assert!((got - w).abs() <= 1e-5 * w.abs().max(1.0), "coefficient +{k}: {got} vs {w}");
+        }
+    }
+
+    #[test]
+    fn at_or_past_the_ceiling_the_shelf_clears_once_and_bypasses() {
+        // corner = 0.5 / 1.0 = 0.5, past the 0.45 ceiling. Engaged is exactly 1, so the histories are
+        // cleared and the flag drops; the pair is not swapped and the trigonometry is never asked.
+        let mut g = shelf_guest(2, 0.5, 4.0);
+        g.set_u32(SH_OBJ + SHELF_ENGAGED, 1).unwrap();
+        let mut trig = shelf_trig();
+        assert_eq!(shelf_stage(&mut g, &mut trig, SH_OBJ, SH_PAIR).unwrap(), 1);
+        for w in 0..8u32 {
+            assert_eq!(g.u32(SH_OBJ + SHELF_HISTORY + 4 * w).unwrap(), 0, "history word {w}");
+        }
+        assert_eq!(g.u32(SH_OBJ + SHELF_HISTORY + 32).unwrap(), SH_POISON, "two channels only");
+        assert_eq!(g.u32(SH_OBJ + SHELF_ENGAGED).unwrap(), 0);
+        assert_eq!(g.f32(SH_OBJ + SHELF_CACHED_CORNER).unwrap(), 0.5, "the cache is published");
+        assert_eq!(g.f32(SH_OBJ + SHELF_CACHED_GAIN).unwrap(), 4.0);
+        assert_eq!(g.u32(SH_PAIR + STREAM_BUFFER_A).unwrap(), SH_IN_DESC, "no swap");
+        assert!(trig.asked.is_empty());
+
+        // An engaged flag of 2 is not exactly 1: nothing is cleared and the flag stays.
+        let mut g = shelf_guest(2, 0.5, 4.0);
+        g.set_u32(SH_OBJ + SHELF_ENGAGED, 2).unwrap();
+        shelf_stage(&mut g, &mut shelf_trig(), SH_OBJ, SH_PAIR).unwrap();
+        assert_eq!(g.u32(SH_OBJ + SHELF_HISTORY).unwrap(), SH_POISON);
+        assert_eq!(g.u32(SH_OBJ + SHELF_ENGAGED).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_unity_gain_bypasses_even_below_the_ceiling() {
+        let mut g = shelf_guest(1, 0.1, 1.0);
+        let mut trig = shelf_trig();
+        shelf_stage(&mut g, &mut trig, SH_OBJ, SH_PAIR).unwrap();
+        assert!(trig.asked.is_empty(), "no coefficients built");
+        assert_eq!(g.u32(SH_OUT).unwrap(), 0, "nothing filtered into the (zeroed) output");
+        assert_eq!(g.u32(SH_PAIR + STREAM_BUFFER_A).unwrap(), SH_IN_DESC, "no swap");
+    }
+
+    #[test]
+    fn the_filter_path_rebuilds_filters_every_channel_and_swaps() {
+        let initial = shelf_guest(2, 0.1, 4.0);
+        let mut g = initial.clone();
+        for w in 0..8u32 {
+            g.set_u32(SH_OBJ + SHELF_HISTORY + 4 * w, 0).unwrap();
+        }
+        let before = g.clone();
+        let mut trig = shelf_trig();
+        assert_eq!(shelf_stage(&mut g, &mut trig, SH_OBJ, SH_PAIR).unwrap(), 1);
+
+        assert_eq!(trig.asked.len(), 2, "the pair (corner, gain) moved, so the coefficients were rebuilt");
+        assert_eq!(g.u32(SH_OBJ + SHELF_ENGAGED).unwrap(), 1);
+        assert_eq!(g.f32(SH_OBJ + SHELF_CACHED_GAIN).unwrap(), 4.0);
+        assert_eq!(g.u32(SH_PAIR + STREAM_BUFFER_A).unwrap(), SH_OUT_DESC, "swapped");
+        assert_eq!(g.u32(SH_PAIR + STREAM_BUFFER_B).unwrap(), SH_IN_DESC);
+
+        // Every channel equals the biquad run directly, with the coefficients the stage built and
+        // the history block the channel owns. That pins the channel addressing and the offsets.
+        let mut h = before;
+        for k in 0..5u32 {
+            let bits = g.u32(SH_OBJ + SHELF_COEFFICIENTS + 4 * k).unwrap();
+            h.set_u32(SH_OBJ + SHELF_COEFFICIENTS + 4 * k, bits).unwrap();
+        }
+        for ch in 0..2u32 {
+            dsp::biquad::biquad(
+                &mut h,
+                SH_OBJ + SHELF_HISTORY + 16 * ch,
+                SH_OUT + 1024 * ch,
+                SH_IN + 1024 * ch,
+                SH_OBJ + SHELF_COEFFICIENTS,
+                BLOCK_FRAMES,
+            )
+            .unwrap();
+        }
+        for ch in 0..2u32 {
+            for i in [0u32, 1, 100, 255] {
+                let at = SH_OUT + 1024 * ch + 4 * i;
+                assert_eq!(g.u32(at).unwrap(), h.u32(at).unwrap(), "channel {ch}, sample {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unchanged_corner_and_gain_reuse_the_coefficients() {
+        let mut g = shelf_guest(1, 0.1, 4.0);
+        g.set_u32(SH_OBJ + SHELF_CACHED_CORNER, 0.1f32.to_bits()).unwrap();
+        g.set_u32(SH_OBJ + SHELF_CACHED_GAIN, 4.0f32.to_bits()).unwrap();
+        for k in 0..5u32 {
+            g.set_u32(SH_OBJ + SHELF_COEFFICIENTS + 4 * k, 0.0f32.to_bits()).unwrap();
+        }
+        let mut trig = shelf_trig();
+        shelf_stage(&mut g, &mut trig, SH_OBJ, SH_PAIR).unwrap();
+        assert!(trig.asked.is_empty(), "no rebuild");
+        assert_eq!(g.u32(SH_OBJ + SHELF_COEFFICIENTS + 8).unwrap(), 0, "coefficients untouched");
+    }
+
+    #[test]
+    fn the_shelf_shares_the_low_pass_pool_cells() {
+        assert_eq!(SHELF_ONE, ONE_SINGLE);
+        assert_eq!(SHELF_TWO, TWO_SINGLE);
+        assert_eq!(SHELF_MINUS_TWO, MINUS_TWO_SINGLE);
+        assert_eq!((CUTOFF_CEILING, CUTOFF_FLOOR, CUTOFF_SCALE), (0x822F_8E80, 0x822F_8E7C, 0x820B_411C));
+    }
+
+    // ------------------------------------------------------------------ the peaking equaliser
+
+    fn peak_guest(channels: u8, nominal: f32, gain: f32, quality: f32) -> Guest {
+        let mut g = shelf_guest(channels, nominal, gain);
+        for (addr, v) in [(QUALITY_FLOOR, 0.5f32), (QUALITY_CEILING, 20.0)] {
+            g.put(addr, v.to_bits().to_be_bytes().to_vec());
+        }
+        g.set_u32(SH_OBJ + PEAK_QUALITY, quality.to_bits()).unwrap();
+        for k in [PEAK_CACHED_WARP, PEAK_CACHED_GAIN, PEAK_CACHED_QUALITY] {
+            g.set_u32(SH_OBJ + k, (-1.0f32).to_bits()).unwrap();
+        }
+        for w in 0..(16 * 8 / 4) {
+            g.set_u32(SH_OBJ + PEAK_HISTORY + 4 * w, 0).unwrap();
+        }
+        g
+    }
+
+    fn rbj_peak(sine: f64, cosine: f64, gain: f64, q: f64) -> [f64; 5] {
+        let a = gain.sqrt();
+        let alpha = sine / (2.0 * q);
+        let a0 = 1.0 + alpha / a;
+        [-2.0 * cosine / a0, (1.0 - alpha / a) / a0, (1.0 + alpha * a) / a0, -2.0 * cosine / a0, (1.0 - alpha * a) / a0]
+    }
+
+    fn peak_coefficients(g: &Guest) -> [f64; 5] {
+        let mut out = [0.0; 5];
+        for (k, v) in out.iter_mut().enumerate() {
+            *v = f64::from(g.f32(SH_OBJ + PEAK_COEFFICIENTS + 4 * k as u32).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn the_peak_coefficients_match_the_rbj_formula_and_b1_equals_a1() {
+        let mut g = peak_guest(1, 0.1, 2.0, 1.5);
+        let mut trig = shelf_trig();
+        assert_eq!(peaking_stage(&mut g, &mut trig, u64::from(SH_OBJ), SH_PAIR).unwrap(), 1);
+        let got = peak_coefficients(&g);
+        for (k, (x, w)) in got.iter().zip(rbj_peak(0.3, 0.95, 2.0, 1.5)).enumerate() {
+            assert!((x - w).abs() <= 1e-5 * w.abs().max(1.0), "coefficient {k}: {x} vs {w}");
+        }
+        assert_eq!(got[0].to_bits(), got[3].to_bits(), "b1 and a1 are the same product");
+        assert_eq!(trig.asked, vec![('s', 0.1f32 as f64), ('c', 0.1f32 as f64)]);
+        assert_eq!(g.u32(SH_OBJ + PEAK_FILTERING).unwrap(), 1, "the flag is raised");
+        assert_eq!(g.u32(SH_PAIR + STREAM_BUFFER_A).unwrap(), SH_OUT_DESC, "and the pair swapped");
+    }
+
+    #[test]
+    fn q_is_clamped_for_the_arithmetic_but_cached_as_stored() {
+        // Q = 0.1 is below the 0.5 floor: the coefficients use 0.5, the cache keeps 0.1.
+        let mut g = peak_guest(1, 0.1, 2.0, 0.1);
+        peaking_stage(&mut g, &mut shelf_trig(), u64::from(SH_OBJ), SH_PAIR).unwrap();
+        let got = peak_coefficients(&g);
+        let want = rbj_peak(0.3, 0.95, 2.0, 0.5);
+        assert!((got[2] - want[2]).abs() <= 1e-5, "b0 used the clamped Q");
+        assert_eq!(g.f32(SH_OBJ + PEAK_CACHED_QUALITY).unwrap(), 0.1, "the cache keeps the raw Q");
+    }
+
+    #[test]
+    fn an_angle_past_the_ceiling_is_clamped_not_bypassed() {
+        // 0.9 / 1.0 is past the 0.45 ceiling. The shelf would bypass here; the peak clamps and filters.
+        let mut g = peak_guest(1, 0.9, 2.0, 1.0);
+        let mut trig = shelf_trig();
+        peaking_stage(&mut g, &mut trig, u64::from(SH_OBJ), SH_PAIR).unwrap();
+        assert_eq!(trig.asked[0], ('s', 0.45f32 as f64), "the trig saw the ceiling");
+        assert_eq!(g.f32(SH_OBJ + PEAK_CACHED_WARP).unwrap(), 0.45);
+        assert_eq!(g.u32(SH_PAIR + STREAM_BUFFER_A).unwrap(), SH_OUT_DESC, "it filtered");
+    }
+
+    #[test]
+    fn a_unity_gain_bypasses_clears_once_and_does_not_swap() {
+        let mut g = peak_guest(2, 0.1, 1.0, 1.0);
+        g.set_u32(SH_OBJ + PEAK_FILTERING, 1).unwrap();
+        for w in 0..8u32 {
+            g.set_u32(SH_OBJ + PEAK_HISTORY + 4 * w, SH_POISON).unwrap();
+        }
+        let mut trig = shelf_trig();
+        assert_eq!(peaking_stage(&mut g, &mut trig, u64::from(SH_OBJ), SH_PAIR).unwrap(), 1);
+        for w in 0..8u32 {
+            assert_eq!(g.u32(SH_OBJ + PEAK_HISTORY + 4 * w).unwrap(), 0, "history word {w}");
+        }
+        assert_eq!(g.u32(SH_OBJ + PEAK_FILTERING).unwrap(), 0);
+        assert_eq!(g.u32(SH_PAIR + STREAM_BUFFER_A).unwrap(), SH_IN_DESC, "no swap");
+        assert!(trig.asked.is_empty());
+        assert_eq!(g.f32(SH_OBJ + PEAK_CACHED_GAIN).unwrap(), 1.0, "the caches are published");
+    }
+
+    #[test]
+    fn the_peak_filters_every_channel_as_the_biquad_does() {
+        let mut g = peak_guest(2, 0.1, 2.0, 1.0);
+        let before = g.clone();
+        peaking_stage(&mut g, &mut shelf_trig(), u64::from(SH_OBJ), SH_PAIR).unwrap();
+        let mut h = before;
+        for k in 0..5u32 {
+            let bits = g.u32(SH_OBJ + PEAK_COEFFICIENTS + 4 * k).unwrap();
+            h.set_u32(SH_OBJ + PEAK_COEFFICIENTS + 4 * k, bits).unwrap();
+        }
+        for ch in 0..2u32 {
+            dsp::biquad::biquad(&mut h, SH_OBJ + PEAK_HISTORY + 16 * ch, SH_OUT + 1024 * ch,
+                SH_IN + 1024 * ch, SH_OBJ + PEAK_COEFFICIENTS, BLOCK_FRAMES).unwrap();
+        }
+        for ch in 0..2u32 {
+            for i in [0u32, 7, 128, 255] {
+                let at = SH_OUT + 1024 * ch + 4 * i;
+                assert_eq!(g.u32(at).unwrap(), h.u32(at).unwrap(), "channel {ch}, sample {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_biquad_coefficient_layout_is_a1_a2_b0_b1_b2() {
+        // Both builders here store raw offsets 0..16 in this order; the kernel's names must agree.
+        use dsp::biquad::{COEFF_A1, COEFF_A2, COEFF_B0, COEFF_B1, COEFF_B2};
+        assert_eq!([COEFF_A1, COEFF_A2, COEFF_B0, COEFF_B1, COEFF_B2], [0, 4, 8, 12, 16]);
     }
 }

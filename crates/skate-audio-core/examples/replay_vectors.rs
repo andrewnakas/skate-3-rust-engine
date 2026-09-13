@@ -846,6 +846,23 @@ fn main() {
             "sub_82B49438" => voices::remove_handle(&mut g, v.r3)
                 .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
+            "sub_82B43D78" => filters::build_shelf_coefficients(
+                &mut g, &mut mathlib::Image, v.r3, f64::from_bits(v.f[0]), f64::from_bits(v.f[1]))
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B26740" => filters::shelf_stage(&mut g, &mut mathlib::Image, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B2C658" if wide_missing => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs the wide r3", v.run));
+                }
+                continue;
+            }
+            "sub_82B2C658" => filters::peaking_stage(&mut g, &mut mathlib::Image, v.w[0], v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
             _ => {
                 t.skipped += 1;
                 continue;
