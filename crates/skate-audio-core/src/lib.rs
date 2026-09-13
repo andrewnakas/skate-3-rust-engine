@@ -91,6 +91,13 @@ pub mod crossfade;
 #[cfg(target_arch = "x86_64")]
 pub mod routing;
 
+/// One contribution's republish into its owner's running total, which reaches the image's log10.
+///
+/// Gated with the rest: every value it touches is single-rounded float work under the guest's flush
+/// mode, held through [`vmx::Fpscr`].
+#[cfg(target_arch = "x86_64")]
+pub mod contributions;
+
 /// Planar channels into interleaved frames, the last shuffle before the driver.
 ///
 /// Gated with the rest because every sample passes through an `lfs`/`stfs` pair under the guest's

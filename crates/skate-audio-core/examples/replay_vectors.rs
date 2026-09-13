@@ -17,7 +17,8 @@
 
 use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
-    Guest, buffers, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix, player, ring,
+    Guest, buffers, contributions, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
+    player, ring,
     interleave, routing,
     scheduler, spatial, stage, system,
 };
@@ -705,6 +706,11 @@ fn main() {
                     .map(|r| Some(r as u32))
                     .map_err(|e| e.to_string())
             }
+            // One contribution's republish. Void, so the whole comparison is the three words it
+            // writes; on the correction path it reaches log10, whose pool the recording now carries.
+            "sub_82B225A0" => contributions::republish(&mut g, v.r3)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
             _ => {
                 t.skipped += 1;
                 continue;
