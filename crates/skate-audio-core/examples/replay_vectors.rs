@@ -647,6 +647,19 @@ fn main() {
             "sub_82B46B30" => interleave::interleave_six(&mut g, v.w[0], v.r4)
                 .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
+            // The bank gather, which dispatches to the scatter-mixer, to `dsp::scale` at unity
+            // gain, or to memset, depending only on the two channel counts. `floats` is r7 at full
+            // width.
+            "sub_82B468C0" if wide_missing => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs the wide r7 float count", v.run));
+                }
+                continue;
+            }
+            "sub_82B468C0" => routing::gather_bank(&mut g, v.r3, v.r4, v.r5, v.r6, v.w[4])
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
             _ => {
                 t.skipped += 1;
                 continue;

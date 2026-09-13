@@ -1,10 +1,10 @@
-//! `sub_82B426D0` — the scatter-mixer: run a table of route bytes, then zero what no route wrote.
+//! The scatter-mixer and the bank gather above it: `sub_82B426D0` and `sub_82B468C0`.
 //!
 //! Ported from `recomp/src/audio_ports/sub_82B426D0.inc`, **STATUS: verified** — 83,885 calls in a
 //! played session on `RwAudioCore Dac`, compared against the original under the shadow harness.
 //!
-//! Replayed against **500 recorded calls, 0 disagreements**, and compared live against the original
-//! 17,788 times in the same session. Recording it needed the harness's read-span cap raised from 32
+//! Replayed against **1,100 recorded calls, 0 disagreements** — 500 for the mixer and 600 for the
+//! gather — and compared live against the original 17,788 and 16,032 times. Recording it needed the harness's read-span cap raised from 32
 //! to 192 — it declares 64 spans, and the excess used to be dropped silently, which made every
 //! recorded vector unreplayable while the shadow comparison stayed green (`docs/port-loop.md`).
 //!
@@ -134,6 +134,112 @@ pub fn scatter_mix(
     Ok(())
 }
 
+// ------------------------------------------------------------------- the bank gather above it
+
+/// `lis r11,-32206 ; lfs f1,-22460(r11)` — the single `1.0` every non-table path scales by.
+/// Loaded once per call and never reloaded, which the port reproduces.
+pub const UNITY_GAIN: u32 = (((-32206i32 as u32) & 0xFFFF) << 16).wrapping_sub(22460);
+/// `lis r10,-32241 ; addi r10,r10,-10496` — 64 two-byte inclusive `[first, last]` route ranges,
+/// one per (source layout, destination layout) pair.
+pub const RANGE_TABLE: u32 = (((-32241i32 as u32) & 0xFFFF) << 16).wrapping_sub(10496);
+/// `lis r8,-32241 ; addi r8,r8,-10368` — the route bytes those ranges index.
+pub const ROUTE_TABLE: u32 = (((-32241i32 as u32) & 0xFFFF) << 16).wrapping_sub(10368);
+
+const _: () = assert!(UNITY_GAIN == 0x8231_A844, "lis -32206 ; lfs -22460");
+const _: () = assert!(RANGE_TABLE == 0x820E_D700 && ROUTE_TABLE == 0x820E_D780);
+
+/// The five channel counts the route tables describe: `cmplwi cr6,r5,1 / 2 / 4 / 6 / 8`.
+pub const STANDARD_LAYOUTS: [u32; 5] = [1, 2, 4, 6, 8];
+
+/// Whether a channel count is one of the five layouts the route tables cover.
+pub fn is_standard_layout(count: u32) -> bool {
+    STANDARD_LAYOUTS.contains(&count)
+}
+
+/// Gather one bank of float buffers into another (`sub_82B468C0`).
+///
+/// Three paths, and which one runs is decided entirely by the two channel counts:
+///
+/// 1. **Both counts are a standard layout** — look the pair up as `8*source + dest - 9` in
+///    [`RANGE_TABLE`] and hand the whole job to [`scatter_mix`], which is the port above. The index
+///    is 0..63 for the five layouts, so it always lands inside the 128-byte table.
+/// 2. **At least as many sources as destinations** — copy buffer by buffer at unity gain through
+///    [`crate::dsp::scale::scale`], one call per destination. Nothing is zeroed: every destination
+///    is fed.
+/// 3. **Fewer sources than destinations** — copy what there is, then `memset` the destinations the
+///    sources ran out for.
+///
+/// `floats` is the guest's `r7` at full width; the kernels below it read only the low word.
+///
+/// **The 144-byte frame is not reproduced.** The C++ port does reproduce it, for a reason that does
+/// not apply here: there, `sub_82B3BED8` spills a single below `r1` and `sub_82B426D0` opens its own
+/// frame, and if `r1` sat 144 bytes higher during a replay those spills would land somewhere else
+/// and read as a divergence. In this crate none of the three callees writes guest memory outside its
+/// destination buffer — `dsp::scale` keeps its splat in registers, `scatter_mix` keeps its flags in a
+/// local array — so there is nothing to place, and the back-chain store would only be a write into
+/// memory no recording carries.
+pub fn gather_bank(
+    g: &mut Guest,
+    dest_array: u32,
+    source_array: u32,
+    dest_count: u32,
+    source_count: u32,
+    floats: u64,
+) -> Result<()> {
+    if is_standard_layout(dest_count) && is_standard_layout(source_count) {
+        // loc_82B469EC. Both rotates in the original wrap exactly the bits their masks clear, so
+        // they are plain shifts: 8*source + dest - 9, doubled for the two-byte range entries.
+        let index = ((source_count << 3) + dest_count) - 9;
+        let range = RANGE_TABLE.wrapping_add(index << 1); // add r7,r11,r10
+        return scatter_mix(g, dest_array, source_array, dest_count, floats as u32, range, ROUTE_TABLE);
+    }
+
+    // The gain is loaded ONCE, before either loop, and the original never reloads it — so the loop
+    // depends on `sub_82B3BED8` leaving `f1` alone. Reproduced rather than papered over.
+    let gain = crate::fp::load_single(g, UNITY_GAIN)?; // lfs f1,-22460(r11)
+    // subf r26,r28,r4 -- the source array is reached as a delta off the destination cursor, so the
+    // sum wraps in 32 bits exactly as the original's `lwzx` does.
+    let delta = source_array.wrapping_sub(dest_array);
+
+    let scale_loop = |g: &mut Guest, trips: u32| -> Result<()> {
+        let mut cursor = dest_array; // mr r31,r28
+        for _ in 0..trips {
+            let src = g.u32(delta.wrapping_add(cursor))?; // lwzx r4,r26,r31 -- B[i]
+            let dst = g.u32(cursor)?; // lwz r3,0(r31) -- A[i]
+            dsp::scale::scale(g, dst, src, floats as u32, gain)?; // bl 0x82b3bed8
+            cursor = cursor.wrapping_add(4); // addi r31,r31,4
+        }
+        Ok(())
+    };
+
+    if source_count >= dest_count {
+        // loc_82B469AC: more sources than destinations, so every destination is fed.
+        if dest_count != 0 {
+            scale_loop(g, dest_count)?;
+        }
+        return Ok(());
+    }
+
+    // Fewer sources than destinations.
+    let mut fed = 0u32; // li r27,0
+    if source_count != 0 {
+        scale_loop(g, source_count)?;
+        fed = source_count; // mr r27,r6
+    }
+    if fed < dest_count {
+        // loc_82B4698C: one memset per destination the sources ran out for.
+        let bytes = u64::from(((floats as u32) << 2) & 0xFFFF_FFFC); // rlwinm r26,r25,2,0,29
+        // rlwinm r11,r27,2,0,29 ; add r11,r11,r28 ; addi r30,r11,-4 -- the `lwzu` pre-increments.
+        let mut cursor = (((fed << 2) & 0xFFFF_FFFC).wrapping_add(dest_array)).wrapping_sub(4);
+        for _ in 0..(dest_count - fed) {
+            cursor = cursor.wrapping_add(4); // lwzu r3,4(r30)
+            let buffer = g.u32(cursor)?;
+            mem::memset(g, buffer, 0, bytes)?; // bl 0x82ee5e80
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +303,166 @@ mod tests {
     /// `route byte = gain << 6 | source << 3 | dest`.
     fn byte(gain: u8, source: u8, dest: u8) -> u8 {
         (gain << 6) | (source << 3) | dest
+    }
+
+    // ------------------------------------------------------------------ the bank gather above it
+
+    /// The three rodata tables sit within 320 bytes of each other, so one segment holds them all.
+    const RODATA: u32 = GAIN_TABLE;
+    const RODATA_BYTES: usize = 0x140;
+    const G_DEST: u32 = BASE + 0x200;
+    const G_SOURCE: u32 = BASE + 0x240;
+    const G_BUFFERS: u32 = BASE + 0x2000;
+    /// Distinguishable from the unity gain, so which path ran is visible in the output.
+    const TABLE_GAIN: f32 = 3.0;
+
+    /// Eight destination buffers then eight source buffers, `COUNT` floats each.
+    fn gather_guest() -> Guest {
+        let mut g = Guest::single(BASE, 0x8000);
+        g.put(RODATA, vec![0u8; RODATA_BYTES]);
+        g.put(UNITY_GAIN, 1.0f32.to_bits().to_be_bytes().to_vec());
+        for i in 0..4u32 {
+            g.set_u32(GAIN_TABLE + i * 4, TABLE_GAIN.to_bits()).unwrap();
+        }
+        for slot in 0..8u32 {
+            let dst = G_BUFFERS + slot * STRIDE;
+            let src = G_BUFFERS + (8 + slot) * STRIDE;
+            g.set_u32(G_DEST + slot * 4, dst).unwrap();
+            g.set_u32(G_SOURCE + slot * 4, src).unwrap();
+            for i in 0..COUNT {
+                g.set_u32(dst + i * 4, POISON).unwrap();
+                g.set_u32(src + i * 4, ((slot + 1) as f32 + i as f32).to_bits()).unwrap();
+            }
+        }
+        g
+    }
+
+    fn g_out(g: &Guest, slot: u32) -> Vec<f32> {
+        (0..COUNT).map(|i| g.f32(G_BUFFERS + slot * STRIDE + i * 4).unwrap()).collect()
+    }
+    fn g_source(slot: u32) -> Vec<f32> {
+        (0..COUNT).map(|i| (slot + 1) as f32 + i as f32).collect()
+    }
+
+    fn gather(g: &mut Guest, dest_count: u32, source_count: u32) {
+        gather_bank(g, G_DEST, G_SOURCE, dest_count, source_count, u64::from(COUNT)).unwrap();
+    }
+
+    #[test]
+    fn the_layouts_are_the_five_the_ladder_tests() {
+        for count in 0..12u32 {
+            assert_eq!(is_standard_layout(count), [1, 2, 4, 6, 8].contains(&count), "{count}");
+        }
+    }
+
+    #[test]
+    fn a_standard_pair_goes_through_the_route_table() {
+        // (source 2, destination 2) indexes 8*2 + 2 - 9 = 9, so the range is two bytes at
+        // RANGE_TABLE + 18. One route there, gain word 0, source slot 1, destination slot 0.
+        let mut g = gather_guest();
+        g.set_u8(RANGE_TABLE + 18, 5).unwrap(); // first
+        g.set_u8(RANGE_TABLE + 19, 5).unwrap(); // last
+        g.set_u8(ROUTE_TABLE + 5, byte(0, 1, 0)).unwrap();
+
+        gather(&mut g, 2, 2);
+
+        // Scaled by the *gain table*, not by unity: that is how we know which path ran.
+        let want: Vec<f32> = g_source(1).iter().map(|v| v * TABLE_GAIN).collect();
+        assert_eq!(g_out(&g, 0), want);
+        // Destination 1 is one of the two slots the caller owns, and no route wrote it, so the
+        // scatter-mixer's closing loop zeroed it.
+        assert_eq!(g_out(&g, 1), vec![0.0f32; COUNT as usize]);
+    }
+
+    #[test]
+    fn the_table_index_is_eight_sources_plus_destinations_minus_nine() {
+        // Both ends of the 64-entry table: (1,1) is index 0 and (8,8) is index 63, the last entry.
+        for (dest, source, index) in [(1u32, 1u32, 0u32), (8, 8, 63), (6, 4, 4 * 8 + 6 - 9)] {
+            let mut g = gather_guest();
+            g.set_u8(RANGE_TABLE + index * 2, 7).unwrap();
+            g.set_u8(RANGE_TABLE + index * 2 + 1, 7).unwrap();
+            g.set_u8(ROUTE_TABLE + 7, byte(0, 0, 0)).unwrap();
+
+            gather(&mut g, dest, source);
+
+            let want: Vec<f32> = g_source(0).iter().map(|v| v * TABLE_GAIN).collect();
+            assert_eq!(g_out(&g, 0), want, "dest {dest}, source {source} -> index {index}");
+        }
+    }
+
+    #[test]
+    fn more_sources_than_destinations_copies_at_unity_gain() {
+        // 3 and 5 are not standard layouts, so this is the copy path. Every destination is fed and
+        // nothing is zeroed.
+        let mut g = gather_guest();
+        gather(&mut g, 3, 5);
+        for slot in 0..3u32 {
+            assert_eq!(g_out(&g, slot), g_source(slot), "slot {slot} copied at unity gain");
+        }
+    }
+
+    #[test]
+    fn fewer_sources_than_destinations_copies_what_there_is_and_zeroes_the_rest() {
+        let mut g = gather_guest();
+        gather(&mut g, 5, 3);
+        for slot in 0..3u32 {
+            assert_eq!(g_out(&g, slot), g_source(slot), "slot {slot} fed");
+        }
+        for slot in 3..5u32 {
+            assert_eq!(g_out(&g, slot), vec![0.0f32; COUNT as usize], "slot {slot} zeroed");
+        }
+        // And the sixth destination, which the caller does not own, keeps its poison.
+        assert_eq!(g.u32(G_BUFFERS + 5 * STRIDE).unwrap(), POISON);
+    }
+
+    #[test]
+    fn no_sources_at_all_zeroes_every_destination() {
+        let mut g = gather_guest();
+        gather(&mut g, 5, 0); // 0 sources, 5 destinations: the scale loop is skipped entirely
+        for slot in 0..5u32 {
+            assert_eq!(g_out(&g, slot), vec![0.0f32; COUNT as usize], "slot {slot}");
+        }
+    }
+
+    #[test]
+    fn no_destinations_does_nothing() {
+        let mut g = gather_guest();
+        gather(&mut g, 0, 3); // sources >= destinations, and the destination guard skips the loop
+        assert_eq!(g.u32(G_BUFFERS).unwrap(), POISON);
+    }
+
+    #[test]
+    fn the_unity_gain_is_read_from_the_image() {
+        // The copy path's gain is a loaded single, not a literal 1.0: patch it and the copies scale.
+        let mut g = gather_guest();
+        g.put(UNITY_GAIN, 2.0f32.to_bits().to_be_bytes().to_vec());
+        gather(&mut g, 2, 3); // destination 2 is standard but source 3 is not, so this is the copy
+        let want: Vec<f32> = g_source(0).iter().map(|v| v * 2.0).collect();
+        assert_eq!(g_out(&g, 0), want);
+    }
+
+    #[test]
+    fn one_standard_count_is_not_enough_for_the_table_path() {
+        // Destination 2 is a layout, source 3 is not, so the pair falls through to the copy path —
+        // which is visible because the copy uses unity gain and the table path would use 3.0.
+        let mut g = gather_guest();
+        g.set_u8(RANGE_TABLE + 2 * ((3 << 3) + 2 - 9), 0).unwrap();
+        g.set_u8(RANGE_TABLE + 2 * ((3 << 3) + 2 - 9) + 1, 0).unwrap();
+        g.set_u8(ROUTE_TABLE, byte(0, 0, 0)).unwrap();
+
+        gather(&mut g, 2, 3);
+
+        assert_eq!(g_out(&g, 0), g_source(0), "unity gain, so the copy path ran");
+        assert_eq!(g_out(&g, 1), g_source(1), "and both destinations were fed");
+    }
+
+    #[test]
+    fn the_gather_table_addresses_come_from_the_lis_immediates() {
+        assert_eq!(UNITY_GAIN, 0x8232_0000 - 22460);
+        assert_eq!(RANGE_TABLE, 0x820F_0000 - 10496);
+        assert_eq!(ROUTE_TABLE, 0x820F_0000 - 10368);
+        assert_eq!(ROUTE_TABLE - RANGE_TABLE, 128, "64 two-byte ranges, then the route bytes");
+        assert_eq!(RANGE_TABLE - GAIN_TABLE, 64);
     }
 
     #[test]
