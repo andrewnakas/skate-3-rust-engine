@@ -111,6 +111,10 @@ pub mod output;
 #[cfg(target_arch = "x86_64")]
 pub mod voices;
 
+/// A voice's pitch ratio and fractional position, single-rounded float work under the flush mode.
+#[cfg(target_arch = "x86_64")]
+pub mod pitch;
+
 /// Planar channels into interleaved frames, the last shuffle before the driver.
 ///
 /// Gated with the rest because every sample passes through an `lfs`/`stfs` pair under the guest's

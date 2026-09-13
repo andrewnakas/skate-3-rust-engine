@@ -19,7 +19,7 @@ use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
     Guest, bitstream, buffers, contributions, counter, eval, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
     player, ring,
-    interleave, output, routing, voices,
+    interleave, output, pitch, routing, voices,
     scheduler, spatial, stage, system,
 };
 
@@ -349,6 +349,23 @@ fn main() {
             "sub_82B3DF90" => ring::fill_tail(&mut g, v.r3, v.r4, v.r5)
                 .map(|_| None)
                 .map_err(|e| e.to_string()),
+            // The ring window builder keeps its window and segment array in a 176-byte frame below r1,
+            // which no window declares. Zeroes are a sound seed: every word the callees read there is
+            // written first, except segment 1's output slot, which the mask discards.
+            "sub_82B3DD90" if v.r1.is_none() || wide_missing => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1 and the wide r3..r6", v.run));
+                }
+                continue;
+            }
+            "sub_82B3DD90" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(ring::WINDOW_FRAME), vec![0u8; ring::WINDOW_FRAME as usize]);
+                ring::build_window(&mut g, v.w[0], v.w[1], v.w[2], v.w[3], sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
             "sub_82B43AF8" => dsp::biquad::biquad(&mut g, v.r3, v.r4, v.r5, v.r6, v.r7)
                 .map(|_| None)
                 .map_err(|e| e.to_string()),
@@ -846,6 +863,10 @@ fn main() {
             "sub_82B49438" => voices::remove_handle(&mut g, v.r3)
                 .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
+            "sub_82B43CC0" => filters::build_lowpass_coefficients(
+                &mut g, &mut mathlib::Image, v.r3, f64::from_bits(v.f[0]))
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
             "sub_82B43D78" => filters::build_shelf_coefficients(
                 &mut g, &mut mathlib::Image, v.r3, f64::from_bits(v.f[0]), f64::from_bits(v.f[1]))
                 .map(|_| None)
@@ -870,6 +891,28 @@ fn main() {
                 .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
             "sub_82B2FE00" => leaves::five_point_ramp(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            // On the bypass path the dispatcher tail-branches into the guest memset, whose r3 is not
+            // modelled here, so only the stage path compares a register.
+            "sub_82B38B68" => match dsp::allpass::dispatch_stage(
+                &mut g, u64::from(v.r3), u64::from(v.r4), u64::from(v.r5), u64::from(v.r7)) {
+                Ok(dsp::allpass::DispatchOutcome::Ran(r)) => Ok(Some(r.r3 as u32)),
+                Ok(dsp::allpass::DispatchOutcome::Cleared) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            },
+            "sub_82B46810" if wide_missing => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs the wide r7 and r8", v.run));
+                }
+                continue;
+            }
+            "sub_82B46810" => routing::downmix(&mut g, v.r3, v.r4, v.w[4], v.w[5] as u32,
+                f64::from_bits(v.f[0]), f64::from_bits(v.f[1]))
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B2DAC8" => pitch::advance_pitch(&mut g, v.r3, v.r4, v.r6)
                 .map(|r| Some(r as u32))
                 .map_err(|e| e.to_string()),
             // The evaluator's opcode table: every ported slot is `fn(&mut Guest, u32) -> u64` with the

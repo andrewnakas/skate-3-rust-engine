@@ -231,6 +231,80 @@ pub fn allpass_stage(
     Ok(AllpassResult { r3, clobbers: Some(last) })
 }
 
+// ------------------------------------------------------------------- the stage dispatcher above it
+
+/// `lwz r6,0(r11)` — the stage descriptor's `c` buffer.
+pub const STAGE_TAP_SOURCE: u32 = 0;
+/// `lwz r7,4(r7)` — the tap, read unaligned by the stage.
+pub const STAGE_TAP_DELAY: u32 = 4;
+/// `lwz r9,8(r7)` — non-zero bypasses the stage and clears its accumulator instead.
+pub const STAGE_BYPASS: u32 = 8;
+/// `lwz r8,16(r7)` — the stage's `d` output.
+pub const STAGE_OUT: u32 = 16;
+/// `lwz r9,20(r7)` — the accumulator, and the clear's target.
+pub const STAGE_ACCUMULATOR: u32 = 20;
+/// `lfs f1,16(r6)` — the coefficient block's tap gain, the stage's `a`.
+pub const COEFF_TAP_GAIN: u32 = 16;
+/// `lfs f2,20(r3)` — its stage gain, the stage's `g`.
+pub const COEFF_STAGE_GAIN: u32 = 20;
+
+/// What [`dispatch_stage`] did.
+#[derive(Clone, Copy, Debug)]
+pub enum DispatchOutcome {
+    /// The stage ran, and these are the registers it left — the dispatcher tail-branches, so they
+    /// are the dispatcher's results too.
+    Ran(AllpassResult),
+    /// The stage was bypassed and its accumulator cleared.
+    Cleared,
+}
+
+/// Run one allpass stage from its descriptor, or clear its accumulator instead (`sub_82B38B68`).
+///
+/// `coeffs` is `r3`, `count` `r4`, `primed` `r5` and `stage` `r7`, all at full width. When the
+/// descriptor's bypass word is zero the loads feed [`allpass_stage`] through a tail branch —
+/// `r3 = count`, the four buffers from the descriptor, `r10 = primed`. Otherwise the accumulator is
+/// cleared through the guest's own memset, for `count * 4` bytes computed as a 32-bit rotate.
+pub fn dispatch_stage(
+    g: &mut Guest,
+    coeffs: u64,
+    count: u64,
+    primed: u64,
+    stage: u64,
+) -> Result<DispatchOutcome> {
+    let coeffs = coeffs as u32;
+    let stage = stage as u32;
+    if g.u32(stage + STAGE_BYPASS)? == 0 {
+        // cmplwi cr6,r9,0 -- an unsigned compare of the low word.
+        let mut fpscr = Fpscr::capture();
+        fpscr.disable_flush_mode_unconditional();
+        let gain = fp::load_single(g, coeffs.wrapping_add(COEFF_STAGE_GAIN))?; // lfs f2,20(r3)
+        let acc = g.u32(stage + STAGE_ACCUMULATOR)?; // lwz r9,20(r7)
+        let a = fp::load_single(g, coeffs.wrapping_add(COEFF_TAP_GAIN))?; // lfs f1,16(r6)
+        let out = g.u32(stage + STAGE_OUT)?; // lwz r8,16(r7)
+        let delay = g.u32(stage + STAGE_TAP_DELAY)?; // lwz r7,4(r7)
+        let source = g.u32(stage + STAGE_TAP_SOURCE)?; // lwz r6,0(r11)
+        drop(fpscr);
+        // b 0x82b389a0
+        let ran = allpass_stage(
+            g,
+            count as u32 as i32,
+            u64::from(source),
+            delay,
+            out,
+            u64::from(acc),
+            primed as u32 as i32,
+            a,
+            gain,
+        )?;
+        return Ok(DispatchOutcome::Ran(ran));
+    }
+    // loc_82B38BA0: rlwinm r5,r4,2,0,29 ; lwz r3,20(r11) ; b 0x82f52040
+    let bytes = u64::from((count as u32).rotate_left(2) & 0xFFFF_FFFC);
+    let target = g.u32(stage + STAGE_ACCUMULATOR)?;
+    crate::mem::memset_82f52040(g, target, 0, bytes)?;
+    Ok(DispatchOutcome::Cleared)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +455,50 @@ mod tests {
             a * (c - a * tap) + tap
         };
         assert_eq!(f32::from_bits(c.v30[3]), expected_y(8), "v30 lane 3 is y for sample 8");
+    }
+
+    // ------------------------------------------------------------------------- the dispatcher
+
+    const STAGE: u32 = BASE + 0x5000;
+    const COEFFS: u32 = BASE + 0x5100;
+
+    fn descriptor(g: &mut Guest, bypass: u32) {
+        g.set_u32(STAGE + STAGE_TAP_SOURCE, C).unwrap();
+        g.set_u32(STAGE + STAGE_TAP_DELAY, T).unwrap();
+        g.set_u32(STAGE + STAGE_BYPASS, bypass).unwrap();
+        g.set_u32(STAGE + STAGE_OUT, D).unwrap();
+        g.set_u32(STAGE + STAGE_ACCUMULATOR, ACC).unwrap();
+        g.set_u32(COEFFS + COEFF_TAP_GAIN, (A as f32).to_bits()).unwrap();
+        g.set_u32(COEFFS + COEFF_STAGE_GAIN, (GAIN as f32).to_bits()).unwrap();
+    }
+
+    #[test]
+    fn the_dispatcher_runs_the_stage_it_describes() {
+        let mut g = guest();
+        descriptor(&mut g, 0);
+        let mut h = g.clone();
+        let out = dispatch_stage(&mut g, u64::from(COEFFS), 16, 1, u64::from(STAGE)).unwrap();
+        let direct = allpass_stage(&mut h, 16, u64::from(C), T, D, u64::from(ACC), 1, A, GAIN).unwrap();
+        match out {
+            DispatchOutcome::Ran(r) => assert_eq!(r.r3, direct.r3),
+            DispatchOutcome::Cleared => panic!("a zero bypass word must run the stage"),
+        }
+        for i in 0..16u32 {
+            assert_eq!(g.u32(D + 4 * i).unwrap(), h.u32(D + 4 * i).unwrap(), "d[{i}]");
+            assert_eq!(g.u32(ACC + 4 * i).unwrap(), h.u32(ACC + 4 * i).unwrap(), "acc[{i}]");
+        }
+    }
+
+    #[test]
+    fn a_bypassed_stage_clears_count_words_of_its_accumulator_and_nothing_else() {
+        let mut g = guest();
+        descriptor(&mut g, 7);
+        let out = dispatch_stage(&mut g, u64::from(COEFFS), 12, 1, u64::from(STAGE)).unwrap();
+        assert!(matches!(out, DispatchOutcome::Cleared));
+        for i in 0..12u32 {
+            assert_eq!(g.u32(ACC + 4 * i).unwrap(), 0, "acc[{i}] cleared");
+        }
+        assert_eq!(at(&g, ACC, 12), 112.0, "twelve words, not thirteen");
+        assert_eq!(g.u32(D).unwrap(), POISON, "and the stage's output is untouched");
     }
 }

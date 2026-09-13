@@ -240,6 +240,68 @@ pub fn gather_bank(
     Ok(())
 }
 
+// ------------------------------------------------------------------------- the downmix program
+
+/// `lis -32208 ; addi -31232 ; lfs 1024` — measured 1/65, the per-sample increment of the ramp.
+pub const DOWNMIX_RAMP_RATE: u32 = (((-32208i32 as u32) & 0xFFFF) << 16).wrapping_sub(31232) + 1024;
+const _: () = assert!(DOWNMIX_RAMP_RATE == 0x822F_8A00, "lis -32208 ; addi -31232 ; lfs 1024");
+
+/// Run the (in-channels -> out-channels) downmix program (`sub_82B46810`): for each routing byte,
+/// ramp-mix one source channel into one destination channel with [`dsp::gain_ramp::gain_ramp_accumulate`].
+///
+/// `dst_array` is `r3` and `src_array` `r4`, eight channel pointers each; `out_channels` is `r7` at
+/// full width, `in_channels` `r8`, `target` `f1` and `current` `f2`. The route range comes from the
+/// same tables [`scatter_mix`] uses, indexed `2 * (8*in + out - 9)`, and each routing byte decodes
+/// exactly as there: destination in bits 2:0, source in 5:3, a gain index in 7:6.
+///
+/// Every route mixes from `scale * current` rising by `scale * (target - current) / 65` per sample —
+/// and since the kernel ramps for 64 samples and then holds, **the ramp lands at 64/65 of the way to
+/// the target, not on it**. That is the original's arithmetic, reproduced rather than corrected. The
+/// last program index is re-read every iteration.
+pub fn downmix(
+    g: &mut Guest,
+    dst_array: u32,
+    src_array: u32,
+    out_channels: u64,
+    in_channels: u32,
+    target: f64,
+    current: f64,
+) -> Result<()> {
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let delta = crate::fp::sub_single(target, current); // fsubs f13,f1,f2
+    let ramp = crate::fp::mul_single(delta, crate::fp::load_single(g, DOWNMIX_RAMP_RATE)?); // fmuls f6
+
+    // rlwinm r11,r8,3,0,28 ; add r11,r11,r7 ; addi r11,r11,-9 ; rlwinm r10,r11,1,0,30
+    let row = u64::from((in_channels << 3) & 0xFFFF_FFF8);
+    let entry = row.wrapping_add(out_channels).wrapping_sub(9);
+    let bounds = RANGE_TABLE.wrapping_add((entry as u32).rotate_left(1) & 0xFFFF_FFFE);
+
+    let mut index = u32::from(g.u8(bounds)?); // lbzx r31,r10,r11
+    let last = u32::from(g.u8(bounds + 1)?); // lbz r6,1(r30)
+    if index <= last {
+        let mut cursor = ROUTE_TABLE.wrapping_add(index).wrapping_sub(1); // addi r29,r11,-1
+        loop {
+            cursor = cursor.wrapping_add(1); // lbzu r11,1(r29)
+            let op = u32::from(g.u8(cursor)?);
+            let gain_off = op.rotate_left(28) & 0x0FFF_FFFC; // rlwinm r10,r11,28,4,29
+            let src_off = op.rotate_left(31) & 0x1C; // rlwinm r9,r11,31,27,29
+            let dst_off = op.rotate_left(2) & 0x1C; // rlwinm r8,r11,2,27,29
+            let scale = crate::fp::load_single(g, GAIN_TABLE.wrapping_add(gain_off))?; // lfsx f0
+            let src = g.u32(src_array.wrapping_add(src_off))?; // lwzx r4,r9,r27
+            let step = crate::fp::mul_single(scale, ramp); // fmuls f2,f0,f6
+            let dst = g.u32(dst_array.wrapping_add(dst_off))?; // lwzx r3,r8,r28
+            let start = crate::fp::mul_single(scale, current); // fmuls f1,f0,f7
+            dsp::gain_ramp::gain_ramp_accumulate(g, dst, src, start, step)?; // bl 0x82b44d18
+            index += 1;
+            if index > u32::from(g.u8(bounds + 1)?) {
+                break; // lbz r7,1(r30) ; cmplw ; ble -- the last index is reloaded
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +666,97 @@ mod tests {
         let e = scatter_mix(&mut g, DEST_ARRAY, SOURCE_ARRAY, 9, COUNT, RANGE, TABLE);
         assert!(e.is_err(), "nine slots reads a flag byte the original never wrote");
         assert_eq!(g.u32(BUFFERS).unwrap(), POISON, "and nothing ran");
+    }
+
+    // -------------------------------------------------------------------- the downmix program
+
+    const DM_DST_ARRAY: u32 = BASE + 0x300;
+    const DM_SRC_ARRAY: u32 = BASE + 0x340;
+    const DM_BUFFERS: u32 = BASE + 0x4000;
+
+    /// The gain-ramp kernel's constant pool, mapped as its own tests map it, plus the routing tables.
+    fn downmix_guest() -> Guest {
+        use dsp::gain_ramp::{LANE2_SCALE, LANE3_SCALE, RAMP_SPAN, SCALE, SCALE_STEP, STEP_SCALE};
+        let mut g = Guest::from_segments(vec![
+            crate::Segment { base: BASE, bytes: vec![0u8; 0x10000] },
+            crate::Segment { base: 0x8206_0000, bytes: vec![0u8; 0x4000] },
+            crate::Segment { base: 0x8225_7000, bytes: vec![0u8; 0x1000] },
+            crate::Segment { base: 0x820E_D000, bytes: vec![0u8; 0x1000] },
+            crate::Segment { base: 0x8231_BA00, bytes: vec![0u8; 0x100] },
+            crate::Segment { base: DOWNMIX_RAMP_RATE, bytes: (1.0f32 / 65.0).to_bits().to_be_bytes().to_vec() },
+        ]);
+        g.set_u32(STEP_SCALE, 4.0f32.to_bits()).unwrap();
+        g.set_u32(RAMP_SPAN, 64.0f32.to_bits()).unwrap();
+        g.set_u32(LANE2_SCALE, 2.0f32.to_bits()).unwrap();
+        g.set_u32(LANE3_SCALE, 3.0f32.to_bits()).unwrap();
+        let splat = |g: &mut Guest, at: u32, v: f32| {
+            for k in 0..4 {
+                g.set_u32(at + 4 * k, v.to_bits()).unwrap();
+            }
+        };
+        for group in 1..8u32 {
+            splat(&mut g, SCALE[group as usize], group as f32);
+        }
+        splat(&mut g, SCALE_STEP, 8.0);
+        for (i, v) in [1.0f32, 0.707, 0.5, 0.25].iter().enumerate() {
+            g.set_u32(GAIN_TABLE + 4 * i as u32, v.to_bits()).unwrap();
+        }
+        for slot in 0..8u32 {
+            let buffer = DM_BUFFERS + slot * 0x400;
+            g.set_u32(DM_DST_ARRAY + 4 * slot, buffer).unwrap();
+            g.set_u32(DM_SRC_ARRAY + 4 * slot, buffer + 8 * 0x400).unwrap();
+            for i in 0..256u32 {
+                g.set_u32(buffer + 4 * i, 0.5f32.to_bits()).unwrap();
+                g.set_u32(buffer + 8 * 0x400 + 4 * i, ((slot + 1) as f32 * 0.1).to_bits()).unwrap();
+            }
+        }
+        g
+    }
+
+    #[test]
+    fn each_routing_byte_ramp_mixes_its_source_into_its_destination() {
+        // 2 in, 2 out: the range is at RANGE_TABLE + 2*(8*2 + 2 - 9) = +18. Two routes: source 0 into
+        // destination 1 at gain index 2 (0.5), and source 1 into destination 0 at gain index 0.
+        let mut g = downmix_guest();
+        g.set_u8(RANGE_TABLE + 18, 3).unwrap();
+        g.set_u8(RANGE_TABLE + 19, 4).unwrap();
+        g.set_u8(ROUTE_TABLE + 3, byte(2, 0, 1)).unwrap();
+        g.set_u8(ROUTE_TABLE + 4, byte(0, 1, 0)).unwrap();
+        let (target, current) = (0.8f64, 0.2f64);
+
+        // The reference: the two kernel calls, made directly with the gains the note derives.
+        let mut h = g.clone();
+        let ramp = crate::fp::mul_single(crate::fp::sub_single(target, current), f64::from(1.0f32 / 65.0));
+        for (dst, src, scale) in [(1u32, 0u32, 0.5f64), (0, 1, 1.0)] {
+            let d = h.u32(DM_DST_ARRAY + 4 * dst).unwrap();
+            let s = h.u32(DM_SRC_ARRAY + 4 * src).unwrap();
+            dsp::gain_ramp::gain_ramp_accumulate(
+                &mut h, d, s, crate::fp::mul_single(scale, current), crate::fp::mul_single(scale, ramp),
+            )
+            .unwrap();
+        }
+
+        downmix(&mut g, DM_DST_ARRAY, DM_SRC_ARRAY, 2, 2, target, current).unwrap();
+        for slot in 0..2u32 {
+            for i in [0u32, 1, 63, 64, 255] {
+                let at = DM_BUFFERS + slot * 0x400 + 4 * i;
+                assert_eq!(g.u32(at).unwrap(), h.u32(at).unwrap(), "destination {slot}, sample {i}");
+            }
+        }
+        assert_ne!(g.u32(DM_BUFFERS).unwrap(), 0.5f32.to_bits(), "destination 0 was mixed into");
+    }
+
+    #[test]
+    fn an_empty_program_range_writes_nothing() {
+        let mut g = downmix_guest();
+        g.set_u8(RANGE_TABLE + 18, 5).unwrap();
+        g.set_u8(RANGE_TABLE + 19, 4).unwrap(); // first > last
+        downmix(&mut g, DM_DST_ARRAY, DM_SRC_ARRAY, 2, 2, 0.8, 0.2).unwrap();
+        assert_eq!(g.u32(DM_BUFFERS).unwrap(), 0.5f32.to_bits());
+    }
+
+    #[test]
+    fn the_downmix_ramp_rate_is_the_lis_address() {
+        assert_eq!(DOWNMIX_RAMP_RATE, 0x8230_0000 - 31232 + 1024);
     }
 }

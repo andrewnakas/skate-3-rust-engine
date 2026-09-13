@@ -741,6 +741,116 @@ fn make_write_plan(
     Ok(plan)
 }
 
+// ------------------------------------------------------------------ sub_82B3DD90: the window
+
+/// `lbz r28,56(r31)` — non-zero means the stream has a second segment. Read twice, the second time
+/// after [`fill_segments`] has run.
+pub const OBJ_TWO_BUFFERS: u32 = 56;
+/// `stwu r1,-176(r1)`. The ring window and the segment array live in this frame, and their
+/// addresses are what [`fill_segments`] is handed.
+pub const WINDOW_FRAME: u32 = 176;
+/// `addi r4,r1,80` — the ring window's place in the frame.
+pub const WINDOW_OFFSET: u32 = 80;
+/// `addi r5,r1,96` — the segment array's.
+pub const SEGMENTS_OFFSET: u32 = 96;
+/// `stw r10,88(r1)` — the ring end less the lag. Stored, and read by nobody this call reaches.
+pub const WIN_LAGGED: u32 = 8;
+
+/// Build the ring window and the segment array for one block, fill the segments, and zero their
+/// tails (`sub_82B3DD90`). Returns 256, the block length, as `li r3,256`.
+///
+/// `object` is `r3` and `consumed` `r5`, both at full width because the two calls hand them on as
+/// full registers; `block_index` is `r4`, whose low word is what `mullw` multiplies; `out` is the
+/// caller's record in `r6`; `sp` is `r1`.
+///
+/// The window is `ring + 4 * span * block_index` to `+ 4 * span`, with the cursor at
+/// `(position + consumed) mod span + lag` words into it. The `mod` is a `divw` and a `mullw`, so a
+/// zero span divides to a zero quotient — the original guards the divide with `twllei` and `twlgei`,
+/// and RexGlue's trap only logs and returns, so both are no-ops here as they are in the recomp.
+///
+/// Three details worth pinning:
+///
+/// - **The second buffer word is masked, not branched on.** With one segment the frame slot for
+///   segment 1's output is never initialised, and the `subfic`/`subfe`/`and` publishes zero whatever
+///   it holds. The flag is re-read after [`fill_segments`] runs.
+/// - **Four 64-bit sums**, one per `add`: `position + consumed`, the block offset, the cursor and
+///   the ring end all keep their high halves until a store truncates them.
+/// - **The frame is real guest memory.** Its back chain is written and the two structures are read
+///   by the callees through their addresses, so the frame must be mapped.
+pub fn build_window(
+    g: &mut Guest,
+    object: u64,
+    block_index: u64,
+    consumed: u64,
+    out: u64,
+    sp: u32,
+) -> Result<u64> {
+    let obj = object as u32;
+    let record = out as u32;
+    let frame = sp.wrapping_sub(WINDOW_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-176(r1)
+    let window = frame.wrapping_add(WINDOW_OFFSET);
+    let segments = frame.wrapping_add(SEGMENTS_OFFSET);
+
+    let position = u64::from(g.u32(obj.wrapping_add(OBJ_POSITION))?); // lwz r6,52(r3)
+    let span = u64::from(g.u32(obj.wrapping_add(OBJ_SPAN_HIGH))?); // lwz r3,20(r3)
+    let reach = position.wrapping_add(consumed); // add r7,r6,r30
+    // mullw r6,r3,r4 -- the full product of the sign-extended low words.
+    let block = (i64::from(span as u32 as i32) * i64::from(block_index as u32 as i32)) as u64;
+    let limit0 = g.u32(obj.wrapping_add(OBJ_LIMIT0))?; // lwz r4,40(r31)
+    let ring = u64::from(g.u32(obj.wrapping_add(OBJ_RING))?); // lwz r11,0(r31)
+    let lag = u64::from(g.u32(obj.wrapping_add(OBJ_SPAN_LOW))?); // lwz r10,24(r31)
+    let cap_base = u64::from(g.u32(obj.wrapping_add(OBJ_BLOCK))?); // lwz r9,16(r31)
+    let two = g.u8(obj.wrapping_add(OBJ_TWO_BUFFERS))?; // lbz r28,56(r31)
+    g.set_u32(segments + SEG_NEED, limit0)?; // stw r4,96(r1)
+    g.set_u32(segments + SEG_OUT, 0)?; // stw r5,108(r1)
+    // divw r4,r7,r3 -- a zero quotient where the divide is undefined.
+    let (dividend, divisor) = (reach as u32 as i32, span as u32 as i32);
+    let quotient = if divisor != 0 && !(dividend == i32::MIN && divisor == -1) {
+        dividend / divisor
+    } else {
+        0
+    };
+    let whole = (i64::from(quotient) * i64::from(divisor)) as u64; // mullw r6,r4,r3
+    let ring_start = words_to_bytes(block).wrapping_add(ring); // rlwinm r8 ; add r11,r8,r11
+    let remainder = reach.wrapping_sub(whole); // subf r8,r6,r7
+    g.set_u32(window + RING_BASE, ring_start as u32)?; // stw r11,80(r1)
+    let offset = remainder.wrapping_add(lag); // add r4,r8,r10
+    let ring_end = words_to_bytes(span).wrapping_add(ring_start); // add r10,r7,r11
+    g.set_u32(window + RING_END, ring_end as u32)?; // stw r10,84(r1)
+    // twllei r3,0 -- logs and returns in RexGlue.
+    let cursor = words_to_bytes(offset).wrapping_add(ring_start); // add r3,r8,r11
+    let cap0 = cap_base.wrapping_add(255); // addi r11,r9,255
+    let lagged = ring_end.wrapping_sub(words_to_bytes(lag)); // subf r10,r27,r10
+    g.set_u32(window + RING_CURSOR, cursor as u32)?; // stw r3,92(r1)
+    let mut count = 1u64; // li r6,1
+    g.set_u32(segments + SEG_CAP, cap0 as u32)?; // stw r11,100(r1)
+    // twlgei r4,-1 -- the divide-overflow guard, likewise a no-op.
+    g.set_u32(window + WIN_LAGGED, lagged as u32)?; // stw r10,88(r1)
+
+    if two != 0 {
+        let limit1 = g.u32(obj.wrapping_add(OBJ_LIMIT1))?; // lwz r11,44(r31)
+        let cap1 = cap_base.wrapping_add(127); // addi r10,r9,127
+        count = 2; // li r6,2
+        g.set_u32(segments + SEG_STRIDE + SEG_OUT, 0)?; // stw r5,124(r1)
+        g.set_u32(segments + SEG_STRIDE + SEG_CAP, cap1 as u32)?; // stw r10,116(r1)
+        g.set_u32(segments + SEG_STRIDE + SEG_NEED, limit1)?; // stw r11,112(r1)
+    }
+
+    let end = fill_segments(g, object, u64::from(window), segments, count)?; // bl 0x82b3dc48
+    let seg0 = g.u32(segments + SEG_OUT)?; // lwz r11,108(r1)
+    g.set_u32(record.wrapping_add(OUT_END), end as u32)?; // stw r3,16(r29)
+    let seg1 = g.u32(segments + SEG_STRIDE + SEG_OUT)?; // lwz r10,124(r1)
+    g.set_u32(record.wrapping_add(BUFFER0), seg0)?; // stw r11,4(r29)
+    let two_again = g.u8(obj.wrapping_add(OBJ_TWO_BUFFERS))?; // lbz r9,56(r31) -- re-read
+    // subfic r8,r9,0 ; subfe r6,r7,r7 ; and r11,r6,r10 -- only the carry survives.
+    let mask = if two_again == 0 { 0 } else { u32::MAX };
+    g.set_u32(record.wrapping_add(BUFFER1), mask & seg1)?; // stw r11,8(r29)
+
+    fill_tail(g, obj, consumed as u32, record)?; // bl 0x82b3df90
+    Ok(256) // li r3,256
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1420,5 +1530,108 @@ mod tests {
 
         assert_eq!(got, 0x1_0000_0100, "bit 32 survives into the returned r3");
         assert_eq!(words(&g, 0x100, 4), ramp(4), "and the copy lands at the truncated address");
+    }
+
+    // ------------------------------------------------------------------ sub_82B3DD90
+
+    const SP: u32 = BASE + 0x3F00;
+    const CONSUMED: u32 = 28;
+
+    /// A stream object whose window lands on the `ring()` fixture: a 256-word span, no lag, and a
+    /// position that puts the cursor 128 words in. The frame the call builds is poisoned, so a word
+    /// the body does not write shows.
+    fn window_stream(g: &mut Guest, two: bool) {
+        ring(g, 0);
+        g.set_u32(OBJECT + OBJ_RING, RING).unwrap();
+        g.set_u32(OBJECT + OBJ_DEST, DEST).unwrap();
+        g.set_u32(OBJECT + OBJ_BLOCK, 0).unwrap();
+        g.set_u32(OBJECT + OBJ_SPAN_HIGH, RING_BYTES / 4).unwrap();
+        g.set_u32(OBJECT + OBJ_SPAN_LOW, 0).unwrap();
+        g.set_u32(OBJECT + OBJ_CURSOR, 0).unwrap();
+        g.set_u32(OBJECT + OBJ_LIMIT0, 32).unwrap();
+        g.set_u32(OBJECT + OBJ_LIMIT1, 16).unwrap();
+        g.set_u32(OBJECT + OBJ_POSITION, 100).unwrap();
+        g.set_u8(OBJECT + OBJ_TWO_BUFFERS, u8::from(two)).unwrap();
+        for i in 0..WINDOW_FRAME / 4 {
+            g.set_u32(SP - WINDOW_FRAME + 4 * i, 0xFFFF_FFFF).unwrap();
+        }
+    }
+
+    /// The same work done by hand: the window and segments written where the tests keep them, then
+    /// the two kernels called directly and the record filled in between.
+    fn window_reference(g: &mut Guest, count: u32) {
+        g.set_u32(WINDOW + RING_BASE, RING).unwrap();
+        g.set_u32(WINDOW + RING_END, RING + RING_BYTES).unwrap();
+        g.set_u32(WINDOW + RING_CURSOR, RING + 512).unwrap(); // (100 + 28) mod 256 words in
+        segment(g, 0, 32, 255);
+        segment(g, 1, 16, 127);
+        let end = fill_segments(g, OBJECT as u64, WINDOW as u64, SEGMENTS, count as u64).unwrap();
+        g.set_u32(RECORD + OUT_END, end as u32).unwrap();
+        let s0 = g.u32(SEGMENTS + SEG_OUT).unwrap();
+        g.set_u32(RECORD + BUFFER0, s0).unwrap();
+        let s1 = if count == 2 { g.u32(SEGMENTS + SEG_STRIDE + SEG_OUT).unwrap() } else { 0 };
+        g.set_u32(RECORD + BUFFER1, s1).unwrap();
+        fill_tail(g, OBJECT, CONSUMED, RECORD).unwrap();
+    }
+
+    #[test]
+    fn the_window_builder_feeds_both_kernels_what_it_derives() {
+        for two in [false, true] {
+            let mut g = guest();
+            window_stream(&mut g, two);
+            let mut h = g.clone();
+            let r = build_window(&mut g, OBJECT as u64, 0, CONSUMED as u64, RECORD as u64, SP);
+            assert_eq!(r.unwrap(), 256);
+            window_reference(&mut h, if two { 2 } else { 1 });
+            assert_eq!(words(&g, DEST, 512), words(&h, DEST, 512), "the copies and fills, two={two}");
+            for off in [BUFFER0, BUFFER1, OUT_END] {
+                assert_eq!(g.u32(RECORD + off).unwrap(), h.u32(RECORD + off).unwrap(), "+{off}, two={two}");
+            }
+            assert_eq!(g.u32(SP - WINDOW_FRAME).unwrap(), SP, "the back chain");
+            let win = SP - WINDOW_FRAME + WINDOW_OFFSET;
+            assert_eq!(g.u32(win + WIN_LAGGED).unwrap(), RING + RING_BYTES, "no lag: the lagged end is the end");
+        }
+    }
+
+    #[test]
+    fn one_segment_publishes_a_null_second_buffer_whatever_the_frame_held() {
+        let mut g = guest();
+        window_stream(&mut g, false);
+        g.set_u32(RECORD + BUFFER1, 0x1234).unwrap();
+        build_window(&mut g, OBJECT as u64, 0, CONSUMED as u64, RECORD as u64, SP).unwrap();
+        assert_eq!(g.u32(RECORD + BUFFER1).unwrap(), 0);
+        let segs = SP - WINDOW_FRAME + SEGMENTS_OFFSET;
+        assert_eq!(g.u32(segs + SEG_STRIDE + SEG_OUT).unwrap(), 0xFFFF_FFFF, "that slot was never written");
+    }
+
+    #[test]
+    fn the_window_divides_the_reach_by_the_span_and_keeps_the_remainder() {
+        // position 300 + consumed 28 = 328 words; mod 256 is 72, plus a lag of 8 is 80 words into the
+        // second block, which starts 256 words past the ring base.
+        let mut g = guest();
+        window_stream(&mut g, false);
+        g.set_u32(OBJECT + OBJ_POSITION, 300).unwrap();
+        g.set_u32(OBJECT + OBJ_SPAN_LOW, 8).unwrap();
+        build_window(&mut g, OBJECT as u64, 1, CONSUMED as u64, RECORD as u64, SP).unwrap();
+        let win = SP - WINDOW_FRAME + WINDOW_OFFSET;
+        assert_eq!(g.u32(win + RING_BASE).unwrap(), RING + 1024);
+        assert_eq!(g.u32(win + RING_END).unwrap(), RING + 2048);
+        assert_eq!(g.u32(win + RING_CURSOR).unwrap(), RING + 1024 + 80 * 4);
+        assert_eq!(g.u32(win + WIN_LAGGED).unwrap(), RING + 2048 - 32);
+        let segs = SP - WINDOW_FRAME + SEGMENTS_OFFSET;
+        assert_eq!(g.u32(segs + SEG_CAP).unwrap(), 255, "block 0 + 255");
+    }
+
+    #[test]
+    fn a_zero_span_divides_to_zero_before_either_kernel_runs() {
+        // The window is built before the first call, so it can be read whatever the kernels then do
+        // with an empty ring -- which here is a copy run long enough to leave the test's mapping.
+        let mut g = guest();
+        window_stream(&mut g, false);
+        g.set_u32(OBJECT + OBJ_SPAN_HIGH, 0).unwrap();
+        let _ = build_window(&mut g, OBJECT as u64, 3, CONSUMED as u64, RECORD as u64, SP);
+        let win = SP - WINDOW_FRAME + WINDOW_OFFSET;
+        assert_eq!(g.u32(win + RING_BASE).unwrap(), RING, "a zero span makes every block start at the base");
+        assert_eq!(g.u32(win + RING_CURSOR).unwrap(), RING + 128 * 4, "the whole reach is the remainder");
     }
 }
