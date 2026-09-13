@@ -85,6 +85,21 @@ pub fn memset_82f52040(g: &mut Guest, dst: u32, byte: u8, len: u64) -> Result<()
     memset(g, dst, byte, len)
 }
 
+/// `sub_82F4DC60` — memmove: `len` bytes from `src` to `dst`, correct for any overlap.
+///
+/// Written as a copy through a temporary buffer, which is memmove's definition. The guest routine
+/// branches on the direction and its forward case tail-calls a memcpy leaf; for the one caller ported
+/// so far (`crate::voices::remove_handle`, which shifts an array down by one entry) `dst` is below
+/// `src`, so a forward copy and a buffered copy leave the same bytes. The whole of `[dst, dst + len)`
+/// is written and nothing else.
+pub fn memmove(g: &mut Guest, dst: u32, src: u32, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let bytes = g.span(src, len as usize)?.to_vec();
+    g.set_span(dst, &bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

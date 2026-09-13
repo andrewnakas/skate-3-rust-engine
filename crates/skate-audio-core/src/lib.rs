@@ -105,6 +105,12 @@ pub mod contributions;
 #[cfg(target_arch = "x86_64")]
 pub mod output;
 
+/// Voice and handle lifecycle, which reaches the gather and the fold's single-rounded adds.
+///
+/// Gated with them: it calls the x86 modules.
+#[cfg(target_arch = "x86_64")]
+pub mod voices;
+
 /// Planar channels into interleaved frames, the last shuffle before the driver.
 ///
 /// Gated with the rest because every sample passes through an `lfs`/`stfs` pair under the guest's

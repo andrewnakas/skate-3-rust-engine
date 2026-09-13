@@ -19,7 +19,7 @@ use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
     Guest, bitstream, buffers, contributions, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
     player, ring,
-    interleave, output, routing,
+    interleave, output, routing, voices,
     scheduler, spatial, stage, system,
 };
 
@@ -807,6 +807,45 @@ fn main() {
                     .map(|_| None)
                     .map_err(|e| e.to_string())
             }
+            // Voice and handle lifecycle. The release builds its pointer arrays in a 208-byte frame
+            // (below the re-point's 112), guest memory no window declares; seeding it with zeroes is
+            // sound because every pointer word is written before the gather reads it.
+            "sub_82B34BD0" => voices::unlink_voice(&mut g, v.r3, v.r4)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B31480" | "sub_82B31368" | "sub_82B31680" if v.r1.is_none() || wide_missing => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1 and the wide r3", v.run));
+                }
+                continue;
+            }
+            "sub_82B31480" | "sub_82B31368" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                let depth = voices::RELEASE_FRAME_BYTES;
+                g.put(sp.wrapping_sub(depth), vec![0u8; depth as usize]);
+                let r = voices::release_voice(&mut g, v.w[0], sp);
+                if v.name == "sub_82B31480" {
+                    r.map(|r| Some(r as u32)).map_err(|e| e.to_string())
+                } else {
+                    r.map(|_| None).map_err(|e| e.to_string())
+                }
+            }
+            "sub_82B31680" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                let depth = voices::REPOINT_FRAME_BYTES + voices::RELEASE_FRAME_BYTES;
+                g.put(sp.wrapping_sub(depth), vec![0u8; depth as usize]);
+                voices::repoint_link(&mut g, v.r3, sp).map(|r| Some(r as u32)).map_err(|e| e.to_string())
+            }
+            "sub_828E30B8" => voices::unlink_checked(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_828E2D78" => voices::unlink_checked_gen8(&mut g, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B49438" => voices::remove_handle(&mut g, v.r3)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
             _ => {
                 t.skipped += 1;
                 continue;
