@@ -9,6 +9,11 @@ name = "skate3rust"
 path = "src/main.rs"
 
 [[bin]]
+name = "skate3-audio-check"
+path = "src/audio_check_main.rs"
+test = false
+
+[[bin]]
 name = "skate3-multiplayer"
 path = "src/multiplayer_main.rs"
 test = false

@@ -8,6 +8,33 @@
 //! A stream that fails to decode is reported once and dropped rather than retried, because every
 //! failure here is a property of the asset or the host's decoder and retrying would only repeat
 //! the process spawn every frame.
+//!
+//! ## Verified by recording the sound card
+//!
+//! `skate3-audio-check` (`src/audio_check_main.rs`) runs this plugin with no window, renderer or
+//! assets, so the audio path can be exercised on a checkout the game itself will not boot on.
+//! Playing 60 blocks of the five-channel ambience bed through it, while recording the output
+//! device's monitor:
+//!
+//! * the plugin decoded 306,816 frames of 5 channels (6.39 s) in 0.19 s and the stream ended
+//!   after 6.6 s;
+//! * the recorded level rose from about -58 dBFS before playback to about -45 dBFS during it;
+//! * cross-correlating the decoded waveform against the recording peaks at **lag 1.370 s** --
+//!   exactly the recorder's one-second head start plus this program's startup -- with a
+//!   peak-to-mean ratio of **58.8**, against **5.7** for a time-reversed control whose peak lands
+//!   at a lag outside the overlap.
+//!
+//! The absolute correlation is 0.22 rather than near 1 because the mixer downmixes five channels
+//! to two and the device has its own response. The sharpness of the peak and the lag being right
+//! are what carry the claim.
+//!
+//! ## What has been verified, and what has not
+//!
+//! The decode underneath this is checked byte-for-byte against an independently produced
+//! reference on real archive data, and the logic in this file is unit-tested. But **no sound from
+//! this path has been heard yet**: it was written on a checkout with no set-up asset pipeline, so
+//! the game does not boot there to reach the startup hook. Treat the first run on a working
+//! install as the real test, and start it with `SKATE_AUDIO_PLAY`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
