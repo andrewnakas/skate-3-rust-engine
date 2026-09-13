@@ -9,6 +9,17 @@
 //! |---|---|---|---|---|---|---|
 //! | [`apply_gain_matrix`] | `sub_82B29AF0` | verified | 143 | 245,762 | 404,782 | [`crate::dsp::scale`] |
 //! | [`ramp_channels`] | `sub_82B23B50` | verified | 119 | 292,165 | 435,555 | [`crate::dsp::gain_ramp`] |
+//! | [`ramp_gain_matrix`] | `sub_82B298E0` | verified | 319 | 142,508 | 180,524 | [`crate::dsp::gain_ramp`], both kernels |
+//!
+//! All three are replayed against recorded gameplay — 795 + 185 + 404 vectors, 0 disagreements.
+//! `sub_82B298E0`'s delta frame is its own stack, so a call with no source rows reads bytes no
+//! recording holds; the replay counts those unreplayable rather than seeding them (there were none).
+//!
+//! `sub_82B298E0` joined the first two later, and is [`apply_gain_matrix`] with a ramp: the same matrix,
+//! the same two passes, the same carried destination count, but every gain moves from the value the
+//! caller saved before this block to the one the matrix holds now, over the kernels' 64 samples. It is
+//! the one body here that **does** reproduce its own frame, because its deltas live there and are read
+//! back by `lfsx`; see [`ramp_gain_matrix`].
 //!
 //! Both `.inc` headers lead with `// STATUS: verified` and `docs/ports.md` agrees. They are here
 //! rather than in `dsp/` because neither is a kernel: they contain no sample arithmetic at all, only
@@ -85,7 +96,7 @@
 //! nothing in this chain writes the guest stack and there is nothing to make room for. Same position
 //! `crate::dsp::biquad` is in with its own frame.
 
-use crate::dsp::gain_ramp::{self, GainRampClobbers};
+use crate::dsp::gain_ramp::{self, AccumulateClobbers, GainRampClobbers};
 use crate::dsp::scale;
 use crate::vmx::Fpscr;
 use crate::{Guest, Result, fp};
@@ -378,6 +389,256 @@ pub fn ramp_channels(
     Ok(RampResult { r3, vector_clobbers })
 }
 
+// ============================================================ sub_82B298E0: the ramped matrix
+
+/// `stwu r1,-432(r1)` — [`ramp_gain_matrix`]'s own frame, and **reproduced**, because the deltas live
+/// in it and are read back out of it by `lfsx`.
+pub const RAMP_FRAME_BYTES: u32 = 432;
+/// `addi r8,r1,80` — the per-destination deltas, `f32[source][8]`, 32 bytes per source row.
+pub const RAMP_DELTAS: u32 = 80;
+/// `(432 - 80) / 32` — the rows of deltas the frame can hold. The matrix is 8×8, so a source count past
+/// 8 is out of the matrix long before it is out of the frame.
+pub const RAMP_FRAME_ROWS: u32 = (RAMP_FRAME_BYTES - RAMP_DELTAS) / GAIN_ROW_STRIDE;
+const _: () = assert!(RAMP_FRAME_ROWS == 11 && RAMP_FRAME_ROWS >= 8);
+
+/// `lis r31,-32208 ; addi r31,r31,-31232 ; lfs f0,480(r31)` — measured 0.015625, **1/64**: the delta
+/// is the whole gain change spread over the kernels' 64-sample ramp. Computed from the immediates and
+/// asserted to be the very cell [`STEP_SCALE`] names for `sub_82B23B50`, reached there from different
+/// lifted lines.
+pub const MATRIX_RAMP_STEP: u32 = LIS_82300000.wrapping_add(-31232i32 as u32) + 480;
+const _: () = assert!(MATRIX_RAMP_STEP == 0x822F_87E0 && MATRIX_RAMP_STEP == STEP_SCALE);
+
+/// The vector registers [`ramp_gain_matrix`] leaves clobbered: whatever its **last** kernel call left.
+///
+/// `sub_82B298E0` saves none of `v14`-`v31` (`__savegprlr_22`, no `__savevmx_*`), so each callee's
+/// clobber reaches its caller, and the harness compares that range on every call. Pass 2 always runs
+/// after pass 1, so if any accumulate ran, the last call was one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastKernelClobbers {
+    /// No kernel ran — a zero destination count. `v14`-`v31` are the caller's own.
+    None,
+    /// The last call was `sub_82B3C098`: `v28`-`v31` are its; `v14`-`v27` are the caller's.
+    Copy(GainRampClobbers),
+    /// The last call was `sub_82B44D18`: every one of `v14`-`v31` is its.
+    Accumulate(AccumulateClobbers),
+}
+
+/// `sub_82B298E0` — apply the channel gain matrix **with a ramp**: each gain moves from the value the
+/// caller saved to the value the matrix holds now, over the kernels' 64-sample ramp.
+///
+/// `mixer` is `r3` (the same object [`apply_gain_matrix`] takes), `dst_desc` is `r4`, `src_desc` is
+/// `r5`, `saved` is `r6` — the caller's copy of the matrix as it stood before this block, same
+/// layout, which `sub_82B29BE0` hands in as its own `r1 + 96` — and `sp` is the entry `r1`. No
+/// result: the mask is `kReturnNone`. What it returns is the vector clobber ([`LastKernelClobbers`]).
+///
+/// It is [`apply_gain_matrix`] with a ramp, and the same shape:
+///
+/// 1. if `+748` is **signed**-positive, one row of eight deltas per source row,
+///    `delta[s][c] = (live[s][c] − saved[s][c]) · 1/64`, stored into this function's own frame;
+/// 2. source channel 0 into every destination through [`gain_ramp::gain_ramp_copy`], which
+///    **overwrites**, starting at `saved[0][d]` and ramping by `delta[0][d]`;
+/// 3. sources `1..` into every destination through [`gain_ramp::gain_ramp_accumulate`], from
+///    `saved[s][d]` by `delta[s][d]`.
+///
+/// **Writes**: the back chain at `sp − 432`; the deltas at `sp − 352 + 32·s + 4·c` for every source row
+/// the delta loop visits and **all eight** columns, whatever the destination count; and, per
+/// destination channel, `[dst & !127, (dst & !0xF) + 1024)` through the copy (its `dcbzl` rounds the
+/// start down) and `[dst & !0xF, +1024)` through the accumulate. **Reads**: both counts, the live
+/// matrix rows the delta loop visits, the saved matrix, both descriptors, [`MATRIX_RAMP_STEP`], the
+/// source channels, the destination channels (the accumulate reads its accumulator), the thirteen
+/// cells the kernels read, and the deltas back out of the frame.
+///
+/// Reproduced rather than fixed, each as the lifted body has it:
+///
+/// - **The delta loop's test is signed and the pass bounds are unsigned.** `cmpwi r10,0 ; ble` skips
+///   the deltas for any count with bit 31 set, while `cmplwi r10,1 ; ble` then sends that same count
+///   into pass 2.
+/// - **With no delta rows, pass 1 still runs and reads the frame as it found it.** A source count of
+///   zero and a non-zero destination count skip step 1 and run step 2, whose `lfsx` loads deltas this
+///   call never wrote. The original reads whatever the stack held; so does this, because the deltas are
+///   guest memory here and not locals.
+/// - **Past eight destinations the cursors walk into the next row** — the saved-gain cursor into the
+///   next saved row, the delta cursor into the next delta row or past the written ones. The matrix has
+///   eight columns and nothing bounds the destination count against it.
+/// - **The deltas' store addresses are `row + (r1 + 80 + 4c − r6)`**, built by six `subf` on 64-bit
+///   registers and truncated only at the store. That equals `sp − 352 + 32·s + 4·c` modulo 2^32 for
+///   every `r6`, and it is written the lifted way below; the store order (columns 0, 2, 3, 5, 4, 6, 7,
+///   1) and the differencing order (2, 3, 0, 5, 4, 6, 7, 1) are kept too.
+/// - **The source base is read once, before pass 1**, and not per destination; pass 2 re-reads the
+///   source descriptor for every source row. The destination count is reloaded after every kernel
+///   call and carried across both passes in one variable, exactly as in [`apply_gain_matrix`].
+///
+/// Not reproduced: `__savegprlr_22`'s spill of `r22`-`r31` and the link register into
+/// `[sp − 88, sp)`, and the kernels' red-zone scratch below `sp − 432` — none of it is read back, and
+/// this crate has no register file. The kernels here keep their splats in registers.
+pub fn ramp_gain_matrix(
+    g: &mut Guest,
+    mixer: u32,
+    dst_desc: u32,
+    src_desc: u32,
+    saved: u32,
+    sp: u32,
+) -> Result<LastKernelClobbers> {
+    // stwu r1,-432(r1): the back chain, then r1 moves.
+    let frame = sp.wrapping_sub(RAMP_FRAME_BYTES);
+    g.set_u32(frame, sp)?;
+    let deltas = frame.wrapping_add(RAMP_DELTAS); // r1 + 80
+    let mut fpscr = Fpscr::capture();
+
+    let source_first = g.u32(mixer.wrapping_add(SOURCE_COUNT))?; // lwz r10,748(r3)
+
+    // cmpwi cr6,r10,0 ; ble cr6,0x82b29a00 — a SIGNED test.
+    if (source_first as i32) > 0 {
+        // The six store offsets, `subf rN,r25,rN`: each a frame slot minus the saved matrix's base, so
+        // that adding the saved-row cursor lands on the frame. Wrapping, as the stores truncate.
+        let r8 = deltas.wrapping_sub(saved); // addi r8,r1,80 ; subf r8,r25,r8
+        let r7 = deltas.wrapping_add(4).wrapping_sub(saved); // addi r7,r1,84
+        let r6 = deltas.wrapping_add(8).wrapping_sub(saved); // addi r6,r1,88
+        let r5 = deltas.wrapping_add(12).wrapping_sub(saved); // addi r5,r1,92
+        let r4 = deltas.wrapping_add(16).wrapping_sub(saved); // addi r4,r1,96
+        let r3 = deltas.wrapping_add(20).wrapping_sub(saved); // addi r3,r1,100
+        fpscr.disable_flush_mode_unconditional(); // emitted at lfs f0,480(r31)
+        let step = fp::load_single(g, MATRIX_RAMP_STEP)?; // lfs f0,480(r31)
+        let mut r9 = deltas.wrapping_add(4).wrapping_sub(GAIN_ROW_STRIDE); // addi r9,r11,-32, r11 = r1+84
+        let mut row = saved.wrapping_add(8); // addi r11,r25,8
+        let mut live = mixer.wrapping_add(GAIN_CURSOR_BASE); // addi r10,r27,440
+        let mut trips = source_first; // mtctr r10
+        loop {
+            // loc_82B29958. All sixteen loads precede all eight stores.
+            fpscr.disable_flush_mode_unconditional(); // emitted at the first lfs
+            let live2 = fp::load_single(g, live.wrapping_add(12))?; // lfs f11,12(r10)
+            let saved2 = fp::load_single(g, row)?; // lfs f5,0(r11)
+            let live3 = fp::load_single(g, live.wrapping_add(16))?; // lfs f10,16(r10)
+            let d2 = fp::sub_single(live2, saved2); // fsubs f2,f11,f5
+            let saved3 = fp::load_single(g, row.wrapping_add(4))?; // lfs f3,4(r11)
+            let saved0 = fp::load_single(g, row.wrapping_sub(8))?; // lfs f6,-8(r11)
+            let d3 = fp::sub_single(live3, saved3); // fsubs f11,f10,f3
+            let live0 = fp::load_single(g, live.wrapping_add(4))?; // lfs f13,4(r10)
+            let live5 = fp::load_single(g, live.wrapping_add(24))?; // lfs f8,24(r10)
+            let d0 = fp::sub_single(live0, saved0); // fsubs f4,f13,f6
+            let saved5 = fp::load_single(g, row.wrapping_add(12))?; // lfs f10,12(r11)
+            let live1 = fp::load_single(g, live.wrapping_add(8))?; // lfs f12,8(r10)
+            let d5 = fp::sub_single(live5, saved5); // fsubs f5,f8,f10
+            let live6 = fp::load_single(g, live.wrapping_add(28))?; // lfs f7,28(r10)
+            let saved4 = fp::load_single(g, row.wrapping_add(8))?; // lfs f1,8(r11)
+            let live4 = fp::load_single(g, live.wrapping_add(20))?; // lfs f9,20(r10)
+            let saved6 = fp::load_single(g, row.wrapping_add(16))?; // lfs f6,16(r11)
+            let d4 = fp::sub_single(live4, saved4); // fsubs f9,f9,f1
+            let saved7 = fp::load_single(g, row.wrapping_add(20))?; // lfs f3,20(r11)
+            let d6 = fp::sub_single(live6, saved6); // fsubs f1,f7,f6
+            live = live.wrapping_add(GAIN_ROW_STRIDE); // lfsu f13,32(r10) updates the address first
+            let live7 = fp::load_single(g, live)?;
+            let saved1 = fp::load_single(g, row.wrapping_sub(4))?; // lfs f10,-4(r11)
+            let d7 = fp::sub_single(live7, saved7); // fsubs f8,f13,f3
+            let d1 = fp::sub_single(live1, saved1); // fsubs f7,f12,f10
+
+            fp::store_single(g, r9.wrapping_add(28), fp::mul_single(d0, step))?; // fmuls f6,f4,f0 ; stfs f6,28(r9)
+            fp::store_single(g, row.wrapping_add(r8), fp::mul_single(d2, step))?; // fmuls f4,f2,f0 ; stfsx f4,r11,r8
+            fp::store_single(g, row.wrapping_add(r7), fp::mul_single(d3, step))?; // fmuls f3,f11,f0 ; stfsx f3,r11,r7
+            fp::store_single(g, row.wrapping_add(r5), fp::mul_single(d5, step))?; // fmuls f13,f5,f0 ; stfsx f13,r11,r5
+            fp::store_single(g, row.wrapping_add(r6), fp::mul_single(d4, step))?; // fmuls f2,f9,f0 ; stfsx f2,r11,r6
+            fp::store_single(g, row.wrapping_add(r4), fp::mul_single(d6, step))?; // fmuls f12,f1,f0 ; stfsx f12,r11,r4
+            fp::store_single(g, row.wrapping_add(r3), fp::mul_single(d7, step))?; // fmuls f11,f8,f0 ; stfsx f11,r11,r3
+            r9 = r9.wrapping_add(GAIN_ROW_STRIDE); // fmuls f10,f7,f0 ; stfsu f10,32(r9)
+            fp::store_single(g, r9, fp::mul_single(d1, step))?;
+            row = row.wrapping_add(GAIN_ROW_STRIDE); // addi r11,r11,32
+
+            trips = trips.wrapping_sub(1); // bdnz 0x82b29958
+            if trips == 0 {
+                break;
+            }
+        }
+    }
+
+    // loc_82B29A00. One destination count across both passes, as in apply_gain_matrix.
+    let mut dest_count = g.u32(mixer.wrapping_add(DEST_COUNT))?; // lwz r11,752(r27)
+    let source = g.u32(src_desc.wrapping_add(BUFFER_BASE))?; // lwz r28,4(r22) — read once, here
+    // addi r11,r1,80 ; subf r29,r25,r11 — the offset from a gain slot to its delta slot.
+    let delta_offset = deltas.wrapping_sub(saved);
+    let mut last = LastKernelClobbers::None;
+
+    // cmplwi cr6,r11,0 ; beq cr6,0x82b29a58 — pass 1: source channel 0 over every destination.
+    if dest_count != 0 {
+        let mut gain = saved; // mr r30,r25
+        let mut dest: u32 = 0; // li r31,0
+        loop {
+            // loc_82B29A20. Both descriptor fields re-read every iteration.
+            let stride = u32::from(g.u16(dst_desc.wrapping_add(CHANNEL_STRIDE))?); // lhz r10,14(r26)
+            let buffer = g.u32(dst_desc.wrapping_add(BUFFER_BASE))?; // lwz r11,4(r26)
+            fpscr.disable_flush_mode_unconditional(); // emitted at the lfsx
+            let slope = fp::load_single(g, gain.wrapping_add(delta_offset))?; // lfsx f2,r30,r29
+            let start = fp::load_single(g, gain)?; // lfs f1,0(r30)
+            let destination = channel_address(stride, dest, buffer); // mullw ; rlwinm ; add r3
+            // bl 0x82b3c098 — dst = src * gain(k), gain ramping from f1 by f2. r4 is the entry source.
+            last = LastKernelClobbers::Copy(gain_ramp::gain_ramp_copy(
+                g,
+                destination as u32,
+                source,
+                start,
+                slope,
+            )?);
+            dest_count = g.u32(mixer.wrapping_add(DEST_COUNT))?; // lwz r11,752(r27) — after the call
+            dest = dest.wrapping_add(1); // addi r31,r31,1
+            gain = gain.wrapping_add(4); // addi r30,r30,4
+            if dest >= dest_count {
+                break; // cmplw cr6,r31,r11 ; blt cr6
+            }
+        }
+    }
+
+    // loc_82B29A58.
+    let mut source_count = g.u32(mixer.wrapping_add(SOURCE_COUNT))?; // lwz r10,748(r27)
+    // cmplwi cr6,r10,1 ; ble cr6,0x82b29ae4 — UNSIGNED, unlike the delta loop's test.
+    if source_count > 1 {
+        let mut row = saved.wrapping_add(GAIN_ROW_STRIDE); // addi r23,r25,32
+        let mut src: u32 = 1; // li r24,1
+        loop {
+            // loc_82B29A6C. The source descriptor is re-read for every source row.
+            let stride = u32::from(g.u16(src_desc.wrapping_add(CHANNEL_STRIDE))?); // lhz r9,14(r22)
+            let buffer = g.u32(src_desc.wrapping_add(BUFFER_BASE))?; // lwz r10,4(r22)
+            let channel = channel_address(stride, src, buffer); // mullw r8,r9,r24 ; rlwinm ; add r28
+            // cmplwi cr6,r11,0 ; beq cr6 — the carried count, not a fresh read.
+            if dest_count != 0 {
+                let mut gain = row; // mr r30,r23
+                let mut dest: u32 = 0; // li r31,0
+                loop {
+                    // loc_82B29A98.
+                    let dst_stride = u32::from(g.u16(dst_desc.wrapping_add(CHANNEL_STRIDE))?); // lhz r10,14(r26)
+                    let dst_buffer = g.u32(dst_desc.wrapping_add(BUFFER_BASE))?; // lwz r11,4(r26)
+                    fpscr.disable_flush_mode_unconditional(); // emitted at the lfsx
+                    let slope = fp::load_single(g, gain.wrapping_add(delta_offset))?; // lfsx f2,r30,r29
+                    let start = fp::load_single(g, gain)?; // lfs f1,0(r30)
+                    let destination = channel_address(dst_stride, dest, dst_buffer);
+                    // bl 0x82b44d18 — dst += src * gain(k).
+                    last = LastKernelClobbers::Accumulate(gain_ramp::gain_ramp_accumulate(
+                        g,
+                        destination as u32,
+                        channel as u32,
+                        start,
+                        slope,
+                    )?);
+                    dest_count = g.u32(mixer.wrapping_add(DEST_COUNT))?; // lwz r11,752(r27)
+                    dest = dest.wrapping_add(1); // addi r31,r31,1
+                    gain = gain.wrapping_add(4); // addi r30,r30,4
+                    if dest >= dest_count {
+                        break; // cmplw cr6,r31,r11 ; blt cr6
+                    }
+                }
+            }
+            // loc_82B29AD0.
+            source_count = g.u32(mixer.wrapping_add(SOURCE_COUNT))?; // lwz r10,748(r27)
+            src = src.wrapping_add(1); // addi r24,r24,1
+            row = row.wrapping_add(GAIN_ROW_STRIDE); // addi r23,r23,32
+            if src >= source_count {
+                break; // cmplw cr6,r24,r10 ; blt cr6
+            }
+        }
+    }
+
+    // loc_82B29AE4: addi r1,r1,432 ; b __restgprlr_22.
+    Ok(last)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,7 +890,7 @@ mod tests {
 
         // step = (1.0 - 0.0)/64, so the kernel's gain is k/64 for the first 64 samples and then 1.0.
         for channel in 0..2u32 {
-            let base = dst + 2048 * 0 + 1024 * channel;
+            let base = dst + 1024 * channel; // row 0 of the destination, then a channel of 256
             assert_eq!(at(&g, base), 0.0, "channel {channel} sample 0 takes the applied gain");
             assert_eq!(at(&g, base + 4), 1.0 / 64.0, "sample 1");
             assert_eq!(at(&g, base + 4 * 64), 1.0, "sample 64 holds at the target");
@@ -725,6 +986,242 @@ mod tests {
         g.set_u32(STEP_SCALE, 0.03125f32.to_bits()).unwrap(); // 1/32
         ramp_channels(&mut g, RAMP_OBJ, PAIR, 0).unwrap();
         assert_eq!(at(&g, dst + 4), 1.0 / 32.0, "the step doubled with the cell");
+    }
+
+    // =========================================================== sub_82B298E0
+
+    const SAVED: u32 = MIXER + 0x0800;
+    const SP: u32 = MIXER + 0x1_F000;
+    const FRAME: u32 = SP - RAMP_FRAME_BYTES;
+
+    fn saved_gain(g: &mut Guest, saved: u32, source: u32, dest: u32, value: f32) {
+        g.set_u32(saved + GAIN_ROW_STRIDE * source + 4 * dest, value.to_bits()).unwrap();
+    }
+
+    fn delta_slot(source: u32, column: u32) -> u32 {
+        FRAME + RAMP_DELTAS + GAIN_ROW_STRIDE * source + 4 * column
+    }
+
+    /// Every value below is dyadic with few significant bits, so every gain, every product and every
+    /// sum the two kernels form is exact in single precision. That keeps these tests neutral on how a
+    /// `vmaddfp` rounds, which is `crate::vmx`'s question and not this module's.
+    #[test]
+    fn the_ramp_starts_at_the_saved_gains_and_arrives_at_the_live_ones() {
+        let mut g = guest();
+        g.set_u32(MIXER + SOURCE_COUNT, 2).unwrap();
+        g.set_u32(MIXER + DEST_COUNT, 2).unwrap();
+        descriptor(&mut g, DST_DESC, DST_BUF, 256);
+        descriptor(&mut g, SRC_DESC, SRC_BUF, 256);
+        fill(&mut g, DST_BUF, 768, 7.0); // a third channel's worth, to catch an overrun
+        fill(&mut g, SRC_BUF, 256, 1.0);
+        fill(&mut g, SRC_BUF + 1024, 256, 2.0);
+        let saved = [[0.0f32, 0.5], [1.0, 0.25]];
+        let live = [[1.0f32, 0.25], [1.0, 0.75]];
+        for s in 0..2 {
+            for d in 0..2 {
+                saved_gain(&mut g, SAVED, s, d, saved[s as usize][d as usize]);
+                gain(&mut g, s, d, live[s as usize][d as usize]);
+            }
+        }
+
+        ramp_gain_matrix(&mut g, MIXER, DST_DESC, SRC_DESC, SAVED, SP).unwrap();
+
+        let src = [1.0f64, 2.0];
+        for d in 0..2usize {
+            for k in 0..256usize {
+                let t = k.min(64) as f64 / 64.0;
+                let expected: f64 = (0..2)
+                    .map(|s| src[s] * (saved[s][d] as f64 + t * (live[s][d] - saved[s][d]) as f64))
+                    .sum();
+                assert_eq!(
+                    at(&g, DST_BUF + 1024 * d as u32 + 4 * k as u32),
+                    expected as f32,
+                    "dest {d} sample {k}"
+                );
+            }
+        }
+        assert_eq!(at(&g, DST_BUF + 2048), 7.0, "nothing past the two channels");
+    }
+
+    #[test]
+    fn the_deltas_live_in_its_own_frame_behind_a_back_chain() {
+        // Eight columns per visited row are written whatever the destination count, and nothing else in
+        // the frame is touched.
+        let mut g = guest();
+        g.set_u32(MIXER + SOURCE_COUNT, 2).unwrap();
+        g.set_u32(MIXER + DEST_COUNT, 1).unwrap();
+        descriptor(&mut g, DST_DESC, DST_BUF, 256);
+        descriptor(&mut g, SRC_DESC, SRC_BUF, 256);
+        for s in 0..2 {
+            for c in 0..8 {
+                saved_gain(&mut g, SAVED, s, c, 0.25 * c as f32);
+                gain(&mut g, s, c, 0.25 * c as f32 + (1 + s + c) as f32);
+            }
+        }
+        g.fill(FRAME, 0xA5, RAMP_FRAME_BYTES).unwrap();
+
+        ramp_gain_matrix(&mut g, MIXER, DST_DESC, SRC_DESC, SAVED, SP).unwrap();
+
+        assert_eq!(g.u32(FRAME).unwrap(), SP, "stwu r1,-432(r1) stores the entry r1");
+        for s in 0..2 {
+            for c in 0..8 {
+                let expected = (1 + s + c) as f32 / 64.0;
+                assert_eq!(at(&g, delta_slot(s, c)), expected, "delta[{s}][{c}]");
+            }
+        }
+        let written = |ea: u32| {
+            (FRAME..FRAME + 4).contains(&ea) || (delta_slot(0, 0)..delta_slot(2, 0)).contains(&ea)
+        };
+        for ea in FRAME..SP {
+            if !written(ea) {
+                assert_eq!(g.u8(ea).unwrap(), 0xA5, "frame byte {:#x} was written", ea - FRAME);
+            }
+        }
+    }
+
+    #[test]
+    fn with_no_source_rows_pass_one_reads_whatever_the_frame_already_held() {
+        // `cmpwi r10,0 ; ble` skips the delta loop for a source count of zero, but pass 1 is gated on
+        // the destination count alone, so its lfsx reads a delta this call never wrote. Seed that slot
+        // as a previous call might have left it: the output ramps by it.
+        let mut g = guest();
+        g.set_u32(MIXER + SOURCE_COUNT, 0).unwrap();
+        g.set_u32(MIXER + DEST_COUNT, 1).unwrap();
+        descriptor(&mut g, DST_DESC, DST_BUF, 256);
+        descriptor(&mut g, SRC_DESC, SRC_BUF, 256);
+        fill(&mut g, SRC_BUF, 256, 1.0);
+        saved_gain(&mut g, SAVED, 0, 0, 0.0);
+        gain(&mut g, 0, 0, 5.0); // never read: no delta row is computed
+        g.set_u32(delta_slot(0, 0), (1.0f32 / 64.0).to_bits()).unwrap();
+
+        let last = ramp_gain_matrix(&mut g, MIXER, DST_DESC, SRC_DESC, SAVED, SP).unwrap();
+
+        assert_eq!(at(&g, DST_BUF), 0.0);
+        assert_eq!(at(&g, DST_BUF + 4), 1.0 / 64.0, "ramped by the stale frame slot");
+        assert_eq!(at(&g, DST_BUF + 4 * 64), 1.0);
+        assert_eq!(at(&g, delta_slot(0, 0)), 1.0 / 64.0, "and the slot was not rewritten");
+        assert!(matches!(last, LastKernelClobbers::Copy(_)), "pass 1 ran; pass 2 did not");
+    }
+
+    #[test]
+    fn the_ramped_destination_count_is_reloaded_after_every_kernel_call() {
+        // Destination channel 0 is laid over the mixer's own counts, so the first kernel call writes
+        // zeros across both and the reload ends pass 1 after one channel; the source count's reload
+        // then skips pass 2. An entry-once read of 4 would have written channels 1 to 3.
+        let mut g = guest();
+        let dst_desc = MIXER + 0x1800;
+        let src_desc = MIXER + 0x1810;
+        let saved = MIXER + 0x1900;
+        let channel0 = MIXER + 256;
+        assert!(channel0 <= MIXER + SOURCE_COUNT && MIXER + DEST_COUNT + 4 <= channel0 + 1024);
+        g.set_u32(MIXER + SOURCE_COUNT, 1).unwrap();
+        g.set_u32(MIXER + DEST_COUNT, 4).unwrap();
+        descriptor(&mut g, dst_desc, channel0, 256);
+        descriptor(&mut g, src_desc, SRC_BUF, 256);
+        fill(&mut g, SRC_BUF, 256, 0.0); // +0.0 * a non-negative gain is +0.0: the counts become 0
+        fill(&mut g, channel0 + 1024, 3 * 256, 7.0);
+        for d in 0..4 {
+            saved_gain(&mut g, saved, 0, d, 0.5);
+            gain(&mut g, 0, d, 0.5);
+        }
+        ramp_gain_matrix(&mut g, MIXER, dst_desc, src_desc, saved, SP).unwrap();
+        assert_eq!(g.u32(MIXER + DEST_COUNT).unwrap(), 0, "channel 0 cleared the count");
+        for i in 0..3 * 256u32 {
+            assert_eq!(at(&g, channel0 + 1024 + 4 * i), 7.0, "channels 1-3 word {i} was written");
+        }
+    }
+
+    #[test]
+    fn pass_one_reads_the_source_base_once_before_its_loop() {
+        // `lwz r28,4(r22)` sits before loc_82B29A20, so every destination of pass 1 mixes from the
+        // base read at that moment. Here channel 0's output lands on the source descriptor and zeroes
+        // its base: a port that re-read it per destination would mix channel 1 from address zero.
+        // The C++ Windows() refuses this layout, so this pins the transcription, not the guest.
+        let mut g = guest();
+        let dst_desc = MIXER + 0x1800;
+        let channel0 = MIXER + 0x2000;
+        let src_desc = channel0 + 64;
+        g.set_u32(MIXER + SOURCE_COUNT, 1).unwrap();
+        g.set_u32(MIXER + DEST_COUNT, 2).unwrap();
+        descriptor(&mut g, dst_desc, channel0, 256);
+        descriptor(&mut g, src_desc, SRC_BUF, 256);
+        fill(&mut g, SRC_BUF, 256, 1.0);
+        saved_gain(&mut g, SAVED, 0, 0, 0.0);
+        saved_gain(&mut g, SAVED, 0, 1, 0.5);
+        gain(&mut g, 0, 0, 0.0);
+        gain(&mut g, 0, 1, 0.5);
+        ramp_gain_matrix(&mut g, MIXER, dst_desc, src_desc, SAVED, SP).unwrap();
+        assert_eq!(g.u32(src_desc + BUFFER_BASE).unwrap(), 0, "channel 0 zeroed the base");
+        for i in 0..256u32 {
+            assert_eq!(at(&g, channel0 + 1024 + 4 * i), 0.5, "channel 1 word {i}");
+        }
+    }
+
+    #[test]
+    fn a_single_source_row_never_reaches_the_accumulate() {
+        let mut g = guest();
+        g.set_u32(MIXER + SOURCE_COUNT, 1).unwrap();
+        g.set_u32(MIXER + DEST_COUNT, 1).unwrap();
+        descriptor(&mut g, DST_DESC, DST_BUF, 256);
+        descriptor(&mut g, SRC_DESC, SRC_BUF, 256);
+        fill(&mut g, SRC_BUF, 256, 1.0);
+        fill(&mut g, SRC_BUF + 1024, 256, 1000.0);
+        saved_gain(&mut g, SAVED, 0, 0, 0.5);
+        gain(&mut g, 0, 0, 0.5);
+        saved_gain(&mut g, SAVED, 1, 0, 1000.0);
+        gain(&mut g, 1, 0, 1000.0);
+        let last = ramp_gain_matrix(&mut g, MIXER, DST_DESC, SRC_DESC, SAVED, SP).unwrap();
+        for i in 0..256u32 {
+            assert_eq!(at(&g, DST_BUF + 4 * i), 0.5, "word {i}: row 0 and source 0 only");
+        }
+        assert!(matches!(last, LastKernelClobbers::Copy(_)));
+    }
+
+    #[test]
+    fn the_returned_clobbers_are_the_last_kernels() {
+        let setup = |sources: u32, dests: u32| {
+            let mut g = guest();
+            g.set_u32(MIXER + SOURCE_COUNT, sources).unwrap();
+            g.set_u32(MIXER + DEST_COUNT, dests).unwrap();
+            descriptor(&mut g, DST_DESC, DST_BUF, 256);
+            descriptor(&mut g, SRC_DESC, SRC_BUF, 256);
+            g
+        };
+        let mut none = setup(2, 0);
+        fill(&mut none, DST_BUF, 256, 7.0);
+        assert_eq!(
+            ramp_gain_matrix(&mut none, MIXER, DST_DESC, SRC_DESC, SAVED, SP).unwrap(),
+            LastKernelClobbers::None,
+            "no destination, no kernel"
+        );
+        assert_eq!(at(&none, DST_BUF), 7.0, "and no channel written");
+
+        let mut copy = setup(1, 1);
+        match ramp_gain_matrix(&mut copy, MIXER, DST_DESC, SRC_DESC, SAVED, SP).unwrap() {
+            LastKernelClobbers::Copy(c) => assert_eq!(c.v28, [8.0f32.to_bits(); 4]),
+            other => panic!("expected the copy's clobber, got {other:?}"),
+        }
+
+        let mut accumulate = setup(2, 1);
+        match ramp_gain_matrix(&mut accumulate, MIXER, DST_DESC, SRC_DESC, SAVED, SP).unwrap() {
+            LastKernelClobbers::Accumulate(c) => {
+                assert_eq!(c.v(14), [8.0f32.to_bits(); 4]);
+                assert_eq!(c.v(21), [1.0f32.to_bits(); 4]);
+            }
+            other => panic!("expected the accumulate's clobber, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ramp_gain_matrix_restores_the_entry_flush_mode() {
+        let mut g = guest();
+        g.set_u32(MIXER + SOURCE_COUNT, 2).unwrap();
+        g.set_u32(MIXER + DEST_COUNT, 1).unwrap();
+        descriptor(&mut g, DST_DESC, DST_BUF, 256);
+        descriptor(&mut g, SRC_DESC, SRC_BUF, 256);
+        let before = crate::vmx::get_mxcsr();
+        ramp_gain_matrix(&mut g, MIXER, DST_DESC, SRC_DESC, SAVED, SP).unwrap();
+        assert_eq!(crate::vmx::get_mxcsr(), before);
     }
 
     #[test]

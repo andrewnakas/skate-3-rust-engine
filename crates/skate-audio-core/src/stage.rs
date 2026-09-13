@@ -691,7 +691,12 @@ mod tests {
     /// than from the loop structure — which is the point: it knows nothing about blocks, pipelining or
     /// cursors, so agreeing with it is evidence the covering is right.
     ///
-    /// Each pass is written in the precision its instruction uses: the two vector passes as f32 FMAs,
+    /// Each pass is written in the precision its instruction uses: the two vector passes as f32
+    /// multiply-then-add, the recomp's two roundings (corrected 2026-09-13; this said FMA),
+    /// **but nothing here pins that choice**: `FEED`, `BUS_COEFF` and `BUS_GAIN` are 0.25, 2 and 0.5,
+    /// so every product is exact and the fused and unfused forms agree. Measured: the suite passed
+    /// with this model fused and the layer unfused. Nor does the recorded replay pin it — stage.tsv
+    /// replays clean under both layers.
     /// the recursion as `fnmsubs` through [`fp::nmsub_single`] with the `mixed` value round-tripped
     /// through an f32 store and load the way the port's memory does it.
     fn model(
@@ -706,14 +711,14 @@ mod tests {
         let mut bus = Vec::with_capacity(count);
         let mut y = state;
         for i in 0..count {
-            // vnmsubfp: -(feed·source[i+1]) + addend[i], one f32 rounding.
-            let mixed = (-feed).mul_add(source[i + 1], addend[i]);
+            // vnmsubfp: addend[i] - feed·source[i+1], the product rounded first.
+            let mixed = addend[i] - feed * source[i + 1];
             // fnmsubs over the value as it comes back out of memory.
             y = fp::nmsub_single(y, POLE, mixed as f64);
             filtered.push(y as f32);
-            // Two f32 FMAs: bus_gain·(bus_coeff·source[i] + source[i+1]) + bus[i].
-            let prod = source[i].mul_add(bc, source[i + 1]);
-            bus.push(prod.mul_add(bg, bus_in[i]));
+            // Two vmaddfp, two roundings each: bus_gain·(bus_coeff·source[i] + source[i+1]) + bus[i].
+            let prod = source[i] * bc + source[i + 1];
+            bus.push(prod * bg + bus_in[i]);
         }
         (filtered, bus, y)
     }

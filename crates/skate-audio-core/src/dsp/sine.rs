@@ -12,10 +12,11 @@
 //!
 //! 1. **The `vspltw128` immediates are reversed** and every coefficient comes through one. A
 //!    single wrong immediate picks a different coefficient and the function still runs.
-//! 2. **Every `vmaddfp` is a single-rounding FMA and every `vmulfp128` is a separate multiply.** The
-//!    Horner chain is eleven of each, alternating; writing any step as `a * b + c` would round
-//!    twice, and letting a multiply and an add collapse into one FMA would round once where the
-//!    guest rounds twice.
+//! 2. **Every `vmaddfp` rounds twice, as the recomp computes it.** The recomp is built without FMA,
+//!    so each Horner step is a multiply and then an add. *Corrected 2026-09-13:* this said
+//!    single-rounding, and under that reading 1,996 of 2,000 recorded calls replayed and 4 did not;
+//!    with two roundings all 2,000 do. The chain is eleven steps, alternating with eleven
+//!    `vmulfp128`, and any step written as a fused `mul_add` rounds once where the recomp rounds twice.
 //! 3. **It clobbers `v31`**, which the ABI preserves and the harness compares unconditionally, so
 //!    the clobber is part of the observable result.
 //!
@@ -145,15 +146,15 @@ unsafe fn sine4_impl(g: &Guest, x: [u32; 4]) -> Result<SineResult> {
         let c10 = _mm_castsi128_ps(vmx::vspltw128::<{ vmx::SPLAT_W2 }>(d));
         let c11 = _mm_castsi128_ps(vmx::vspltw128::<{ vmx::SPLAT_W3 }>(d));
 
-        // Range reduction. vrfin128 rounds to nearest; vnmsubfp is -(a*b)+c with one rounding, so
-        // `t = x - 2pi*round(x/2pi)` never materialises the product as a separate single.
+        // Range reduction. vrfin128 rounds to nearest; vnmsubfp is `x - 2pi*turns` with the
+        // product rounded to single first, as the recomp computes it (vmx.rs, rule 1).
         let turns = vmx::vrfin(scaled); // vrfin128 v12,v60
         let t = vmx::vnmsubfp(reduce_step, turns, x); // vnmsubfp v0,v13,v12,v1
         let t2 = vmx::vmulfp(t, t); // vmulfp128 v59,v0,v0
 
         // Odd-power Horner: each step multiplies the running power by t^2 and folds in one
-        // coefficient with a fused multiply-add. Every vmaddfp rounds once; every vmulfp128 stays
-        // a separate multiply. Letting any adjacent pair collapse changes the answer.
+        // coefficient with a vmaddfp, which the recomp rounds twice. Writing any step as a fused
+        // mul_add changes the answer: on 4 of 2,000 recorded calls, which is how it was found.
         let mut power_a = vmx::vmulfp(t2, t); // vmulfp128 v13,v59,v0   -> t^3
         let mut power_b = vmx::vmulfp(power_a, t2); // vmulfp128 v12,v13,v59  -> t^5
         let mut sum = vmx::vmaddfp(c1, power_a, t); // vmaddfp v13,v31,v13,v0
@@ -271,14 +272,14 @@ mod tests {
         let inv_two_pi = f(A_WORDS[3]);
 
         let turns = (x * inv_two_pi).round_ties_even(); // vmulfp128 then vrfin128
-        let t = (-two_pi).mul_add(turns, x); // vnmsubfp, one rounding
+        let t = x - two_pi * turns; // vnmsubfp: two roundings in the recomp (corrected 2026-09-13)
         let t2 = t * t;
 
         let mut power = t2 * t; // t^3
-        let mut sum = f(SERIES[0]).mul_add(power, t);
+        let mut sum = f(SERIES[0]) * power + t; // vmaddfp, unfused
         for k in 1..11 {
             power *= t2; // t^(2k+3), one multiply from the last, never powi
-            sum = f(SERIES[k]).mul_add(power, sum);
+            sum = f(SERIES[k]) * power + sum;
         }
         sum
     }
@@ -361,6 +362,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // the probes below are input angles, not uses of pi
     fn it_computes_sine_against_an_independent_oracle() {
         // f64::sin is outside this translation entirely. A swapped lane, a wrong splat immediate or
         // a reduction that used pi instead of 2pi all survive a self-consistency check and none of

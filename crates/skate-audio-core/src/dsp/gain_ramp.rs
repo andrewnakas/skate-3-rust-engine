@@ -1,4 +1,25 @@
-//! `sub_82B3C098` — a gain-ramped copy of a fixed 256-single block.
+//! `sub_82B3C098` and `sub_82B44D18` — a gain-ramped copy of a fixed 256-single block, and its
+//! accumulating sibling.
+//!
+//! | function | guest | `docs/ports.md` | lifted lines | calls/boot | calls/play |
+//! |---|---|---|---|---|---|
+//! | [`gain_ramp_copy`] | `sub_82B3C098` | verified | 278 | 2,126,778 | 3,023,068 |
+//! | [`gain_ramp_accumulate`] | `sub_82B44D18` | verified | 402 | 34,866 | 71,847 |
+//!
+//! Both are replayed against recorded gameplay: 166 vectors for the copy and 31 for the
+//! accumulate, 0 disagreements.
+//!
+//! Both `.inc` headers lead with `// STATUS: verified` and `docs/ports.md` agrees. They share a file
+//! because they share everything but the last step: the same thirteen rodata cells in the same roles,
+//! the same two-loop shape, the same literal 1024-byte extent. `sub_82B44D18` differs in three places —
+//! every group is a `vmaddfp` **into** the destination instead of a `vmulfp128` over it, there is no
+//! `dcbzl`, and it clobbers all eighteen of `v14`-`v31` rather than four. Its only caller in the audio
+//! set that matters here is `sub_82B298E0` ([`crate::gains::ramp_gain_matrix`]), which runs this
+//! kernel for every source channel after the first.
+//!
+//! What follows up to the next heading is about `sub_82B3C098`, and was written before its sibling
+//! joined it.
+//!
 //!
 //! `STATUS: verified`, zero divergence over 902,638 compared calls in one boot session, at
 //! **2,126,778 calls per boot** and 3,023,068 per played session on `RwAudioCore Dac`. A leaf: no
@@ -55,8 +76,9 @@
 //! same function rather than two answers that happen to agree. Rewriting any of them the wrong way
 //! leaves every test in this crate passing. That was measured by making the change and watching the
 //! suite, not assumed; the same change at group 3 or group 5, where the multiplier is not a power of
-//! two, fails `it_matches_the_independent_model_bit_for_bit`. All seventeen are written fused
-//! because the original writes them fused.
+//! two, fails `it_matches_the_independent_model_bit_for_bit`. All seventeen go through
+//! [`vmx::vmaddfp`], which rounds twice as the recomp does. *Corrected 2026-09-13:* this said
+//! "fused", and the measurement above was taken under that reading.
 
 #![allow(unused_unsafe)] // see the note at the top of `crate::vmx`
 
@@ -284,6 +306,238 @@ unsafe fn gain_ramp_copy_impl(
     })
 }
 
+// ======================================================= sub_82B44D18: the accumulating sibling
+
+/// The ramp loop's `stvx128` order in [`gain_ramp_accumulate`], by 16-byte group — **not** ascending.
+///
+/// `stvx128 v25,r0,r11`, `v24,r11,r31`, `v1,r11,r3`, `v2,r11,r5`, then `v11,r11,r8` (group 6), then
+/// `v9,r11,r6` and `v10,r11,r7` (groups 4, 5), then `v12,r11,r9`. Reproduced literally, as the C++'s
+/// `kRampStoreOrder` is. The hold loop stores in ascending order.
+pub const ACCUMULATE_RAMP_STORE_ORDER: [usize; VECTORS_PER_BLOCK] = [0, 1, 2, 3, 6, 4, 5, 7];
+
+/// The eighteen ABI-preserved vector registers `sub_82B44D18` leaves clobbered: **all** of
+/// `v14`-`v31`, none of them saved — it uses `__savegprlr_24`, not `__savevmx_*`.
+///
+/// `vr[n - 14]` is `vn` as four host lanes, the layout the C++ writes with
+/// `simde_mm_store_ps(ctx.vN.f32, ...)`. `v14`-`v21` are the eight pool multipliers; `v22`-`v31` are
+/// the **second ramp block's** intermediates, which survive because the hold loop writes only
+/// `v0`-`v13`:
+///
+/// | register | holds |
+/// |---|---|
+/// | `v14` | the whole-block step, [`SCALE_STEP`] |
+/// | `v15`, `v16`, `v17` | the group 7, 6, 5 multipliers |
+/// | `v18`, `v19`, `v20`, `v21` | the group 4, 3, 2, 1 multipliers |
+/// | `v22`, `v23` | the destination vectors that block read at `+48` and `+32` |
+/// | `v24`, `v25` | that block's results for groups 1 and 0 |
+/// | `v26` | the gain a third ramp block would have started from |
+/// | `v27` … `v31` | that block's gains for groups 7, 6, 5, 4, 3 |
+///
+/// The harness compares `v14`-`v31` on every call whatever the result mask says, so this is part of
+/// the function's observable output even though the guest function is void.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccumulateClobbers {
+    /// `vr[n - 14]` is `vn`.
+    pub vr: [[u32; 4]; 18],
+}
+
+impl AccumulateClobbers {
+    /// The lowest register [`AccumulateClobbers::vr`] holds.
+    pub const FIRST: usize = 14;
+
+    /// `vn`'s four host lanes, for `n` in `14..=31`.
+    pub fn v(&self, n: usize) -> [u32; 4] {
+        self.vr[n - Self::FIRST]
+    }
+}
+
+/// `sub_82B44D18` — `dst[k] += src[k] * gain(k)` over 256 singles, the accumulating sibling of
+/// [`gain_ramp_copy`]. `dst` is `r3`, `src` is `r4`, `gain` is `f1` (the gain at sample 0) and `step`
+/// is `f2` (the increment per sample). `gain(k)` ramps for 64 samples and then holds, exactly as in
+/// [`gain_ramp_copy`], and the length is again literal rather than a parameter.
+///
+/// **Writes** `[dst & !0xF, (dst & !0xF) + 1024)` through 64 `stvx128`, and nothing else. There is
+/// **no `dcbzl`**: the destination's old contents are the accumulator, so there is nothing to discard,
+/// and an unaligned `dst` leaves the bytes below it in its line alone — the one place this kernel's
+/// write set differs from its sibling's. **Reads** that same span, 1024 bytes at `src & !0xF`
+/// (`lvx128` masks its address, so an unaligned `src` is read from below itself), and the thirteen
+/// rodata cells [`gain_ramp_copy`] reads, in the same roles.
+///
+/// Returns the clobbered `v14`-`v31` ([`AccumulateClobbers`]). The guest function is void and leaves
+/// `r3 = 32` as scratch (`li r3,32`); its mask is `kReturnNone`, so that word is not a result.
+///
+/// Every vector multiply-add is [`vmx::vmaddfp`] with its operands in the lifted order — `(gain,
+/// sample, accumulator)` for the samples and `(multiplier, step, gain)` for the group gains. How that
+/// operation rounds is [`crate::vmx`]'s to state, not this function's. The four scalar `fmadds` of the
+/// preamble are scalar and go through [`fp::fmadd_single`].
+///
+/// Reproduced rather than tidied: the ramp loop's store order ([`ACCUMULATE_RAMP_STORE_ORDER`]); all
+/// eight source loads of a block before its eight destination loads, and all sixteen before any store,
+/// so a destination one vector ahead of its source still sees the pre-call source within a block; and
+/// the guarded `disableFlushMode` form at the `stfs f12,-96(r1)` between the two loops, where the other
+/// eleven toggles are unconditional.
+pub fn gain_ramp_accumulate(
+    g: &mut Guest,
+    dst: u32,
+    src: u32,
+    gain: f64,
+    step: f64,
+) -> Result<AccumulateClobbers> {
+    if !vmx::supported() {
+        return Err(vmx::unsupported());
+    }
+    unsafe { gain_ramp_accumulate_impl(g, dst, src, gain, step) }
+}
+
+#[target_feature(enable = "sse4.1,fma")]
+unsafe fn gain_ramp_accumulate_impl(
+    g: &mut Guest,
+    dst: u32,
+    src: u32,
+    f1: f64,
+    f2: f64,
+) -> Result<AccumulateClobbers> {
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional(); // emitted at lfs f0,29448(r9)
+
+    let step_scale = fp::load_single(g, STEP_SCALE)?; // lfs f0,29448(r9)
+    let ramp_span = fp::load_single(g, RAMP_SPAN)?; // lfs f13,-9896(r8)
+    let step = fp::mul_single(f2, step_scale); // fmuls f11,f2,f0
+    let held = fp::fmadd_single(f2, ramp_span, f1); // fmadds f12,f2,f13,f1
+    let gain1 = fp::add_single(f1, f2); // fadds f10,f1,f2
+    let lane2_scale = fp::load_single(g, LANE2_SCALE)?; // lfs f0,3152(r7)
+    let lane3_scale = fp::load_single(g, LANE3_SCALE)?; // lfs f13,15112(r6)
+    let gain2 = fp::fmadd_single(f2, lane2_scale, f1); // fmadds f9,f2,f0,f1
+    let gain3 = fp::fmadd_single(f2, lane3_scale, f1); // fmadds f8,f2,f13,f1
+
+    // stfs f11 x4 at -112(r1), read back by lvx128 v13; stfs f1/f10/f9/f8 at -96(r1), read back by
+    // lvx128 v0. Built in registers: the stfs byte order and the lvx128 reversal cancel, exactly as in
+    // `gain_ramp_copy`, so the single stored lowest (f1, sample 0's gain) is host lane 3.
+    let step_v = unsafe { _mm_set1_ps(step as f32) };
+    let start = unsafe { _mm_set_ps(f1 as f32, gain1 as f32, gain2 as f32, gain3 as f32) };
+
+    // The eight pool multipliers, in the order the lifted body loads them.
+    let scale_step = unsafe { vmx::lvx128_ps(g, SCALE_STEP)? }; // lvx128 v14,r0,r9
+    let scale2 = unsafe { vmx::lvx128_ps(g, SCALE[2])? }; // lvx128 v20,r0,r9
+    let scale7 = unsafe { vmx::lvx128_ps(g, SCALE[7])? }; // lvx128 v15,r0,r8
+    let scale6 = unsafe { vmx::lvx128_ps(g, SCALE[6])? }; // lvx128 v16,r0,r7
+    let scale5 = unsafe { vmx::lvx128_ps(g, SCALE[5])? }; // lvx128 v17,r0,r6
+    let scale4 = unsafe { vmx::lvx128_ps(g, SCALE[4])? }; // lvx128 v18,r0,r29
+    let scale3 = unsafe { vmx::lvx128_ps(g, SCALE[3])? }; // lvx128 v19,r0,r28
+    let scale1 = unsafe { vmx::lvx128_ps(g, SCALE[1])? }; // lvx128 v21,r0,r27
+
+    let mut src_cursor = src; // r10
+    let mut dst_cursor = dst; // r11
+    let mut gain = start; // v0
+
+    // Outside the loop on purpose: the last ramp block's values are part of the result (v22-v31).
+    // The loop always runs twice, so none of these is returned unwritten.
+    let zero = unsafe { _mm_setzero_ps() };
+    let mut accum = [zero; VECTORS_PER_BLOCK];
+    let mut out = [zero; VECTORS_PER_BLOCK];
+    let mut group_gain = [zero; VECTORS_PER_BLOCK];
+    let mut next = zero;
+
+    // First loop, loc_82B44E14: the gain still moving. Two blocks of eight vectors, 64 singles.
+    for _ in 0..RAMP_BLOCKS {
+        // lvx128 v12, v11, v10, v9, v8, v7, v6, v5: the source, all eight before anything else.
+        let mut sample = [zero; VECTORS_PER_BLOCK];
+        for (i, s) in sample.iter_mut().enumerate() {
+            *s = unsafe { vmx::lvx128_ps(g, src_cursor.wrapping_add(16 * i as u32))? };
+        }
+        src_cursor = src_cursor.wrapping_add(BLOCK_BYTES); // addi r10,r10,128
+
+        fpscr.enable_flush_mode_unconditional(); // emitted at vmaddfp v2,v21,v13,v0
+        group_gain[0] = gain; // group 0 is v0 itself, the fourth operand of vmaddfp v25,v0,v12,v4
+        group_gain[1] = unsafe { vmx::vmaddfp(scale1, step_v, gain) }; // vmaddfp v2,v21,v13,v0
+        group_gain[2] = unsafe { vmx::vmaddfp(scale2, step_v, gain) }; // vmaddfp v1,v20,v13,v0
+        group_gain[3] = unsafe { vmx::vmaddfp(scale3, step_v, gain) }; // vmaddfp v31,v19,v13,v0
+        group_gain[6] = unsafe { vmx::vmaddfp(scale6, step_v, gain) }; // vmaddfp v28,v16,v13,v0
+        group_gain[4] = unsafe { vmx::vmaddfp(scale4, step_v, gain) }; // vmaddfp v30,v18,v13,v0
+        group_gain[5] = unsafe { vmx::vmaddfp(scale5, step_v, gain) }; // vmaddfp v29,v17,v13,v0
+        group_gain[7] = unsafe { vmx::vmaddfp(scale7, step_v, gain) }; // vmaddfp v27,v15,v13,v0
+
+        // lvx128 v4, v24, v23, v22, v3, v4, v12, v0: the accumulator. Interleaved with the gains in
+        // the lifted body, and every one of them still precedes every store of the block.
+        for (i, a) in accum.iter_mut().enumerate() {
+            *a = unsafe { vmx::lvx128_ps(g, dst_cursor.wrapping_add(16 * i as u32))? };
+        }
+
+        out[0] = unsafe { vmx::vmaddfp(group_gain[0], sample[0], accum[0]) }; // vmaddfp v25,v0,v12,v4
+        next = unsafe { vmx::vmaddfp(scale_step, step_v, gain) }; // vmaddfp v26,v14,v13,v0
+        out[1] = unsafe { vmx::vmaddfp(group_gain[1], sample[1], accum[1]) }; // vmaddfp v24,v2,v11,v24
+        out[2] = unsafe { vmx::vmaddfp(group_gain[2], sample[2], accum[2]) }; // vmaddfp v1,v1,v10,v23
+        out[3] = unsafe { vmx::vmaddfp(group_gain[3], sample[3], accum[3]) }; // vmaddfp v2,v31,v9,v22
+        out[6] = unsafe { vmx::vmaddfp(group_gain[6], sample[6], accum[6]) }; // vmaddfp v11,v28,v6,v12
+        out[4] = unsafe { vmx::vmaddfp(group_gain[4], sample[4], accum[4]) }; // vmaddfp v9,v30,v8,v3
+        out[5] = unsafe { vmx::vmaddfp(group_gain[5], sample[5], accum[5]) }; // vmaddfp v10,v29,v7,v4
+        out[7] = unsafe { vmx::vmaddfp(group_gain[7], sample[7], accum[7]) }; // vmaddfp v12,v27,v5,v0
+
+        for &i in &ACCUMULATE_RAMP_STORE_ORDER {
+            unsafe { vmx::stvx128_ps(g, dst_cursor.wrapping_add(16 * i as u32), out[i])? };
+        }
+        dst_cursor = dst_cursor.wrapping_add(BLOCK_BYTES); // addi r11,r11,128
+        gain = next; // vor v0,v26,v26
+    }
+
+    // The ramp is over at sample 64: every remaining single takes the held gain.
+    fpscr.disable_flush_mode(); // the *guarded* form, emitted at stfs f12,-96(r1)
+    let held_v = unsafe { _mm_set1_ps(held as f32) }; // stfs f12 x4 ; lvx128 v0,r0,r29
+
+    // Second loop, loc_82B44EEC: six blocks, 192 singles, constant gain.
+    for _ in 0..HOLD_BLOCKS {
+        // lvx128 v12, v10, v9, v5, v4, v3, v2, v1.
+        let mut sample = [zero; VECTORS_PER_BLOCK];
+        for (i, s) in sample.iter_mut().enumerate() {
+            *s = unsafe { vmx::lvx128_ps(g, src_cursor.wrapping_add(16 * i as u32))? };
+        }
+        src_cursor = src_cursor.wrapping_add(BLOCK_BYTES); // addi r10,r10,128
+
+        // lvx128 v13, v13, v11, v12, v13, v11, v12, v13: all eight before the first store here too.
+        let mut hold_accum = [zero; VECTORS_PER_BLOCK];
+        for (i, a) in hold_accum.iter_mut().enumerate() {
+            *a = unsafe { vmx::lvx128_ps(g, dst_cursor.wrapping_add(16 * i as u32))? };
+        }
+
+        fpscr.enable_flush_mode_unconditional(); // emitted at vmaddfp v6,v0,v12,v13
+        let mut hold_out = [zero; VECTORS_PER_BLOCK];
+        for (i, o) in hold_out.iter_mut().enumerate() {
+            // vmaddfp v6,v0,v12,v13 ... v13,v0,v1,v13: the held gain is the FIRST operand.
+            *o = unsafe { vmx::vmaddfp(held_v, sample[i], hold_accum[i]) };
+        }
+        for (i, o) in hold_out.iter().enumerate() {
+            unsafe { vmx::stvx128_ps(g, dst_cursor.wrapping_add(16 * i as u32), *o)? };
+        }
+        dst_cursor = dst_cursor.wrapping_add(BLOCK_BYTES); // addi r11,r11,128
+    }
+
+    let registers = [
+        scale_step,    // v14
+        scale7,        // v15
+        scale6,        // v16
+        scale5,        // v17
+        scale4,        // v18
+        scale3,        // v19
+        scale2,        // v20
+        scale1,        // v21
+        accum[3],      // v22: lvx128 v22,r11,r5, the accumulator at +48
+        accum[2],      // v23: lvx128 v23,r11,r3, the accumulator at +32
+        out[1],        // v24: vmaddfp v24,v2,v11,v24
+        out[0],        // v25: vmaddfp v25,v0,v12,v4
+        next,          // v26: vmaddfp v26,v14,v13,v0
+        group_gain[7], // v27
+        group_gain[6], // v28
+        group_gain[5], // v29
+        group_gain[4], // v30
+        group_gain[3], // v31
+    ];
+    let mut vr = [[0u32; 4]; 18];
+    for (slot, v) in vr.iter_mut().zip(registers) {
+        *slot = unsafe { lanes_ps(v) };
+    }
+    Ok(AccumulateClobbers { vr })
+}
+
 #[inline]
 #[target_feature(enable = "sse4.1")]
 unsafe fn lanes_ps(v: __m128) -> [u32; 4] {
@@ -348,7 +602,8 @@ mod tests {
 
     /// An independent model, written from what the kernel is *for*: 256 singles scaled by a gain
     /// that ramps for 64 samples and then holds. The rounding structure is reproduced — `fmuls`,
-    /// `fadds` and `fmadds` narrow to single, and the vector multiply-adds round once — but nothing
+    /// `fadds` and `fmadds` narrow to single, `fmadds` rounds once, and the vector multiply-adds round
+    /// twice, as the recomp's unfused `vmaddfp` does (corrected 2026-09-13) — but nothing
     /// about the loop shape, the group multipliers or the lane order is taken from the body.
     fn model(src: &[f32], f1: f64, f2: f64) -> Vec<f32> {
         let step = ((f2 * 4.0) as f32) as f64;
@@ -363,12 +618,12 @@ mod tests {
         let mut out = vec![0f32; 256];
         let mut gain = start;
         for block in 0..RAMP_BLOCKS {
-            let next = gain.map(|l| 8.0f32.mul_add(step as f32, l));
+            let next = gain.map(|l| 8.0f32 * step as f32 + l);
             for group in 0..VECTORS_PER_BLOCK {
                 let gg = if group == 0 {
                     gain
                 } else {
-                    gain.map(|l| (group as f32).mul_add(step as f32, l))
+                    gain.map(|l| group as f32 * step as f32 + l)
                 };
                 for j in 0..4 {
                     let k = block * 32 + group * 4 + j;
@@ -463,8 +718,9 @@ mod tests {
     /// the block step, `fma(c, step, gain)` and `fl(fl(c*step) + gain)` are the *same function*, not
     /// two answers that happen to agree. Measured, not assumed: breaking group 1 or the block step
     /// into a separate multiply and add leaves every test in this crate passing, while the same
-    /// break at group 3 or group 5 fails this one. Those four sites are written fused anyway,
-    /// because the original is, and nothing here would catch their absence.
+    /// break at group 3 or group 5 fails this one. (Measured when the layer was fused.) Those four
+    /// sites go through the same `vmx::vmaddfp` as the rest, and nothing here would catch it if
+    /// they did not.
     #[test]
     fn it_matches_the_independent_model_bit_for_bit() {
         let src = source();
@@ -594,6 +850,176 @@ mod tests {
         put(&mut g, SRC, &vec![1.0f32; 256]);
         let before = vmx::get_mxcsr();
         gain_ramp_copy(&mut g, DST, SRC, 1.0, 0.01).unwrap();
+        assert_eq!(vmx::get_mxcsr(), before);
+    }
+
+    // ================================================================ sub_82B44D18
+
+    /// `dst` then `src`, both 256 singles, with few enough significant bits that **every product and
+    /// every sum below is exact in single precision**.
+    ///
+    /// That is deliberate, and it is what these tests may and may not claim. Whether a `vmaddfp` rounds
+    /// once or twice is [`crate::vmx`]'s question — it is under measurement, and the answer is owned
+    /// there. With exact products the two readings are the *same function*, so every expected value
+    /// here holds under either, and nothing in this module asserts one of them.
+    fn accumulator() -> Vec<f32> {
+        (0..256).map(|i| ((i * 7 % 23) as f32) * 0.125 - 1.0).collect()
+    }
+
+    /// The independent model: `dst[k] + src[k]*gain(k)` with `gain(k) = f1 + k*f2` for 64 samples and
+    /// `f1 + 64*f2` after. Written from what the kernel is for, not from its loop shape.
+    ///
+    /// The multiply-add is written `a * b + c` in `f32` — a separate multiply and add, never
+    /// `mul_add` — which is how the recomp's `vmaddfp` computes (built without `-mfma`, so SIMDe's
+    /// fallback). Only the callers' exact inputs are used with it, and on those the product never rounds,
+    /// so the model and the kernel agree whichever way `crate::vmx` lowers the operation. The callers
+    /// assert that exactness rather than assume it.
+    fn accumulate_model(dst: &[f32], src: &[f32], f1: f64, f2: f64) -> Vec<f32> {
+        (0..256)
+            .map(|k| {
+                let gain = if k < 64 { f1 + k as f64 * f2 } else { f1 + 64.0 * f2 };
+                src[k] * (gain as f32) + dst[k]
+            })
+            .collect()
+    }
+
+    /// True when `a*b` needs no rounding in single precision.
+    fn exact_product(a: f32, b: f32) -> bool {
+        (a as f64 * b as f64) as f32 as f64 == a as f64 * b as f64
+    }
+
+    /// Host lanes of a vector loaded from four guest words: `lvx128` reverses all sixteen bytes, so
+    /// guest element `e` is host lane `3 - e`.
+    fn lanes_of(words: &[f32]) -> [u32; 4] {
+        [words[3].to_bits(), words[2].to_bits(), words[1].to_bits(), words[0].to_bits()]
+    }
+
+    #[test]
+    fn the_accumulate_adds_the_ramped_source_onto_the_destination() {
+        // The headline behaviour, in values that are exact under any rounding: a source of ones onto
+        // a destination of tens, ramping by 1/64 a sample, so sample k gains k/64 for 64 samples and
+        // then a flat 1.0.
+        let mut g = image();
+        put(&mut g, SRC, &vec![1.0f32; 256]);
+        put(&mut g, DST, &vec![10.0f32; 256]);
+        gain_ramp_accumulate(&mut g, DST, SRC, 0.0, 1.0 / 64.0).unwrap();
+        let out = get(&g, DST, 256);
+        for k in 0..64 {
+            assert_eq!(out[k], 10.0 + k as f32 / 64.0, "sample {k}");
+        }
+        for k in 64..256 {
+            assert_eq!(out[k], 11.0, "sample {k} holds");
+        }
+    }
+
+    #[test]
+    fn accumulate_matches_the_independent_model_on_exact_products() {
+        let src = source();
+        let dst = accumulator();
+        for (f1, f2) in [(0.5, 1.0 / 1024.0), (1.0, -1.0 / 2048.0), (-2.0, 0.125), (0.25, 0.0), (3.0, 1.0 / 256.0)] {
+            // The guard this test's neutrality rests on, checked rather than assumed: every gain the
+            // kernel forms is exact, and every product of a gain and a sample is exact.
+            for k in 0..=64 {
+                let gain = f1 + k as f64 * f2;
+                assert_eq!(gain as f32 as f64, gain, "gain {k} is exact");
+                for &s in &src {
+                    assert!(exact_product(gain as f32, s), "gain {gain} * {s} is exact");
+                }
+            }
+            let mut g = image();
+            put(&mut g, SRC, &src);
+            put(&mut g, DST, &dst);
+            gain_ramp_accumulate(&mut g, DST, SRC, f1, f2).unwrap();
+            assert_eq!(get(&g, DST, 256), accumulate_model(&dst, &src, f1, f2), "f1 = {f1}, f2 = {f2}");
+        }
+    }
+
+    #[test]
+    fn there_is_no_line_clear_so_the_bytes_below_an_unaligned_destination_survive() {
+        // The one write-set difference from gain_ramp_copy. A destination 16 bytes into a 128-byte
+        // line: the copy's dcbzl would zero the 16 bytes below it; the accumulate must not.
+        let mut g = image();
+        put(&mut g, SRC, &vec![1.0f32; 256]);
+        let unaligned = DST + 16;
+        assert_ne!(unaligned & 127, 0);
+        put(&mut g, DST, &vec![7.0f32; 4 + 256 + 4]);
+        gain_ramp_accumulate(&mut g, unaligned, SRC, 1.0, 0.0).unwrap();
+        assert_eq!(get(&g, DST, 4), vec![7.0f32; 4], "the head of the line is untouched");
+        assert_eq!(get(&g, unaligned, 256), vec![8.0f32; 256], "7 + 1*1 everywhere");
+        assert_eq!(get(&g, unaligned + 1024, 4), vec![7.0f32; 4], "nothing past 1024 bytes");
+    }
+
+    #[test]
+    fn an_unaligned_destination_is_accumulated_at_its_masked_address() {
+        // stvx128 and lvx128 both mask to 16 bytes, so a destination 4 bytes into a vector reads and
+        // writes the aligned run below it: the word below the pointer is accumulated and the last
+        // three words of the nominal run are not touched.
+        let mut g = image();
+        put(&mut g, SRC, &vec![1.0f32; 256]);
+        put(&mut g, DST, &vec![7.0f32; 260]);
+        gain_ramp_accumulate(&mut g, DST + 4, SRC, 1.0, 0.0).unwrap();
+        assert_eq!(get(&g, DST, 256), vec![8.0f32; 256], "the aligned run below the pointer");
+        assert_eq!(get(&g, DST + 1024, 4), vec![7.0f32; 4], "the nominal tail is not written");
+    }
+
+    #[test]
+    fn a_ramp_block_reads_all_its_source_and_accumulator_before_it_stores() {
+        // A destination one vector ahead of its source: block 0's first store lands on the source
+        // vector group 1 reads. Every load of the block precedes every store in the original, so all
+        // 32 outputs of block 0 are formed from pre-call values: out[k] = src[k+4] + src[k] at gain 1.
+        let src = source();
+        let mut g = image();
+        put(&mut g, SRC, &src);
+        put(&mut g, SRC + 1024, &vec![0.5f32; 64]); // what the destination reaches past the source
+        gain_ramp_accumulate(&mut g, SRC + 16, SRC, 1.0, 0.0).unwrap();
+        let out = get(&g, SRC + 16, 32);
+        for k in 0..32 {
+            assert_eq!(out[k], src[k + 4] + src[k], "block 0, sample {k}");
+        }
+    }
+
+    #[test]
+    fn the_clobbered_vector_registers_are_the_pool_and_the_second_ramp_blocks_values() {
+        // Every one of v14-v31 is named, and the ten data-dependent ones are checked against values
+        // computed here from the inputs. Exact dyadic inputs again, so rounding cannot enter.
+        let src = source();
+        let dst = accumulator();
+        let (f1, f2) = (0.5f64, 1.0 / 1024.0);
+        let mut g = image();
+        put(&mut g, SRC, &src);
+        put(&mut g, DST, &dst);
+        let c = gain_ramp_accumulate(&mut g, DST, SRC, f1, f2).unwrap();
+        let out = get(&g, DST, 256);
+
+        for (n, value) in [(14, 8.0f32), (15, 7.0), (16, 6.0), (17, 5.0), (18, 4.0), (19, 3.0), (20, 2.0), (21, 1.0)] {
+            assert_eq!(c.v(n), [value.to_bits(); 4], "v{n} is a pool multiplier");
+        }
+        // The second ramp block covers samples 32..64, i.e. destination words 32..64.
+        assert_eq!(c.v(22), lanes_of(&dst[32 + 12..32 + 16]), "v22: the accumulator at +48");
+        assert_eq!(c.v(23), lanes_of(&dst[32 + 8..32 + 12]), "v23: the accumulator at +32");
+        assert_eq!(c.v(24), lanes_of(&out[32 + 4..32 + 8]), "v24: group 1's result");
+        assert_eq!(c.v(25), lanes_of(&out[32..32 + 4]), "v25: group 0's result");
+        let gain = |k: usize| (f1 + k as f64 * f2) as f32;
+        let gains = |first: usize| lanes_of(&[gain(first), gain(first + 1), gain(first + 2), gain(first + 3)]);
+        assert_eq!(c.v(26), gains(64), "v26: where a third ramp block would start");
+        for (n, group) in [(27, 7usize), (28, 6), (29, 5), (30, 4), (31, 3)] {
+            assert_eq!(c.v(n), gains(32 + 4 * group), "v{n}: group {group}'s gain");
+        }
+    }
+
+    #[test]
+    fn accumulate_a_missing_constant_is_an_error_not_a_zero() {
+        let mut bare = Guest::single(BASE, 0x1000);
+        let err = gain_ramp_accumulate(&mut bare, DST, SRC, 1.0, 0.0).unwrap_err();
+        assert_eq!(err.address, STEP_SCALE, "the first cell it reaches");
+    }
+
+    #[test]
+    fn accumulate_restores_the_entry_flush_mode() {
+        let mut g = image();
+        put(&mut g, SRC, &vec![1.0f32; 256]);
+        let before = vmx::get_mxcsr();
+        gain_ramp_accumulate(&mut g, DST, SRC, 1.0, 0.01).unwrap();
         assert_eq!(vmx::get_mxcsr(), before);
     }
 }

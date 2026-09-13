@@ -12,8 +12,12 @@
 //! comparisons in both flush-to-zero states. The five rules it draws, and where each one lands
 //! here:
 //!
-//! 1. **`vmaddfp*` is a single-rounding FMA.** [`vmaddfp`] is `_mm_fmadd_ps` and [`vnmsubfp`] is
-//!    `_mm_fnmadd_ps`; a `vmulfp128` next to a `vaddfp128` stays two operations. Never `a * b + c`.
+//! 1. **`vmaddfp*` rounds twice in the recomp.** It is built for plain x86-64 plus SSE4.1 with no
+//!    `-mfma`, so SIMDe lowers [`vmaddfp`] to `(a * b) + c` and [`vnmsubfp`] to `-(a * b) + c`, which
+//!    clang-20 emits as `mulps` then `addps`, and `mulps` then `subps`. Both are translated in that
+//!    form. The scalar `fmadds` family is `std::fma` and stays single-rounding. *Corrected
+//!    2026-09-13:* this rule used to say the opposite, and the probe agreed only because its
+//!    reference was built with `-march=native`, which the game never is.
 //! 2. **Flush-to-zero is per instruction class, not per function.** [`Fpscr`] reproduces
 //!    `ctx.fpscr`; see its documentation for the part of this that is *not* what the name suggests.
 //! 3. **The BE↔LE lane mask is literal data.** [`VECTOR_MASK_L`] and [`VECTOR_MASK_R`] are copied
@@ -148,6 +152,17 @@ pub fn set_mxcsr(v: u32) {
 /// preserved"); it was corrected on 2026-09-12 and now agrees with this. Nothing in `fp.rs` ever
 /// depended on it either way, because the ops there are called under whatever mode their caller
 /// established — which is why every body that uses them holds an [`Fpscr`] of its own.
+///
+/// **What holding the mode cannot do, measured 2026-09-13.** `examples/flush_probe` sets `FZ|DAZ`,
+/// confirms MXCSR reads back `0x9FC0`, and then shows that an `lfs`/`stfs` round trip of the same
+/// value flushes a denormal at `opt-level = 0` and **does not** at `opt-level >= 1` — because LLVM
+/// folds `fptrunc(fpext(x))` into a no-op and the conversions never execute. Real arithmetic is
+/// unaffected: a denormal *product* is `+0` under both profiles, which is the behaviour
+/// [`crate::dsp::biquad`]'s denormal-avoidance bias exists for. So the mode is honoured wherever an
+/// operation actually happens, and a pure widen/narrow pair is not an operation the optimizer keeps.
+/// Two tests used to assert the flush through such a pair; they were wrong, and say so now. clang
+/// has the same fold available for the recomp's own `double(f32)`/`float(f64)` pairs, which is why
+/// no claim is made about the original's answer either — no recorded vector exercises it.
 ///
 /// **One deliberate divergence.** The guest's FPSCR is sticky: a lifted function leaves the mode
 /// it last set and the next one inherits it. [`Fpscr`] restores the entry MXCSR when it is dropped,
@@ -489,16 +504,19 @@ vop! {
     vmulfp(a: __m128, b: __m128) = _mm_mul_ps(a, b)
 }
 vop! {
-    /// `vmaddfp`, `vmaddfp128`, `vmaddcfp128` — `a * b + c` with **one** rounding.
+    /// `vmaddfp`, `vmaddfp128`, `vmaddcfp128` — `a * b + c` with **two** roundings.
     ///
-    /// Rule 1: this is `_mm_fmadd_ps` and never the algebraic form. LLVM will not contract a
-    /// separate multiply and add without fast-math, so the failure mode is a human writing
-    /// `a * b + c`, not the compiler. **Rule 4 applies** to the two factors.
-    vmaddfp(a: __m128, b: __m128, c: __m128) = _mm_fmadd_ps(a, b, c)
+    /// Rule 1: the recomp has no FMA, so SIMDe multiplies, rounds, adds and rounds again, and
+    /// clang-20 emits exactly `mulps` then `addps` with the product as the first source. LLVM will
+    /// not contract the pair without fast-math, so it stays unfused here too. **Rule 4 applies** to
+    /// the multiply's two factors and to the add.
+    vmaddfp(a: __m128, b: __m128, c: __m128) = _mm_add_ps(_mm_mul_ps(a, b), c)
 }
 vop! {
-    /// `vnmsubfp` — `-(a * b) + c`, one rounding. **Rule 4 applies.**
-    vnmsubfp(a: __m128, b: __m128, c: __m128) = _mm_fnmadd_ps(a, b, c)
+    /// `vnmsubfp` — `-(a * b) + c`, which clang-20 emits as `c - a * b`: `mulps` then `subps`, two
+    /// roundings. A subtraction is not commutative, so which NaN wins is fixed — `c`, then the
+    /// product with its sign *not* flipped. **Rule 4 applies** only to the multiply's factors.
+    vnmsubfp(a: __m128, b: __m128, c: __m128) = _mm_sub_ps(c, _mm_mul_ps(a, b))
 }
 vop! {
     /// `vmaxfp128`. Needs no operand pinning: SSE defines `maxps` to return its second operand
@@ -1077,30 +1095,34 @@ mod tests {
     }
 
     #[test]
-    fn vmaddfp_rounds_once() {
+    fn vmaddfp_rounds_twice_as_the_recomp_computes_it() {
+        // CORRECTED 2026-09-13: this test used to assert a single rounding. The recomp is built for
+        // plain x86-64 with SSE4.1 and no FMA, so SIMDe lowers vmaddfp to `(a * b) + c` in float --
+        // the multiply rounds, then the add rounds. Replaying 2,000 recorded calls of the four-lane
+        // sine kernel settled it: a two-rounding emulation matches the original on 16 of 16 distinct
+        // inputs where a fused one matches 12, and the probe rebuilt with the recomp's own flags
+        // agrees on this primitive where the -march=native build did not.
         let (a, b, rounded, error) = fma_probe();
         assert!(supported());
         unsafe {
             let r = vmaddfp(from_f32([a; 4]), from_f32([b; 4]), from_f32([-rounded; 4]));
-            assert_eq!(lanes_ps(r), [error.to_bits(); 4], "vmaddfp must be a single-rounding FMA");
-
-            // The algebraic form `a * b + c`, which rule 1 forbids: the multiply rounds away
-            // exactly the bits the addend then cancels, so it returns zero.
-            let unfused =
-                vaddfp(vmulfp(from_f32([a; 4]), from_f32([b; 4])), from_f32([-rounded; 4]));
-            assert_eq!(lanes_ps(unfused), [0; 4]);
-            assert_ne!(lanes_ps(unfused), lanes_ps(r), "if these agreed the test would prove nothing");
+            // The multiply rounds away exactly the bits the addend then cancels: +0, by bits.
+            assert_eq!(lanes_ps(r), [0; 4], "vmaddfp rounds the product before adding");
+            // A single-rounding FMA would have kept them. If it agreed, this would prove nothing.
+            assert_ne!(error.to_bits(), 0, "the input must tell the two forms apart");
         }
     }
 
     #[test]
-    fn vnmsubfp_negates_the_product_and_rounds_once() {
+    fn vnmsubfp_negates_the_rounded_product_then_adds() {
+        // CORRECTED 2026-09-13, for the reason above: SIMDe's fallback is `-(a * b) + c`, the product
+        // rounded, negated exactly, then the add rounded.
         let (a, b, rounded, error) = fma_probe();
         assert!(supported());
         unsafe {
-            // -(a*b) + rounded is the negation of vmaddfp's answer above, again in one rounding.
             let r = vnmsubfp(from_f32([a; 4]), from_f32([b; 4]), from_f32([rounded; 4]));
-            assert_eq!(lanes_ps(r), [(-error).to_bits(); 4]);
+            assert_eq!(lanes_ps(r), [0; 4]);
+            assert_ne!((-error).to_bits(), 0, "the input must tell the two forms apart");
             // And the sign really is on the product, not the addend.
             let s = vnmsubfp(from_f32([2.0; 4]), from_f32([3.0; 4]), from_f32([1.0; 4]));
             assert_eq!(lanes_ps(s), [(-5.0f32).to_bits(); 4]);

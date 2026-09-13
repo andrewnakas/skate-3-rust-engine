@@ -19,6 +19,7 @@ pub mod counter;
 pub mod cursors;
 pub mod eval;
 pub mod fp;
+pub mod leaves;
 pub mod mem;
 pub mod player;
 pub mod scheduler;

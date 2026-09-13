@@ -12,6 +12,7 @@
 //! | [`gain_ramp`] | `sub_82B3C098` | gain-ramped copy of 256 singles | verified | 2,126,778 | 3,023,068 |
 //! | [`biquad`] | `sub_82B43AF8` | a biquad over a run of singles, eight a pass | verified | 1,152,252 | 1,592,578 |
 //! | [`resample`] | `sub_82B43FB8` | linear interpolation walked by a 16.16 phase | verified | 404,358 | 748,902 |
+//! | [`clip`] | `sub_82B22678` | hard clipper: clamp 256 samples a channel, then swap the pair | verified | 49,325 | 76,864 |
 //! | [`scale_add`] | `sub_82B3CF58` | `z[i] = x[i]·gain + y[i]`, and a copy of `x` into `w` | verified | 179,218 | 339,926 |
 //!
 //! The last two are **scalar**, which is worth saying in a directory named for vector kernels: they
@@ -56,6 +57,7 @@
 
 pub mod biquad;
 pub mod gain_ramp;
+pub mod clip;
 pub mod resample;
 pub mod scale;
 pub mod scale_add;

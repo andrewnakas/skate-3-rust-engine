@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn the_accumulator_fuses_and_the_plain_scale_does_not() {
+    fn the_accumulator_rounds_twice_on_the_vector_path_and_once_on_the_scalar_path() {
         // The distinguishing input: `a * b` needs 48 bits, and the destination holds the negation
         // of its f32 rounding. A single-rounding multiply-add returns the discarded bits; a
         // multiply-then-add returns zero, because the multiply threw those bits away first.
@@ -553,11 +553,14 @@ mod tests {
             put(&mut g, s, &vec![a; count as usize]);
             put(&mut g, d, &vec![-rounded; count as usize]);
             scale_accumulate(&mut g, d, s, count, b as f64).unwrap();
-            assert_eq!(
-                get(&g, d, count as usize),
-                vec![fused; count as usize],
-                "count {count}: the multiply-add must round once, not twice"
-            );
+            // CORRECTED 2026-09-13. The vector path's vmaddfp rounds the product and then the add,
+            // because the recomp is built without FMA and SIMDe falls back to `(a * b) + c`; so the
+            // discarded bits are gone and the answer is +0. The scalar path's fmadds is `std::fma`,
+            // which is correctly rounded in software with or without the instruction, so it keeps
+            // them. One function, two answers, decided by which path the count and alignment take.
+            let want = if count == 256 { 0.0f32 } else { fused };
+            let got: Vec<u32> = get(&g, d, count as usize).iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got, vec![want.to_bits(); count as usize], "count {count}");
         }
 
         // And `scale`, which has no add at all, leaves the rounded product — the value the

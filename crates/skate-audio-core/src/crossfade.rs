@@ -671,7 +671,9 @@ mod tests {
             let inv = 1.0f32 - d;
             let wet = d * c;
             let dry = inv * b;
-            let mix = dry.mul_add(gb, wet * gc);
+            // vmaddfp: the recomp's is unfused, so the product rounds before the add (corrected
+            // 2026-09-13; see vmx.rs).
+            let mix = dry * gb + wet * gc;
             return (mix + a, wet + dry);
         }
         let (a, b, c, d) = (a as f64, b as f64, c as f64, d as f64);

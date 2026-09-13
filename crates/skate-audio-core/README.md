@@ -14,18 +14,20 @@ than at a misunderstanding of the engine.
 | `buffers.rs` | buffer-pair init | **214 replayed** |
 | `fp.rs` | the guest's scalar FP idioms: `lfs`/`lfd`/`stfs`, `fcfid`/`frsp`, the single-rounded forms, `fsqrts`, `fmsubs`, `fabs`/`fneg`, `fsel`, `fctiwz`, `fctidz`, `rlwinm` | unit-tested only |
 | `spatial.rs` | `sub_82B453D8`, `sub_82B269C0`, `sub_82B454B8`, `sub_82B45788`, `sub_82B45B60`: a source's position becoming a gain per speaker — the unit-disc clamp, the panner placement, distance panning, the seven-sector angular pass, and the power-normalised scale | **2,369 replayed**, all five (474 + 473 + 473 + 482 + 467) |
-| `gains.rs` | `sub_82B29AF0` and `sub_82B23B50`: the channel gain matrix and the per-channel gain ramp, both driving `dsp/` kernels over a `+4`/`+14` channel descriptor | **980 replayed** (795 + 185) |
-| `mathlib.rs` | `sub_82F4DE80` (`floor`, 2.87 M calls a boot — the hottest body ported anywhere in this project), and `Image`, the image's own sine (`sub_82F4DED0`) and cosine (`sub_82F4DFB0`), ported beyond the 216 because four callers here needed them | **4,000 replayed** (2,000 floor + 999 sine + 1,001 cosine), all compared by the bits of the returned `f1` |
+| `gains.rs` | `sub_82B29AF0`, `sub_82B23B50` and `sub_82B298E0`: the channel gain matrix, the per-channel gain ramp, and the matrix applied through a ramp, all driving `dsp/` kernels over a `+4`/`+14` channel descriptor | **1,384 replayed** (795 + 185 + 404) |
+| `mathlib.rs` | `sub_82F4DE80` (`floor`, 2.87 M calls a boot — the hottest body ported anywhere in this project), `Image`'s sine (`sub_82F4DED0`) and cosine (`sub_82F4DFB0`), `log10` (`sub_82F55068`) with the natural log `sub_82F54ED8` under it, and `atan2` (`sub_82F52318`) — the last four ported beyond the 216 because callers here needed them | **10,015 replayed** (2,000 floor + 999 sine + 1,001 cosine + 3,000 log10 + 3,015 atan2), all compared by the bits of the returned `f1` |
 | `counter.rs` | `sub_82B1F360`, the six-word cascading counter the evaluator draws from | verified C++ reference; unit-tested only |
 | `eval/` | the expression evaluator's 40-slot opcode table at guest `0x82FD3600` — **31 slots**, every one that has a verified C++ body | verified C++ reference; unit-tested only |
 | `scheduler.rs` | `sub_82B489D0` and `sub_82B39690`: an instance detaching itself from the scheduler, and the bucket list mechanic that removal runs on | **4 replayed** — two calls each, read the count before quoting it |
 | `cursors.rs` | `sub_82B32550`, `sub_82B349A8`, `sub_82B3C9D8`: the three verified cursor advances — which ring slot, which entry, which segment comes next | **3,210 replayed** (2,462 + 714 + 34) |
+| `leaves.rs` | `sub_82B463A8`, `sub_82B34268`, `sub_82B2C8E8`, `sub_82B23C10`: four small verified leaves that belong to no larger mechanism ported yet — the hottest command-ring handler, a `u16` field setter, a 64-bit identity, and a stream's unconsumed byte count | **6,661 replayed** (3,232 + 230 + 230 + 2,969) |
 | `vmx.rs` | the VMX128 layer: RexGlue's lowerings, the flush-mode control, and the guest-memory vector accesses | **45 ops replayed** against `probe/vmx128`'s recorded C++; the rest unit-tested only |
-| `dsp/sine.rs` | `sub_824531C8`, four-lane sine by range reduction and an 11-term odd polynomial | verified C++ reference; unit-tested only |
+| `dsp/sine.rs` | `sub_824531C8`, four-lane sine by range reduction and an 11-term odd polynomial | **2,000 replayed**, the result compared by the bits of `v1` — and the only recorded data in this project that tells a fused multiply-add from two roundings (`docs/vmx128-exactness.md` rule 1) |
 | `dsp/scale.rs` | `sub_82B3BED8` and `sub_82B44B20`: `dst[i] = src[i]*k` and `dst[i] += src[i]*k`, each on a vector and a scalar path | **734 replayed** (548 + 186) |
-| `dsp/gain_ramp.rs` | `sub_82B3C098`, a gain-ramped copy of a fixed 256-single block | **166 replayed** |
+| `dsp/gain_ramp.rs` | `sub_82B3C098` and `sub_82B44D18`: a gain-ramped copy of a fixed 256-single block, and the same ramp accumulated onto the destination instead of written over it | **197 replayed** (166 + 31) |
 | `dsp/scale_add.rs` | `sub_82B3CF58`, `z[i] = x[i]·gain + y[i]` alongside a parallel copy `w[i] = x[i]` | **642 replayed** |
 | `dsp/biquad.rs` | `sub_82B43AF8`, a biquad over a run of singles, eight a pass | **1,000 replayed** |
+| `dsp/clip.rs` | `sub_82B22678`, the hard clipper: clamp 256 samples a channel into `[-level, level]`, then swap the buffer pair — scalar throughout, and it declines to run at all unless the level is below the pool's 100.0 | **1,485 replayed** |
 | `dsp/resample.rs` | `sub_82B43FB8`, linear interpolation walked by a 16.16 phase | **530 replayed** |
 | `ring.rs` | `sub_82B3DB90`, `sub_82B3DC48`, `sub_82B3DF90`, `sub_82B3DEA8`: copy out of the wrapping decode ring, rank and fill the segments, pad the tail with a rodata constant, and write a block back in | **3,943 replayed** (1,200 + 1,052 + 1,046 + 645) |
 | `mix.rs` | `sub_82B34E08`, `sub_82B3C668`, `sub_82B443F8`: flush the mix accumulator, fold the pending deltas into the rows, advance a fill position and clear ahead of it | **2,351 replayed** (1,086 + 1,000 + 265) |
@@ -34,7 +36,7 @@ than at a misunderstanding of the engine.
 | `filters.rs` | `sub_82B27E20` and `sub_82B26568`: the per-channel low-pass and high-pass stages | **1,152 replayed** (576 + 576), given the ported sine and cosine |
 | `mem.rs` | the write-set contract of `sub_82EDF460` (memcpy) and `sub_82EE5E80` (memset), which six of the bodies above call | not a port; see its module note |
 
-`cargo test` runs 351 unit tests. **Read the next two sections before reading that as one number:
+`cargo test` runs 367 unit tests. **Read the next two sections before reading that as one number:
 the modules are checked in different ways, and only the ones whose table row gives a replay figure
 have one.**
 
@@ -108,13 +110,7 @@ probe/vmx128/run.sh                              # regenerate the vectors and th
 cargo run --release --example check_vmx_primitives
 ```
 
-**Measured 2026-09-12: 45 of 45 operations bit-identical against both `clang20_pinned` and
-`gcc_pinned`, 56,880 lane comparisons each, in both flush-to-zero states.** That reproduces
-`docs/vmx128-exactness.md`'s result with this crate's code in place of the probe's standalone
-translation. Against the two `_plain` builds it is 86 of 90 `(op, ftz)` pairs, diverging on exactly
-the four the cookbook names — clang-20 on `vmaddfp`/`vnmsubfp`, GCC on `vaddfp128`/`vmulfp128`, two
-lanes of 632 each — which is rule 4 and not a fault: the winning NaN operand slot is a
-register-allocation decision and cannot be derived from source in either language. It is an
+**Measured 2026-09-13, after correcting rule 1: 45 of 45 operations bit-identical against `clang20_pinned`, `gcc_pinned` and `clang20_plain`, 56,880 lane comparisons each, in both flush-to-zero states** — with every reference now built with the recomp's own code-generation flags. Against `gcc_plain` it is 86 of 90 `(op, ftz)` pairs, diverging on `vmaddfp`/`vnmsubfp` in two NaN lanes of 632, which is rule 4 and not a fault: the winning NaN operand slot is a register-allocation decision and cannot be derived from source in either language. The earlier 2026-09-12 run reported 45 of 45 against references built with `-march=native`. That agreement was real, and it certified the wrong arithmetic — see rule 1. It is an
 `example` rather than a test because the recorded files are gitignored build products; a `cargo
 test` that skipped when they were missing would be the vacuous green this project keeps warning
 about. What this covers is the arithmetic the kernels are built from, and **not** whether they are
@@ -196,6 +192,8 @@ then cancels what is left, while the FMA keeps them and returns exactly those di
 written the other way round would have passed against an unfused translation. The same error was in
 `dsp::scale`'s fusion test and was corrected with it.
 
+**And the corrected assertions were still testing the wrong arithmetic — found 2026-09-13.** The recomp has no `-mfma`, so its `vmaddfp` rounds twice and the *unfused* answer, zero, is what it computes. Those two tests and `dsp::scale`'s now assert that. The evidence is in real data: 4 of 2,000 recorded `sub_824531C8` calls would not replay under the fused reading. `docs/vmx128-exactness.md` rule 1 records how the probe came to certify the wrong form.
+
 Four still pass, and each is an equivalent transformation rather than a weak test:
 
 - the unrolled trip count in `op_round_product` and the two summers — reducing it leaves the
@@ -212,8 +210,8 @@ Four still pass, and each is an equivalent transformation rather than a weak tes
   is exact — so at groups 1, 2, 4 and at the block step the fused and unfused forms are the *same
   function*, not two answers that agree. Measured: the break at group 1 leaves all 155 tests
   passing, and the identical break at group 3 or group 5 fails
-  `it_matches_the_independent_model_bit_for_bit`. All seventeen are written fused because the
-  original writes them fused.
+  `it_matches_the_independent_model_bit_for_bit`. All seventeen go through `vmx::vmaddfp`, which
+  rounds twice as the recomp does — that measurement was taken while the layer was fused.
 
 Those four are reproduced as the original has them anyway, and said so in their doc comments, but
 no test in this crate would catch their absence.
