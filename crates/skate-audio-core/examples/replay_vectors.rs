@@ -18,6 +18,7 @@
 use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
     Guest, buffers, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix, player, ring,
+    routing,
     scheduler, spatial, stage, system,
 };
 
@@ -619,6 +620,20 @@ fn main() {
                     Err(e) => Err(e.to_string()),
                 }
             }
+            // The scatter-mixer takes six arguments, the sixth being the route table in r8, so a
+            // recording without the wide columns cannot be replayed: a zero table would make every
+            // route byte a read of guest address zero.
+            "sub_82B426D0" if wide_missing => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r8, the route table", v.run));
+                }
+                continue;
+            }
+            "sub_82B426D0" => routing::scatter_mix(
+                &mut g, v.r3, v.r4, v.r5, v.r6, v.r7, v.w[5] as u32)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
             _ => {
                 t.skipped += 1;
                 continue;

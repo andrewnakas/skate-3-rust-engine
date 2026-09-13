@@ -85,6 +85,12 @@ pub mod stage;
 #[cfg(target_arch = "x86_64")]
 pub mod crossfade;
 
+/// The scatter-mixer, which composes [`dsp::scale`]'s two kernels and [`mem::memset`].
+///
+/// Gated with them, because it calls them.
+#[cfg(target_arch = "x86_64")]
+pub mod routing;
+
 /// One contiguous span of guest memory.
 #[derive(Clone, Debug)]
 pub struct Segment {
