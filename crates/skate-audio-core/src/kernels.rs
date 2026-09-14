@@ -14,15 +14,20 @@
 //! | `Rechannel` | `sub_82B2C8E8` → [`leaves::fourth_argument`]`(request)` | `sub_82B2C8F0` → [`mix::refold_rows`]`(object, owner, sp)` |
 //! | `Resample` | `sub_82B2DAC8` → [`pitch::advance_pitch`]`(object, owner, request)` | `sub_82B2DBA8` → [`pitch::resample_block`]`(object, owner, sp)` |
 //! | `SndPlayer1` | `sub_82B34268` → [`leaves::set_field_460`]`(object, request)` | `sub_82B34278` → [`sndplayer::render_block`]`(object, owner)` |
+//! | `Send` | — | `sub_82B31838` → [`bus::mix_source`]`(object, owner, flag, sp)` |
+//! | `GainFader` | — | `sub_82B238A8` → [`gains::advance_gain_ramp`]`(object, owner)` |
 //!
-//! All but the last process function are verified ports. The routing itself is unverified: which
+//! The three voice graph shapes the `msgs1` trace logged use exactly these nine classes
+//! (`docs/audio-banks.md`).
+//!
+//! All but `SndPlayer1`'s process function are verified ports. The routing itself is unverified: which
 //! register each port takes is read from its `.inc` body, not observed. An address outside the table
 //! is an error naming it.
 
 use crate::graph::GraphHost;
 use crate::mathlib::Trig;
 use crate::stream::StreamFill;
-use crate::{Error, Guest, Result, filters, gains, leaves, mix, pitch, sndplayer};
+use crate::{Error, Guest, Result, bus, filters, gains, leaves, mix, pitch, sndplayer};
 
 /// The voice kernels, with what they need from the host: the trigonometry the filters and the panner
 /// call, the stream fill `SndPlayer1` pulls PCM through, and a stack pointer for the ports that build
@@ -52,6 +57,8 @@ impl<T: Trig> GraphHost for VoiceKernels<'_, T> {
             0x82B2_C8F0 => mix::refold_rows(g, object, owner, self.sp),
             0x82B2_DBA8 => pitch::resample_block(g, object, owner, self.sp),
             0x82B3_4278 => sndplayer::render_block(g, self.fill, object, owner),
+            0x82B3_1838 => bus::mix_source(g, object, owner, flag, self.sp),
+            0x82B2_38A8 => gains::advance_gain_ramp(g, self.trig, object, owner),
             other => Err(Error::new(other, format!("process function {other:#010x} is not a voice kernel"))),
         }
     }

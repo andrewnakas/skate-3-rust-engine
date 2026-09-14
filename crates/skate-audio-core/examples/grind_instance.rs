@@ -156,7 +156,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Class_grind's payload as sub_824AF8C8 builds it: fixed header words, then a speed of 5000,
     // 1024, surface class 3, variant 0, level 20000, three flags off, and two zero words.
-    let payload: [u32; 17] = [0, 32767, 0, 0, 0, 25000, 0, 5000, 1024, 3, 0, 20000, 0, 0, 0, 0, 0];
+    let mut payload: Vec<u32> = vec![0, 32767, 0, 0, 0, 25000, 0, 5000, 1024, 3, 0, 20000, 0, 0, 0, 0, 0];
+    // PAYLOAD="hex words ..." replaces it, e.g. a payload copied from a skate3-audio-msg trace line.
+    if let Ok(words) = std::env::var("PAYLOAD") {
+        payload = words.split_whitespace().map(|w| u32::from_str_radix(w, 16)).collect::<std::result::Result<_, _>>()?;
+    }
     for (i, w) in payload.iter().enumerate() {
         g.set_u32(message + 4 + 4 * i as u32, *w)?;
     }
