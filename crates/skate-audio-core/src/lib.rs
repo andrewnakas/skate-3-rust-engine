@@ -347,3 +347,6 @@ pub mod stream;
 
 /// SndPlayer1's block render and fade. Unverified; see the module note.
 pub mod sndplayer;
+
+/// A voice graph's per-block pass and node mixer fill. Unverified; see the module note.
+pub mod graph;
