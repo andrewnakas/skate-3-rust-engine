@@ -212,13 +212,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let delta = (256.0f32 / 48_000.0) as f64;
     let mut ops = 0usize;
     let mut device = LoggingDevice { voices: 0, frame: 0, lines: Vec::new(), last: Default::default() };
-    let frames = 375; // two seconds of audio frames
+    let frames: usize = std::env::var("FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(375);
     // UPDATES re-delivers the payload every frame the way the grind updater sub_824C39E0 does:
     // word 0 becomes 32767, and volume, two cutoffs and speed are refreshed (values chosen here).
     let updates = std::env::var_os("UPDATES").is_some();
+    // UPDATE_FILE: one traced update payload per line (hex words, as `skate3-audio-update` logs them),
+    // re-delivered from frame 1 over the words the post supplied, one every UPDATE_EVERY audio frames
+    // (default 1). The game re-delivers from its own thread about every 25 ms, near 6 audio frames.
+    let traced: Vec<Vec<u32>> = match std::env::var("UPDATE_FILE") {
+        Ok(path) => std::fs::read_to_string(path)?
+            .lines()
+            .map(|l| l.split_whitespace().filter_map(|w| u32::from_str_radix(w, 16).ok()).collect())
+            .filter(|v: &Vec<u32>| !v.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let every: usize = std::env::var("UPDATE_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
     let node = g.u32(message)?;
     for frame in 0..frames {
         device.frame = frame;
+        if frame >= 1 && (frame - 1) % every == 0 && (frame - 1) / every < traced.len() {
+            for (i, w) in traced[(frame - 1) / every].iter().enumerate() {
+                g.set_u32(message + 4 + 4 * i as u32, *w)?;
+            }
+            patch::redeliver(&mut g, node, message + 4)?;
+        }
         if updates && frame >= 20 {
             for (field, value) in [(4u32, 32767u32), (8, 20000), (12, 0), (16, 0), (20, 0), (24, 25000), (28, 25000), (32, 5000)] {
                 g.set_u32(message + field, value)?;
