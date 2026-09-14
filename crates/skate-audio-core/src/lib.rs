@@ -353,3 +353,7 @@ pub mod graph;
 
 /// The voice classes' kernels by address, a GraphHost for a voice graph. Routing unverified.
 pub mod kernels;
+
+/// Voice graph construction: the module classes' sizes and constructors, the builder and its install
+/// command. Unverified; see the module note.
+pub mod modules;
