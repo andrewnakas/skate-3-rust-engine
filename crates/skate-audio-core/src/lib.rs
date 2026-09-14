@@ -361,3 +361,7 @@ pub mod modules;
 /// The voice module classes: registration, cooked parameter defaults, and a parameter's default block.
 /// Unverified; see the module note.
 pub mod classes;
+
+/// The voice device's open: a voice object over a built module graph, its sends and angles. Unverified;
+/// see the module note.
+pub mod device;
