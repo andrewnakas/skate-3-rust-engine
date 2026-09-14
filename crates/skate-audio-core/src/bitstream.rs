@@ -747,6 +747,241 @@ pub fn seek_packet(g: &mut Guest, cursor: u32, substream: u32, desc: u32, chunk:
     Ok(chunk_bytes) // mr r3,r25
 }
 
+// ======================================================= sub_82B472C0: seeking fixed records
+
+/// One record: `{offset, base, length, mode}`, big-endian words read byte by byte.
+pub const FIXED_RECORD_BYTES: u32 = 16;
+
+fn record_word(g: &Guest, at: u32) -> Result<u64> {
+    let mut word = 0u32;
+    for i in 0..4 {
+        word = (word << 8) | u32::from(g.u8(at.wrapping_add(i))?);
+    }
+    Ok(u64::from(word))
+}
+
+fn fixed_record(g: &Guest, at: u32) -> Result<[u64; 4]> {
+    Ok([
+        record_word(g, at)?,
+        record_word(g, at.wrapping_add(4))?,
+        record_word(g, at.wrapping_add(8))?,
+        record_word(g, at.wrapping_add(12))?,
+    ])
+}
+
+/// Walk a table of fixed 16-byte seek records until the one containing a target is found, and
+/// publish it (`sub_82B472C0`) — [`seek_record`]'s twin over a table instead of four run-length
+/// streams. Returns 1 when a negative length ends the walk, 0 when it passes the target.
+///
+/// `object` is `r3`, `records` `r4`, `target` `r5`. The publish set, the containment test and the
+/// mode-1 rule are [`seek_record`]'s; the one difference in the arithmetic is that the minimum
+/// length at `+28` is read **once**, where [`seek_record`] reloads it. Each record's words are read
+/// after the previous record's publish, byte by byte, so an unaligned table reads the same.
+pub fn seek_fixed_records(g: &mut Guest, object: u32, records: u32, target: u64) -> Result<u64> {
+    let min_length = u64::from(g.u32(object.wrapping_add(SEEK_MIN_LENGTH))?); // lwz r30,28(r9)
+    let span = target.wrapping_sub(min_length);
+    let carry = u64::from(span as u32 == 0);
+    let sign = u64::from((span as u32) >> 31);
+    let limit = (sign + carry).wrapping_sub(1) & span;
+    let base_entry = u64::from(g.u32(object.wrapping_add(SEEK_PUBLISH_BASE))?); // lwz r27,4(r9)
+    let mut record = fixed_record(g, records)?;
+    let mut result = 1;
+    if record[2] as u32 as i32 >= 0 {
+        let (mut position, mut sum_a, mut sum_b) = (0u64, 0u64, 0u64);
+        let mut cursor = records;
+        loop {
+            let [offset, base_word, length, mode] = record;
+            let in_range = (position as u32 as i32) <= (limit as u32 as i32)
+                && (limit as u32 as i32) < (length.wrapping_add(position) as u32 as i32);
+            if in_range || mode as u32 as i32 == 1 {
+                let published = if base_word as u32 as i32 == 0 { 0 } else { sum_b.wrapping_add(base_entry) };
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_BASE), published as u32)?;
+                let remaining = target.wrapping_sub(position);
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_POSITION), position as u32)?;
+                let published_length =
+                    if (remaining as u32 as i32) < (min_length as u32 as i32) { remaining } else { min_length };
+                let leading = (mode.wrapping_sub(1) as u32).leading_zeros();
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_LENGTH), published_length as u32)?;
+                let tail = target.wrapping_sub(published_length);
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_OFFSET), sum_a as u32)?;
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_SKIP), tail.wrapping_sub(position) as u32)?;
+                g.set_u8(object.wrapping_add(SEEK_PUBLISH_EXACT), ((leading >> 5) & 1) as u8)?;
+            }
+            position = length.wrapping_add(position); // add r10,r31,r10
+            if (target as u32 as i32) < (position as u32 as i32) {
+                result = 0;
+                break;
+            }
+            sum_b = base_word.wrapping_add(sum_b); // add r6,r29,r6
+            sum_a = offset.wrapping_add(sum_a); // add r7,r8,r7
+            cursor = cursor.wrapping_add(FIXED_RECORD_BYTES);
+            record = fixed_record(g, cursor)?;
+            if (record[2] as u32 as i32) < 0 {
+                break;
+            }
+        }
+    }
+    Ok(result)
+}
+
+// ====================================================== sub_82B471D8: the seek-header dispatch
+
+/// `stwu r1,-128(r1)`. Real: [`seek_record`]'s frame sits below it.
+pub const SEEK_HEADER_FRAME: u32 = 128;
+/// `stw r7,0(r3)` — the header's address plus 12.
+pub const SEEK_HEADER_END: u32 = 0;
+/// `stw r7,24(r3)` — the low nibble of byte 1.
+pub const SEEK_HEADER_KIND: u32 = 24;
+/// The deepest stack the dispatch reaches.
+pub const SEEK_HEADER_STACK_DEPTH: u32 = SEEK_HEADER_FRAME + SEEK_FRAME;
+
+fn header_word(g: &Guest, at: u32) -> Result<u32> {
+    Ok(record_word(g, at)? as u32)
+}
+
+/// Parse a seek header and hand the walk on (`sub_82B471D8`). Returns the walker's result, or 0.
+///
+/// `object` is `r3`, `header` `r4` at full width (the pointer sums are 64-bit), `target` `r5`, `sp`
+/// `r1`. Byte 1's low nibble goes to `+24` **before** bytes 2 to 11 are read; bytes 2..3 are the
+/// minimum length at `+28`, bytes 4..7 the records' offset and bytes 8..11 the data's (zero stays
+/// zero) at `+4`, and `+0` gets the header's end. Byte 1's high nibble then picks
+/// [`seek_fixed_records`] (0) or [`seek_record`] (1); anything else returns 0.
+pub fn parse_seek_header(g: &mut Guest, object: u32, header: u64, target: u64, sp: u32) -> Result<u64> {
+    let at = header as u32;
+    let frame = sp.wrapping_sub(SEEK_HEADER_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-128(r1)
+    let byte1 = u32::from(g.u8(at.wrapping_add(1))?); // lbz r8,1(r4)
+    g.set_u32(object.wrapping_add(SEEK_HEADER_KIND), byte1 & 0xF)?; // stw r7,24(r3)
+    let min_length = (u32::from(g.u8(at.wrapping_add(2))?) << 8) | u32::from(g.u8(at.wrapping_add(3))?);
+    let stream_offset = header_word(g, at.wrapping_add(4))?; // lwz r11,88(r1)
+    let data_offset = header_word(g, at.wrapping_add(8))?; // lwz r9,96(r1)
+    let stream = u64::from(stream_offset).wrapping_add(header); // add r4,r11,r10
+    g.set_u32(object.wrapping_add(SEEK_MIN_LENGTH), min_length)?; // stw r6,28(r3)
+    let data = if data_offset == 0 { 0 } else { u64::from(data_offset).wrapping_add(header) };
+    g.set_u32(object.wrapping_add(SEEK_PUBLISH_BASE), data as u32)?; // stw r11,4(r3)
+    g.set_u32(object.wrapping_add(SEEK_HEADER_END), header.wrapping_add(12) as u32)?; // stw r7,0(r3)
+    match byte1 >> 4 {
+        0 => seek_fixed_records(g, object, stream as u32, target), // bl 0x82b472c0
+        1 => seek_record(g, object, stream, target, frame),        // bl 0x82b474b8
+        _ => Ok(0),                                                 // li r3,0
+    }
+}
+
+// =================================================== sub_82B470D0: the stream-header dispatch
+
+/// `stwu r1,-128(r1)`.
+pub const STREAM_HEADER_FRAME: u32 = 128;
+/// The deepest stack the dispatch reaches.
+pub const STREAM_HEADER_STACK_DEPTH: u32 = STREAM_HEADER_FRAME + SEEK_HEADER_STACK_DEPTH;
+
+/// Parse a stream header by its version byte (`sub_82B470D0`). Returns the status; any non-zero
+/// **low byte** wipes six of the object's words.
+///
+/// `object` is `r3`, `stream` `r4`, `target` `r5` (it flows through untouched to whichever walker
+/// runs), `sp` `r1`. The version byte is sign-extended and compared unsigned, so only 0 and 1 have
+/// paths of their own: 1 is [`parse_seek_header`], and 0 is its inline twin — `+0` and `+24` written
+/// **before** bytes 2..7 are read, the payload at `stream + 8`, the high nibble picking the walker.
+/// The wipe clears `+0, +4, +8, +12, +20, +24` and leaves `+16`, `+28` and `+32`.
+pub fn parse_stream_header(g: &mut Guest, object: u32, stream: u32, target: u64, sp: u32) -> Result<u64> {
+    let frame = sp.wrapping_sub(STREAM_HEADER_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-128(r1)
+    let version = g.u8(stream)? as i8 as i32 as u32; // lbz ; extsb ; cmplwi
+    let status = if version > 1 {
+        1 // li r3,1
+    } else if version == 1 {
+        parse_seek_header(g, object, u64::from(stream), target, frame)? // bl 0x82b471d8
+    } else {
+        let nibbles = u32::from(g.u8(stream.wrapping_add(1))?); // lbz r9,1(r10)
+        g.set_u32(object, 0)?; // stw r30,0(r31)
+        g.set_u32(object.wrapping_add(SEEK_HEADER_KIND), nibbles & 0xF)?; // stw r8,24(r31)
+        let field28 =
+            (u32::from(g.u8(stream.wrapping_add(2))?) << 8) | u32::from(g.u8(stream.wrapping_add(3))?);
+        let offset = header_word(g, stream.wrapping_add(4))?;
+        g.set_u32(object.wrapping_add(SEEK_MIN_LENGTH), field28)?; // stw r29,28(r31)
+        let data = if offset != 0 { u64::from(offset).wrapping_add(u64::from(stream)) } else { 0 };
+        g.set_u32(object.wrapping_add(SEEK_PUBLISH_BASE), data as u32)?; // stw r11,4(r31)
+        let payload = stream.wrapping_add(8);
+        match nibbles >> 4 {
+            0 => seek_fixed_records(g, object, payload, target)?, // bl 0x82b472c0
+            1 => seek_record(g, object, u64::from(payload), target, frame)?, // bl 0x82b474b8
+            _ => 0, // mr r3,r30 -- not a failure
+        }
+    };
+    if status & 0xFF != 0 {
+        for offset in [0, 4, 8, 12, 20, 24] {
+            g.set_u32(object.wrapping_add(offset), 0)?; // the failure wipe
+        }
+    }
+    Ok(status)
+}
+
+// ===================================================== sub_82B33780: one packet header decoded
+
+/// `stwu r1,-144(r1)`. Real: the 33-byte output buffer at `r1 + 80` is handed to
+/// [`parse_stream_header`].
+pub const PACKET_HEADER_FRAME: u32 = 144;
+const PACKET_HEADER_OUT: u32 = 80;
+/// The deepest stack the decode reaches.
+pub const PACKET_HEADER_STACK_DEPTH: u32 = PACKET_HEADER_FRAME + STREAM_HEADER_STACK_DEPTH;
+
+/// Decode one packet header for stream `index` and scatter its fields into the object's 48-byte
+/// slot and the array's 80-byte entry (`sub_82B33780`).
+///
+/// `object` is `r3`, `index` `r4`, `bytes` `r5`, `length` `r6` — the length is also the target the
+/// walkers seek, since it reaches them as `r5`. The two record addresses are computed once at entry,
+/// with 64-bit adds truncated only at the stores. A positive length and a non-null pointer decode
+/// into the frame and copy seven fields out, the slot's `+36` **re-read** before it is copied to the
+/// entry's `+20`; otherwise both records are cleared and the entry is marked 1.
+pub fn decode_packet_header(
+    g: &mut Guest,
+    object: u64,
+    index: u64,
+    bytes: u64,
+    length: u64,
+    sp: u32,
+) -> Result<()> {
+    let obj = object as u32;
+    let slot_base = u64::from(g.u16(obj.wrapping_add(HEADER_SLOT_TABLE))?); // lhz r9,464(r3)
+    let array = u64::from(g.u32(obj.wrapping_add(HEADER_VOICE_ARRAY))?); // lwz r10,96(r3)
+    let triple = index.wrapping_add(u64::from((index as u32).wrapping_mul(2))); // rlwinm ; add
+    let quint = index.wrapping_add(u64::from((index as u32).wrapping_mul(4)));
+    let slot = u64::from((triple as u32).wrapping_mul(16)).wrapping_add(slot_base).wrapping_add(object) as u32;
+    let entry = u64::from((quint as u32).wrapping_mul(16)).wrapping_add(array) as u32;
+    let frame = sp.wrapping_sub(PACKET_HEADER_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-144(r1)
+    let out = frame.wrapping_add(PACKET_HEADER_OUT);
+    let at = |base: u32, offset: u32| base.wrapping_add(offset);
+    if (length as u32 as i32) > 0 && bytes as u32 != 0 {
+        parse_stream_header(g, out, bytes as u32, length, frame)?; // bl 0x82b470d0
+        let at88 = g.u32(at(out, 8))?; // lwz r10,88(r1)
+        let at92 = g.u32(at(out, 12))?; // lwz r9,92(r1)
+        let at96 = g.u32(at(out, 16))?; // lwz r8,96(r1)
+        let at100 = g.u32(at(out, 20))?; // lwz r7,100(r1)
+        let at84 = g.u32(at(out, 4))?; // lwz r6,84(r1)
+        let at104 = g.u32(at(out, 24))?; // lwz r5,104(r1)
+        let at112 = g.u8(at(out, 32))?;
+        g.set_u32(at(slot, 36), at88)?; // stw r10,36(r30)
+        g.set_u32(at(slot, 32), at92)?; // stw r9,32(r30)
+        g.set_u32(at(entry, 60), at96)?; // stw r8,60(r31)
+        g.set_u32(at(entry, 64), at100)?; // stw r7,64(r31)
+        g.set_u32(at(entry, 56), at84)?; // stw r6,56(r31)
+        g.set_u32(at(entry, 68), at104)?; // stw r5,68(r31)
+        g.set_u8(at(entry, 77), at112)?; // stb r4,77(r31)
+        let published = g.u32(at(slot, 36))?; // lwz r3,36(r30) -- re-read
+        g.set_u32(at(slot, 28), 0)?; // stw r11,28(r30)
+        g.set_u32(at(entry, 20), published)?; // stw r3,20(r31)
+    } else {
+        g.set_u32(at(slot, 32), 0)?;
+        g.set_u32(at(entry, 60), 0)?;
+        g.set_u32(at(entry, 64), 0)?;
+        g.set_u32(at(entry, 56), 0)?;
+        g.set_u8(at(entry, 77), 1)?;
+        g.set_u32(at(slot, 28), 0)?;
+        g.set_u32(at(slot, 36), 0)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1162,7 +1397,7 @@ mod seek_tests {
     impl Bits {
         fn push(&mut self, value: u64, width: u32) {
             for i in (0..width).rev() {
-                if self.1 % 8 == 0 {
+                if self.1.is_multiple_of(8) {
                     self.0.push(0);
                 }
                 let bit = ((value >> i) & 1) as u8;
@@ -1347,11 +1582,151 @@ mod seek_tests {
         let mut g = packet_guest(5 * 512, 0);
         g.set_u32(DESC + PACKET_DESC_TABLE, TABLE).unwrap();
         g.set_u32(TABLE + 4, 0x40).unwrap();
-        fill(&mut g, TABLE + 0x40, &vec![2, 3, 4]);
+        fill(&mut g, TABLE + 0x40, &[2, 3, 4]);
         g.set_u32(CHUNK + 4 + 4096, 0x0000_5000).unwrap(); // the third packet's header: position 10
         seek_packet(&mut g, CURSOR, 1, DESC, u64::from(CHUNK), SP).unwrap();
         assert_eq!(g.u32(CURSOR + PACKET_CURSOR_PACKET).unwrap(), CHUNK + 4 + 4096);
         assert_eq!(g.u32(CURSOR + PACKET_CURSOR_BITS).unwrap(), 10);
         assert_eq!(g.u32(CURSOR + PACKET_CURSOR_REMAINING).unwrap(), 0x3000 - 4096 - 4);
+    }
+}
+
+#[cfg(test)]
+mod header_seek_tests {
+    use super::*;
+
+    const BASE: u32 = 0x4000_0000;
+    const OBJECT: u32 = BASE + 0x100;
+    const RECORDS: u32 = BASE + 0x1000;
+    const HEADER: u32 = BASE + 0x2000;
+    const STREAM: u32 = BASE + 0x3000;
+    const SP: u32 = BASE + 0xF000;
+
+    fn guest() -> Guest {
+        Guest::single(BASE, 0x10000)
+    }
+
+    fn fill(g: &mut Guest, at: u32, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            g.set_u8(at + i as u32, *b).unwrap();
+        }
+    }
+
+    /// Records of `{offset, base, length, mode}`.
+    fn records(g: &mut Guest, at: u32, list: &[[i32; 4]]) {
+        let bytes: Vec<u8> = list.iter().flat_map(|r| r.iter().flat_map(|w| w.to_be_bytes())).collect();
+        fill(g, at, &bytes);
+    }
+
+    const FOUR: [[i32; 4]; 4] = [[3, 2, 10, 0], [3, 2, 10, 0], [3, 2, 10, 0], [3, 2, 10, 0]];
+
+    #[test]
+    fn the_record_containing_the_target_less_its_minimum_is_published() {
+        let mut g = guest();
+        records(&mut g, RECORDS, &FOUR);
+        g.set_u32(OBJECT + SEEK_MIN_LENGTH, 5).unwrap();
+        g.set_u32(OBJECT + SEEK_PUBLISH_BASE, 100).unwrap();
+        assert_eq!(seek_fixed_records(&mut g, OBJECT, RECORDS, 25).unwrap(), 0);
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_POSITION).unwrap(), 20);
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_LENGTH).unwrap(), 5);
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_SKIP).unwrap(), 0);
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_OFFSET).unwrap(), 6, "two records' offsets");
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_BASE).unwrap(), 104);
+    }
+
+    #[test]
+    fn a_negative_first_length_returns_one_untouched() {
+        let mut g = guest();
+        records(&mut g, RECORDS, &[[3, 2, -1, 0]]);
+        g.set_u32(OBJECT + SEEK_PUBLISH_POSITION, 0x7777).unwrap();
+        assert_eq!(seek_fixed_records(&mut g, OBJECT, RECORDS, 25).unwrap(), 1);
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_POSITION).unwrap(), 0x7777);
+    }
+
+    #[test]
+    fn the_seek_header_dispatches_by_its_high_nibble() {
+        let mut g = guest();
+        // Mode 0, kind 3, minimum 5, records 0x100 on, data 0x40 on.
+        fill(&mut g, HEADER, &[0, 0x03, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0x40]);
+        records(&mut g, HEADER + 0x100, &FOUR);
+        assert_eq!(parse_seek_header(&mut g, OBJECT, u64::from(HEADER), 25, SP).unwrap(), 0);
+        assert_eq!(g.u32(OBJECT + SEEK_HEADER_KIND).unwrap(), 3);
+        assert_eq!(g.u32(OBJECT + SEEK_MIN_LENGTH).unwrap(), 5);
+        assert_eq!(g.u32(OBJECT + SEEK_HEADER_END).unwrap(), HEADER + 12);
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_POSITION).unwrap(), 20);
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_BASE).unwrap(), HEADER + 0x40 + 4, "the data pointer is the base");
+        let mut h = guest();
+        fill(&mut h, HEADER, &[0, 0x23, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0]);
+        h.set_u32(OBJECT + SEEK_PUBLISH_POSITION, 0x7777).unwrap();
+        assert_eq!(parse_seek_header(&mut h, OBJECT, u64::from(HEADER), 25, SP).unwrap(), 0);
+        assert_eq!(h.u32(OBJECT + SEEK_PUBLISH_BASE).unwrap(), 0, "a zero data offset stays zero");
+        assert_eq!(h.u32(OBJECT + SEEK_PUBLISH_POSITION).unwrap(), 0x7777, "mode 2 walks nothing");
+    }
+
+    #[test]
+    fn a_version_zero_header_walks_its_payload_inline() {
+        let mut g = guest();
+        fill(&mut g, STREAM, &[0, 0x07, 0, 5, 0, 0, 0, 0]);
+        records(&mut g, STREAM + 8, &FOUR);
+        assert_eq!(parse_stream_header(&mut g, OBJECT, STREAM, 25, SP).unwrap(), 0);
+        assert_eq!(g.u32(OBJECT + SEEK_HEADER_KIND).unwrap(), 7);
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_POSITION).unwrap(), 20);
+        assert_eq!(g.u32(OBJECT + SEEK_PUBLISH_BASE).unwrap(), 4, "a zero base entry plus two bases");
+    }
+
+    #[test]
+    fn an_unknown_version_fails_and_wipes_six_words() {
+        for version in [2u8, 0x80] {
+            let mut g = guest();
+            fill(&mut g, STREAM, &[version]);
+            for offset in [0u32, 4, 8, 12, 16, 20, 24, 28] {
+                g.set_u32(OBJECT + offset, 0x1000 + offset).unwrap();
+            }
+            assert_eq!(parse_stream_header(&mut g, OBJECT, STREAM, 25, SP).unwrap(), 1, "version {version:#x}");
+            for offset in [0u32, 4, 8, 12, 20, 24] {
+                assert_eq!(g.u32(OBJECT + offset).unwrap(), 0, "+{offset}");
+            }
+            assert_eq!(g.u32(OBJECT + 16).unwrap(), 0x1010, "+16 is left");
+            assert_eq!(g.u32(OBJECT + 28).unwrap(), 0x101C, "+28 is left");
+        }
+    }
+
+    const DECODER: u32 = BASE + 0x4000;
+    const ARRAY: u32 = BASE + 0x5000;
+    const SLOT: u32 = DECODER + 0x200 + 48;
+    const ENTRY: u32 = ARRAY + 80;
+
+    fn decoder() -> Guest {
+        let mut g = guest();
+        g.set_u32(DECODER + HEADER_VOICE_ARRAY, ARRAY).unwrap();
+        g.set_u16(DECODER + HEADER_SLOT_TABLE, 0x200).unwrap();
+        fill(&mut g, STREAM, &[0, 0x07, 0, 5, 0, 0, 0, 0]);
+        records(&mut g, STREAM + 8, &FOUR);
+        g
+    }
+
+    #[test]
+    fn a_decoded_header_scatters_seven_fields() {
+        let mut g = decoder();
+        decode_packet_header(&mut g, u64::from(DECODER), 1, u64::from(STREAM), 25, SP).unwrap();
+        assert_eq!(g.u32(SLOT + 36).unwrap(), 20, "the position");
+        assert_eq!(g.u32(SLOT + 32).unwrap(), 0, "the skip");
+        assert_eq!(g.u32(ENTRY + 60).unwrap(), 5, "the length");
+        assert_eq!(g.u32(ENTRY + 64).unwrap(), 6, "the offset");
+        assert_eq!(g.u32(ENTRY + 56).unwrap(), 4, "the base");
+        assert_eq!(g.u32(ENTRY + 68).unwrap(), 7, "the kind");
+        assert_eq!(g.u8(ENTRY + 77).unwrap(), 0);
+        assert_eq!(g.u32(ENTRY + 20).unwrap(), 20, "the slot's +36, re-read");
+    }
+
+    #[test]
+    fn a_zero_length_clears_both_records_and_marks_the_entry() {
+        let mut g = decoder();
+        g.set_u32(SLOT + 36, 0x55).unwrap();
+        g.set_u32(ENTRY + 60, 0x55).unwrap();
+        decode_packet_header(&mut g, u64::from(DECODER), 1, u64::from(STREAM), 0, SP).unwrap();
+        assert_eq!(g.u32(SLOT + 36).unwrap(), 0);
+        assert_eq!(g.u32(ENTRY + 60).unwrap(), 0);
+        assert_eq!(g.u8(ENTRY + 77).unwrap(), 1);
     }
 }

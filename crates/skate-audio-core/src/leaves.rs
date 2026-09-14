@@ -793,6 +793,260 @@ pub fn resample_bands(
     Ok(1) // li r3,1
 }
 
+// ------------------------------------------------------------ sub_82B2FF88: rearming the levels
+
+/// `lis -32239 ; lfs 25224` — the one-pair layout's rate, and the three-pair layout's middle one.
+pub const LEVEL_RATE_ONE: u32 = BAND_TABLE + 25224;
+/// `lis -32239 ; lfs 25004` — the candidate that goes with it.
+pub const LEVEL_CANDIDATE_ONE: u32 = BAND_TABLE + 25004;
+/// `lfs 1104` on the ramp pool — the first pair's rate.
+pub const LEVEL_RATE_FIRST: u32 = RAMP_POOL + 1104;
+/// `lfs 1108` — the last pair's candidate.
+pub const LEVEL_CANDIDATE_LAST: u32 = RAMP_POOL + 1108;
+/// `lfs 1112` — the last pair's rate.
+pub const LEVEL_RATE_LAST: u32 = RAMP_POOL + 1112;
+/// `lis -32244 ; lfs -22064` — the first pair's candidate.
+pub const LEVEL_CANDIDATE_FIRST: u32 = (((-32244i32 as u32) & 0xFFFF) << 16).wrapping_sub(22064);
+/// `lis -32246 ; lfs -26788` — 0.5, the rounding half.
+pub const LEVEL_HALF: u32 = (((-32246i32 as u32) & 0xFFFF) << 16).wrapping_sub(26788);
+const _: () = assert!(LEVEL_RATE_ONE == 0x8211_6288 && LEVEL_CANDIDATE_ONE == 0x8211_61AC);
+const _: () = assert!(LEVEL_RATE_FIRST == 0x822F_8A50 && LEVEL_CANDIDATE_FIRST == 0x820B_A9D0);
+const _: () = assert!(LEVEL_HALF == 0x8209_975C);
+/// `lfs f13,1100(r3)` — the source every count is scaled from.
+pub const LEVEL_SOURCE: u32 = 1100;
+/// `lbz r11,42(r3)` — the layout byte, [`crate::layout::LAYOUT`] on the same object.
+pub const LEVEL_LAYOUT: u32 = 42;
+
+/// `fcmpu` against the zero cell ; `blt` — below zero takes the half off, anything else (a NaN
+/// included) adds it; then `fctiwz` and the low word.
+fn round_away(value: f64, zero: f64, half: f64) -> u32 {
+    let adjusted = if value < zero {
+        crate::fp::sub_single(value, half)
+    } else {
+        crate::fp::add_single(value, half)
+    };
+    crate::fp::fctiwz_low_word(adjusted)
+}
+
+/// Rearm the level tables [`settle_levels`] reads (`sub_82B2FF88`). `object` is `r3`.
+///
+/// The layout byte picks one pair (layout 1), two (layouts 2 and 4) or three (anything else). Each
+/// pair is a candidate single copied from rodata to `+1060..` and a count at `+1072..` that is the
+/// object's `+1100` times a rodata rate, rounded half away from zero; the pair count goes to
+/// `+1089`. The three-pair layout's middle pair is the one-pair layout's.
+pub fn rearm_level_table(g: &mut Guest, object: u32) -> Result<()> {
+    use crate::fp::{load_single, mul_single, store_single};
+    let at = |offset: u32| object.wrapping_add(offset);
+    let layout = g.u8(at(LEVEL_LAYOUT))?; // lbz r11,42(r3)
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let source = load_single(g, at(LEVEL_SOURCE))?; // lfs f13,1100(r3)
+    if layout == 1 {
+        let scaled = mul_single(source, load_single(g, LEVEL_RATE_ONE)?); // fmuls f0,f13,f0
+        let zero = load_single(g, ZERO_CELL)?;
+        let candidate = load_single(g, LEVEL_CANDIDATE_ONE)?;
+        g.set_u8(at(LEVEL_CANDIDATE_COUNT), 1)?; // stb r8,1089(r3)
+        store_single(g, at(LEVEL_CANDIDATES), candidate)?; // stfs f13,1060(r3)
+        let half = load_single(g, LEVEL_HALF)?;
+        g.set_u32(at(LEVEL_COUNTS), round_away(scaled, zero, half))?; // stw r11,1072(r3)
+        return Ok(());
+    }
+    let zero = load_single(g, ZERO_CELL)?;
+    let scaled_first = mul_single(source, load_single(g, LEVEL_RATE_FIRST)?); // lfs 1104 ; fmuls
+    if layout == 2 || layout == 4 {
+        // loc_82B3010C: the first and the last pair.
+        g.set_u8(at(LEVEL_CANDIDATE_COUNT), 2)?; // stb r7,1089(r3)
+        let candidate_first = load_single(g, LEVEL_CANDIDATE_FIRST)?;
+        store_single(g, at(LEVEL_CANDIDATES), candidate_first)?; // stfs f11,1060(r3)
+        let half = load_single(g, LEVEL_HALF)?;
+        let first = round_away(scaled_first, zero, half);
+        let rate_last = load_single(g, LEVEL_RATE_LAST)?; // lfs f0,1112(r10)
+        g.set_u32(at(LEVEL_COUNTS), first)?; // stw r11,1072(r3)
+        let scaled_last = mul_single(source, rate_last);
+        let candidate_last = load_single(g, LEVEL_CANDIDATE_LAST)?;
+        store_single(g, at(LEVEL_CANDIDATES + 4), candidate_last)?; // stfs f13,1064(r3)
+        g.set_u32(at(LEVEL_COUNTS + 4), round_away(scaled_last, zero, half))?; // stw r11,1076(r3)
+        return Ok(());
+    }
+    // Three pairs: the first, the one-pair layout's, and the last.
+    g.set_u8(at(LEVEL_CANDIDATE_COUNT), 3)?; // stb r7,1089(r3)
+    let candidate_first = load_single(g, LEVEL_CANDIDATE_FIRST)?; // lfs f11,-22064(r8)
+    let half = load_single(g, LEVEL_HALF)?; // lfs f10,0(r11)
+    store_single(g, at(LEVEL_CANDIDATES), candidate_first)?;
+    g.set_u32(at(LEVEL_COUNTS), round_away(scaled_first, zero, half))?; // stw r11,1072(r3)
+    let scaled_middle = mul_single(source, load_single(g, LEVEL_RATE_ONE)?);
+    let candidate_one = load_single(g, LEVEL_CANDIDATE_ONE)?;
+    store_single(g, at(LEVEL_CANDIDATES + 4), candidate_one)?; // stfs f11,1064(r3)
+    let middle = round_away(scaled_middle, zero, half);
+    let rate_last = load_single(g, LEVEL_RATE_LAST)?; // lfs f0,1112(r10)
+    g.set_u32(at(LEVEL_COUNTS + 4), middle)?; // stw r11,1076(r3)
+    let scaled_last = mul_single(source, rate_last);
+    let candidate_last = load_single(g, LEVEL_CANDIDATE_LAST)?;
+    store_single(g, at(LEVEL_CANDIDATES + 8), candidate_last)?; // stfs f13,1068(r3)
+    g.set_u32(at(LEVEL_COUNTS + 8), round_away(scaled_last, zero, half))?; // stw r11,1080(r3)
+    Ok(())
+}
+
+// ------------------------------------------------------------ sub_82B2F590: recommitting the filter
+
+/// `lfs f0,52(r31)` — floored against [`RECOMMIT_FLOOR`] for the weights.
+pub const RECOMMIT_PARAM_52: u32 = 52;
+/// `stw r10,56(r31)` — poisoned with [`RECOMMIT_GUARD_WORD`] on the rate path.
+pub const RECOMMIT_GUARD: u32 = 56;
+/// `lfs f0,60(r3)` — the rate [`five_point_ramp`] clamps.
+pub const RECOMMIT_RATE: u32 = 60;
+/// `lfs f0,68(r31)` — [`resample_bands`]' current level.
+pub const RECOMMIT_LEVEL: u32 = 68;
+/// The four published copies: `+348` of `+1100`, `+352` of `+52`, `+356` of `+60`, `+360` of `+68`.
+pub const RECOMMIT_PUBLISHED_BLEND: u32 = 348;
+/// The published `+52`.
+pub const RECOMMIT_PUBLISHED_52: u32 = 352;
+/// The published rate.
+pub const RECOMMIT_PUBLISHED_RATE: u32 = 356;
+/// The published level.
+pub const RECOMMIT_PUBLISHED_LEVEL: u32 = 360;
+/// Six ramp singles, [`five_point_ramp`]'s output and [`table_ramp`]'s input.
+pub const RECOMMIT_RAMP: u32 = 364;
+/// Six table points, [`table_ramp`]'s output.
+pub const RECOMMIT_POINTS: u32 = 388;
+/// Six bands, [`resample_bands`]' output.
+pub const RECOMMIT_BANDS: u32 = 436;
+/// Six weights, `(1 - band) * (1 - floor / max(+52, floor))`.
+pub const RECOMMIT_WEIGHTS: u32 = 460;
+/// `lbz r10,1088(r31)` — zero selects [`rearm_level_table`] over the record loop.
+pub const RECOMMIT_READY: u32 = 1088;
+/// `lwz r11,1092(r3)` — 1 runs the function; it is left 2.
+pub const RECOMMIT_STATE: u32 = 1092;
+/// The per-voice records the loop rewrites, 60 bytes each from `+140`.
+pub const RECOMMIT_RECORDS: u32 = 140;
+/// `addi r9,r31,1068` — the word array, pre-incremented, so `+1072` is the first read.
+pub const RECOMMIT_WORDS: u32 = 1068;
+/// `stwu r1,-128(r1)`. Real: the rate is clamped in place at `r1 + 80`.
+pub const RECOMMIT_FRAME: u32 = 128;
+/// `lis r11,32759 ; ori r10,r11,65521`.
+pub const RECOMMIT_GUARD_WORD: u32 = 0x7FF7_FFF1;
+/// `lfs f13,1116(r10)` on the ramp pool — the floor.
+pub const RECOMMIT_FLOOR: u32 = RAMP_POOL + 1116;
+const _: () = assert!(RECOMMIT_FLOOR == 0x822F_8A5C);
+/// The deepest stack the call reaches: its frame and [`resample_bands`]' red zone below it.
+pub const RECOMMIT_STACK_DEPTH: u32 = RECOMMIT_FRAME + BAND_RED_ZONE;
+const RECOMMIT_SCRATCH: u32 = 80;
+
+/// Recommit a filter object whose state word says 1 (`sub_82B2F590`).
+///
+/// `object` is `r3`, `sp` is `r1`. Which of three parameters moved picks the work: a moved rate is
+/// clamped in the frame by [`five_point_ramp`] and rebuilds the ramp, then remaps it through
+/// [`table_ramp`] and resamples through [`resample_bands`]; a moved blend does the last two and
+/// clears the ready byte; a moved level only resamples. Every compare is unordered-is-unequal. Then
+/// the six weights are computed, every load before every store; then either
+/// [`rearm_level_table`] (ready byte zero) or, only after the rate path, the per-voice record loop
+/// whose bound is re-read every iteration and whose last store lands on the next record's first
+/// byte. The four parameters are published last, the state word stored between two of their loads.
+pub fn recommit_filter(g: &mut Guest, object: u32, sp: u32) -> Result<()> {
+    use crate::fp::{div_single, load_single, mul_single, store_single, sub_single};
+    let at = |offset: u32| object.wrapping_add(offset);
+    let frame = sp.wrapping_sub(RECOMMIT_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-128(r1)
+    if g.u32(at(RECOMMIT_STATE))? as i32 != 1 {
+        return Ok(()); // bne cr6,0x82b2f790
+    }
+    let mut retuned = false;
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let rate = load_single(g, at(RECOMMIT_RATE))?;
+    let rate_published = load_single(g, at(RECOMMIT_PUBLISHED_RATE))?;
+    if rate != rate_published {
+        let scratch = frame.wrapping_add(RECOMMIT_SCRATCH);
+        store_single(g, scratch, rate)?; // stfs f0,80(r1)
+        five_point_ramp(g, scratch, at(RECOMMIT_RAMP))?; // bl 0x82b2fe00
+        fpscr.disable_flush_mode_unconditional();
+        let clamped = load_single(g, scratch)?; // lfs f0,80(r1)
+        store_single(g, at(RECOMMIT_RATE), clamped)?; // stfs f0,60(r31)
+        g.set_u32(at(RECOMMIT_GUARD), RECOMMIT_GUARD_WORD)?; // stw r10,56(r31)
+        let blend = load_single(g, at(LEVEL_SOURCE))?; // lfs f1,1100(r31)
+        table_ramp(g, object, at(RECOMMIT_RAMP), at(RECOMMIT_POINTS), blend)?; // bl 0x82b2fea8
+        fpscr.disable_flush_mode_unconditional();
+        let blend = load_single(g, at(LEVEL_SOURCE))?; // reloaded
+        resample_bands(g, object, at(RECOMMIT_BANDS), at(RECOMMIT_RAMP), blend, frame)?; // bl 0x82b2f2c8
+        retuned = true; // li r29,1
+    } else {
+        let blend_published = load_single(g, at(RECOMMIT_PUBLISHED_BLEND))?; // lfs f0,348(r31)
+        let blend = load_single(g, at(LEVEL_SOURCE))?; // lfs f1,1100(r31)
+        if blend != blend_published {
+            table_ramp(g, object, at(RECOMMIT_RAMP), at(RECOMMIT_POINTS), blend)?;
+            fpscr.disable_flush_mode_unconditional();
+            let blend = load_single(g, at(LEVEL_SOURCE))?;
+            resample_bands(g, object, at(RECOMMIT_BANDS), at(RECOMMIT_RAMP), blend, frame)?;
+            g.set_u8(at(RECOMMIT_READY), 0)?; // stb r30,1088(r31)
+        } else {
+            let level = load_single(g, at(RECOMMIT_LEVEL))?;
+            let level_published = load_single(g, at(RECOMMIT_PUBLISHED_LEVEL))?;
+            if level != level_published {
+                // f1 is not reloaded here: it still holds the blend from the compare above.
+                resample_bands(g, object, at(RECOMMIT_BANDS), at(RECOMMIT_RAMP), blend, frame)?;
+            }
+        }
+    }
+
+    // loc_82B2F670: the six weights, every load before every store.
+    fpscr.disable_flush_mode_unconditional();
+    let mut param = load_single(g, at(RECOMMIT_PARAM_52))?;
+    let floor = load_single(g, RECOMMIT_FLOOR)?;
+    if !(param > floor) {
+        param = floor; // bgt ; fmr f0,f13 -- a NaN is replaced
+    }
+    let ratio = div_single(floor, param); // fdivs f13,f13,f0
+    let mut band = [0.0f64; 6];
+    for (k, value) in band.iter_mut().take(4).enumerate() {
+        *value = load_single(g, at(RECOMMIT_BANDS + 4 * k as u32))?;
+    }
+    let one = load_single(g, crate::routing::UNITY_GAIN)?; // lfs f0,-22460(r11)
+    band[4] = load_single(g, at(RECOMMIT_BANDS + 16))?;
+    band[5] = load_single(g, at(RECOMMIT_BANDS + 20))?;
+    let rest = band.map(|b| sub_single(one, b));
+    let depth = sub_single(one, ratio); // fsubs f2,f0,f13
+    for (k, r) in rest.iter().enumerate() {
+        store_single(g, at(RECOMMIT_WEIGHTS + 4 * k as u32), mul_single(*r, depth))?;
+    }
+
+    if g.u8(at(RECOMMIT_READY))? == 0 {
+        rearm_level_table(g, object)?; // bl 0x82b2ff88
+    } else if retuned && g.u8(at(LEVEL_CANDIDATE_COUNT))? != 0 {
+        let mut words = at(RECOMMIT_WORDS); // addi r9,r31,1068
+        let mut record = at(RECOMMIT_RECORDS); // addi r11,r31,140
+        let mut index = 0i32;
+        loop {
+            let from24 = g.u32(record.wrapping_add(24))?; // lwz r7,24(r11)
+            index += 1;
+            words = words.wrapping_add(4); // lwzu r8,4(r9)
+            let word = g.u32(words)?;
+            let from28 = g.u32(record.wrapping_add(28))?; // lwz r6,28(r11)
+            g.set_u32(record.wrapping_add(40), 0)?; // stw r30,40(r11)
+            g.set_u32(record.wrapping_add(36), from24)?; // stw r7,36(r11)
+            g.set_u32(record.wrapping_add(44), word)?; // stw r8,44(r11)
+            g.set_u32(record.wrapping_add(56), from28)?; // stw r6,56(r11)
+            record = record.wrapping_add(60); // stbu r30,60(r11) -- the next record's +0
+            g.set_u8(record, 0)?;
+            if index >= i32::from(g.u8(at(LEVEL_CANDIDATE_COUNT))?) {
+                break; // lbz r5,1089(r31) -- re-read ; cmpw ; blt
+            }
+        }
+    }
+
+    // loc_82B2F768: publish, the state word stored between the loads.
+    fpscr.disable_flush_mode_unconditional();
+    let final52 = load_single(g, at(RECOMMIT_PARAM_52))?;
+    let final_rate = load_single(g, at(RECOMMIT_RATE))?;
+    let final_level = load_single(g, at(RECOMMIT_LEVEL))?;
+    g.set_u32(at(RECOMMIT_STATE), 2)?; // li r11,2 ; stw r11,1092(r31)
+    let final_blend = load_single(g, at(LEVEL_SOURCE))?;
+    store_single(g, at(RECOMMIT_PUBLISHED_52), final52)?;
+    store_single(g, at(RECOMMIT_PUBLISHED_RATE), final_rate)?;
+    store_single(g, at(RECOMMIT_PUBLISHED_LEVEL), final_level)?;
+    store_single(g, at(RECOMMIT_PUBLISHED_BLEND), final_blend)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1410,5 +1664,120 @@ mod resample_bands_tests {
         assert!(!reservation_fits(100, 128));
         assert!(!reservation_fits(0x8000_0000, 32), "a negative limit fits nothing");
         assert!(reservation_fits(32, 0x8000_0000), "anything fits above a negative need");
+    }
+}
+
+#[cfg(test)]
+mod level_table_tests {
+    use super::*;
+    use crate::Segment;
+
+    const BASE: u32 = 0x4000_0000;
+    const OBJECT: u32 = BASE;
+    const SP: u32 = BASE + 0x8000;
+
+    fn cell(g: &mut Guest, at: u32, v: f32) {
+        g.set_u32(at, v.to_bits()).unwrap();
+    }
+
+    /// Rates 1.5 (one), 2.0 (first), 3.0 (last); candidates 10, 20, 30; the source 2.0.
+    fn guest(layout: u8, source: f32) -> Guest {
+        let mut g = Guest::from_segments(vec![
+            Segment { base: BASE, bytes: vec![0u8; 0x10000] },
+            Segment { base: 0x8209_9000, bytes: vec![0u8; 0x1000] },
+            Segment { base: 0x820B_A000, bytes: vec![0u8; 0x1000] },
+            Segment { base: 0x8211_6000, bytes: vec![0u8; 0x1000] },
+            Segment { base: 0x8216_5000, bytes: vec![0u8; 0x1000] },
+            Segment { base: 0x822F_8000, bytes: vec![0u8; 0x1000] },
+            Segment { base: 0x8231_A000, bytes: vec![0u8; 0x1000] },
+        ]);
+        for (at, v) in [
+            (LEVEL_RATE_ONE, 1.5f32), (LEVEL_CANDIDATE_ONE, 10.0), (LEVEL_RATE_FIRST, 2.0),
+            (LEVEL_CANDIDATE_FIRST, 20.0), (LEVEL_RATE_LAST, 3.0), (LEVEL_CANDIDATE_LAST, 30.0),
+            (LEVEL_HALF, 0.5), (ZERO_CELL, 0.0), (RECOMMIT_FLOOR, 1.0), (crate::routing::UNITY_GAIN, 1.0),
+        ] {
+            cell(&mut g, at, v);
+        }
+        g.set_u8(OBJECT + LEVEL_LAYOUT, layout).unwrap();
+        cell(&mut g, OBJECT + LEVEL_SOURCE, source);
+        g
+    }
+
+    fn pairs(g: &Guest, n: u32) -> (u8, Vec<f32>, Vec<i32>) {
+        (
+            g.u8(OBJECT + LEVEL_CANDIDATE_COUNT).unwrap(),
+            (0..n).map(|k| g.f32(OBJECT + LEVEL_CANDIDATES + 4 * k).unwrap()).collect(),
+            (0..n).map(|k| g.u32(OBJECT + LEVEL_COUNTS + 4 * k).unwrap() as i32).collect(),
+        )
+    }
+
+    #[test]
+    fn each_layout_rearms_its_pairs() {
+        let mut g = guest(1, 2.0);
+        rearm_level_table(&mut g, OBJECT).unwrap();
+        assert_eq!(pairs(&g, 1), (1, vec![10.0], vec![3]), "2 * 1.5 = 3, plus the half, truncated");
+        let mut g = guest(4, 2.0);
+        rearm_level_table(&mut g, OBJECT).unwrap();
+        assert_eq!(pairs(&g, 2), (2, vec![20.0, 30.0], vec![4, 6]));
+        let mut g = guest(6, 2.0);
+        rearm_level_table(&mut g, OBJECT).unwrap();
+        assert_eq!(pairs(&g, 3), (3, vec![20.0, 10.0, 30.0], vec![4, 3, 6]), "the middle pair is layout 1's");
+    }
+
+    #[test]
+    fn a_negative_count_rounds_away_from_zero() {
+        let mut g = guest(1, -1.0);
+        rearm_level_table(&mut g, OBJECT).unwrap();
+        assert_eq!(pairs(&g, 1).2, vec![-2], "-1.5 less the half is -2.0");
+    }
+
+    /// A filter object whose three parameters all equal their published copies, bands of 0.5, and
+    /// +52 of 2.0 against a floor of 1.0: the weights are (1 - 0.5) * (1 - 0.5).
+    fn unchanged(g: &mut Guest, state: u32, ready: u8) {
+        g.set_u32(OBJECT + RECOMMIT_STATE, state).unwrap();
+        g.set_u8(OBJECT + RECOMMIT_READY, ready).unwrap();
+        cell(g, OBJECT + RECOMMIT_PARAM_52, 2.0);
+        for (a, b, v) in [(RECOMMIT_RATE, RECOMMIT_PUBLISHED_RATE, 7.0f32), (LEVEL_SOURCE, RECOMMIT_PUBLISHED_BLEND, 2.0),
+                          (RECOMMIT_LEVEL, RECOMMIT_PUBLISHED_LEVEL, 0.25)] {
+            cell(g, OBJECT + a, v);
+            cell(g, OBJECT + b, v);
+        }
+        for k in 0..6u32 {
+            cell(g, OBJECT + RECOMMIT_BANDS + 4 * k, 0.5);
+            g.set_u32(OBJECT + RECOMMIT_WEIGHTS + 4 * k, 0xDEAD_BEEF).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_state_other_than_one_writes_nothing() {
+        let mut g = guest(1, 2.0);
+        unchanged(&mut g, 2, 0);
+        recommit_filter(&mut g, OBJECT, SP).unwrap();
+        assert_eq!(g.u32(OBJECT + RECOMMIT_WEIGHTS).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(g.u8(OBJECT + LEVEL_CANDIDATE_COUNT).unwrap(), 0);
+    }
+
+    #[test]
+    fn with_nothing_moved_the_weights_are_recomputed_and_the_table_rearmed() {
+        let mut g = guest(1, 2.0);
+        unchanged(&mut g, 1, 0);
+        recommit_filter(&mut g, OBJECT, SP).unwrap();
+        for k in 0..6u32 {
+            assert_eq!(g.f32(OBJECT + RECOMMIT_WEIGHTS + 4 * k).unwrap(), 0.25, "weight {k}");
+        }
+        assert_eq!(pairs(&g, 1), (1, vec![10.0], vec![3]), "the ready byte is 0");
+        assert_eq!(g.u32(OBJECT + RECOMMIT_STATE).unwrap(), 2);
+        assert_eq!(g.f32(OBJECT + RECOMMIT_PUBLISHED_52).unwrap(), 2.0);
+    }
+
+    #[test]
+    fn a_ready_object_off_the_rate_path_neither_rearms_nor_rewrites_records() {
+        let mut g = guest(1, 2.0);
+        unchanged(&mut g, 1, 1);
+        g.set_u8(OBJECT + LEVEL_CANDIDATE_COUNT, 2).unwrap();
+        g.set_u32(OBJECT + RECOMMIT_RECORDS + 36, 0x5555).unwrap();
+        recommit_filter(&mut g, OBJECT, SP).unwrap();
+        assert_eq!(g.u8(OBJECT + LEVEL_CANDIDATE_COUNT).unwrap(), 2);
+        assert_eq!(g.u32(OBJECT + RECOMMIT_RECORDS + 36).unwrap(), 0x5555);
     }
 }

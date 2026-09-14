@@ -19,7 +19,7 @@ use skate_audio_core::mathlib::Trig;
 use skate_audio_core::{
     Guest, bitstream, buffers, contributions, counter, eval, crossfade, cursors, dsp, filters, gains, leaves, mathlib, mix,
     player, ring,
-    bus, interleave, layout, meters, output, pitch, routing, voices,
+    bus, interleave, layout, mem, meters, output, pitch, routing, voices,
     scheduler, spatial, stage, system,
 };
 
@@ -1067,6 +1067,60 @@ fn main() {
                 g.put(sp.wrapping_sub(bitstream::PACKET_FRAME), vec![0u8; bitstream::PACKET_FRAME as usize]);
                 bitstream::seek_packet(&mut g, v.r3, v.r4, v.r5, u64::from(v.r6), sp)
                     .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
+            // The four helpers outside the 216, and the three bodies that could not be ported before
+            // them. Their decoders and walkers keep frames below r1, seeded with zeroes.
+            "sub_82F52FB8" => {
+                let len = if wide_missing { u64::from(v.r5) } else { v.w[2] };
+                mem::memcpy_chunked(&mut g, v.r3, v.r4, len)
+                    .map(|_| Some(v.r3))
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B472C0" => bitstream::seek_fixed_records(&mut g, v.r3, v.r4, u64::from(v.r5))
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B2FF88" => leaves::rearm_level_table(&mut g, v.r3)
+                .map(|_| None)
+                .map_err(|e| e.to_string()),
+            "sub_82B471D8" | "sub_82B470D0" | "sub_82B33780" | "sub_82B2F590" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where the frames live", v.run));
+                }
+                continue;
+            }
+            "sub_82B471D8" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                let depth = bitstream::SEEK_HEADER_STACK_DEPTH;
+                g.put(sp.wrapping_sub(depth), vec![0u8; depth as usize]);
+                bitstream::parse_seek_header(&mut g, v.r3, u64::from(v.r4), u64::from(v.r5), sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B470D0" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                let depth = bitstream::STREAM_HEADER_STACK_DEPTH;
+                g.put(sp.wrapping_sub(depth), vec![0u8; depth as usize]);
+                bitstream::parse_stream_header(&mut g, v.r3, v.r4, u64::from(v.r5), sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B33780" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                let depth = bitstream::PACKET_HEADER_STACK_DEPTH;
+                g.put(sp.wrapping_sub(depth), vec![0u8; depth as usize]);
+                bitstream::decode_packet_header(
+                    &mut g, u64::from(v.r3), u64::from(v.r4), u64::from(v.r5), u64::from(v.r6), sp)
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B2F590" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                let depth = leaves::RECOMMIT_STACK_DEPTH;
+                g.put(sp.wrapping_sub(depth), vec![0u8; depth as usize]);
+                leaves::recommit_filter(&mut g, v.r3, sp)
+                    .map(|_| None)
                     .map_err(|e| e.to_string())
             }
             // The evaluator's opcode table: every ported slot is `fn(&mut Guest, u32) -> u64` with the

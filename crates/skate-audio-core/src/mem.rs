@@ -100,6 +100,55 @@ pub fn memmove(g: &mut Guest, dst: u32, src: u32, len: u64) -> Result<()> {
     g.set_span(dst, &bytes)
 }
 
+// ---------------------------------------------------------------- sub_82F52FB8: the chunked copy
+
+/// A forward copy in the original's chunks (`sub_82F52FB8`): single bytes until `dst` is
+/// word-aligned, then whole words — one aligned load when `src` is aligned too, four byte loads
+/// otherwise, every byte of a word read before any is stored — then the tail bytes.
+///
+/// `dst` is `r3`, which the original returns unchanged; `src` is `r4`; `len` is `r5` at full width,
+/// because the alignment loop's counter is `len + 1` in 64 bits, tested on its low word. An
+/// overlapping copy follows the chunking, not memmove's rules: the tests pin one.
+pub fn memcpy_chunked(g: &mut Guest, dst: u32, src: u32, len: u64) -> Result<()> {
+    let (mut d, mut s, mut len) = (dst, src, len);
+    let mut ctr = len.wrapping_add(1); // addi r0,r5,1 ; mtctr r0
+    loop {
+        let aligned = d & 3 == 0; // andi. r0,r6,3
+        ctr = ctr.wrapping_sub(1); // bdnzf eq,0x82f52fc8
+        if ctr as u32 == 0 || aligned {
+            break;
+        }
+        len = len.wrapping_sub(1); // addi r5,r5,-1
+        let byte = g.u8(s)?;
+        s = s.wrapping_add(1);
+        g.set_u8(d, byte)?;
+        d = d.wrapping_add(1);
+    }
+    let words = (len as u32) >> 2; // rlwinm. r0,r5,30,2,31
+    let aligned_src = s & 3 == 0; // andi. r0,r4,3
+    for _ in 0..words {
+        let word = if aligned_src {
+            g.u32(s)? // lwz r7,0(r4)
+        } else {
+            let b3 = u32::from(g.u8(s.wrapping_add(3))?);
+            let b2 = u32::from(g.u8(s.wrapping_add(2))?);
+            let b1 = u32::from(g.u8(s.wrapping_add(1))?);
+            let b0 = u32::from(g.u8(s)?);
+            (b0 << 24) | (b1 << 16) | (b2 << 8) | b3 // lbz x4 ; rlwimi x3
+        };
+        s = s.wrapping_add(4);
+        g.set_u32(d, word)?; // stw r7,0(r6)
+        d = d.wrapping_add(4);
+    }
+    for _ in 0..(len as u32 & 3) {
+        let byte = g.u8(s)?;
+        s = s.wrapping_add(1);
+        g.set_u8(d, byte)?;
+        d = d.wrapping_add(1);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +212,53 @@ mod tests {
         }
         assert_eq!(g.u8(BASE + 0x0F).unwrap(), 0x11);
         assert_eq!(g.u8(BASE + 0x20).unwrap(), 0x22);
+    }
+}
+
+#[cfg(test)]
+mod chunked_copy_tests {
+    use super::*;
+
+    const BASE: u32 = 0x4000_0000;
+
+    fn guest() -> Guest {
+        let mut g = Guest::single(BASE, 0x100);
+        for i in 0..0x40u32 {
+            g.set_u8(BASE + i, i as u8 + 1).unwrap();
+        }
+        g
+    }
+
+    fn bytes(g: &Guest, at: u32, n: u32) -> Vec<u8> {
+        (0..n).map(|i| g.u8(at + i).unwrap()).collect()
+    }
+
+    #[test]
+    fn an_aligned_copy_moves_every_byte_and_no_more() {
+        let mut g = guest();
+        memcpy_chunked(&mut g, BASE + 0x80, BASE, 11).unwrap();
+        assert_eq!(bytes(&g, BASE + 0x80, 12), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]);
+    }
+
+    #[test]
+    fn misaligned_ends_take_the_byte_paths() {
+        let mut g = guest();
+        memcpy_chunked(&mut g, BASE + 0x81, BASE + 2, 13).unwrap();
+        assert_eq!(bytes(&g, BASE + 0x80, 15), [0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0]);
+    }
+
+    #[test]
+    fn a_zero_length_copies_nothing_even_misaligned() {
+        let mut g = guest();
+        memcpy_chunked(&mut g, BASE + 0x81, BASE, 0).unwrap();
+        assert_eq!(bytes(&g, BASE + 0x80, 4), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn an_overlapping_copy_follows_the_word_chunks_not_memmove() {
+        // The second word is read after the first was stored over it, so the pattern repeats.
+        let mut g = guest();
+        memcpy_chunked(&mut g, BASE + 4, BASE, 8).unwrap();
+        assert_eq!(bytes(&g, BASE, 12), [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]);
     }
 }
