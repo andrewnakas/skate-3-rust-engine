@@ -105,6 +105,179 @@ pub fn advance_pitch(g: &mut Guest, voice: u32, stream: u32, frames: u32) -> Res
     Ok(mask & remaining)
 }
 
+// ---------------------------------------------------------------- sub_82B2DBA8: one block resampled
+
+/// `lwz r8,8(r31)` — the system whose `+0` is the arena with the bump pointer at `+32`.
+pub const BLOCK_SYSTEM: u32 = 8;
+/// `lbz r9,42(r31)` — channels, reloaded at every loop test.
+pub const BLOCK_CHANNELS: u32 = 42;
+/// `lfs f13,64(r3)` — the stream rate this voice was last set up for.
+pub const BLOCK_RATE_CACHE: u32 = 64;
+/// `lhz r9,76(r31)` — the per-channel tail rows' offset in the voice, 24 bytes a channel.
+pub const BLOCK_TAIL_OFFSET: u32 = 76;
+/// `lwz r27,28(r19)` / `lwz r26,32(r19)` — the source and destination descriptors.
+pub const BLOCK_PAIR_BACK: u32 = 28;
+/// The destination descriptor.
+pub const BLOCK_PAIR_FRONT: u32 = 32;
+/// `lwz r11,40(r4)` — the format, whose `+12` is its rate.
+pub const BLOCK_FORMAT: u32 = 40;
+/// `lwz r10,48(r19)` — input frames in; output frames out.
+pub const BLOCK_INPUT_FRAMES: u32 = 48;
+/// `lfs f0,52(r4)` — the stream rate the cache is compared against.
+pub const BLOCK_STREAM_RATE: u32 = 52;
+/// `lwz r17,32(r7)` — the arena's bump pointer.
+pub const ARENA_TOP: u32 = 32;
+/// `stwu r1,-224(r1)`. Real: the resampler's cursor and phase slots are `r1 + 80` and `r1 + 84`.
+pub const BLOCK_FRAME: u32 = 224;
+
+fn scale4(value: u64) -> u64 {
+    u64::from((value as u32) << 2)
+}
+
+/// `mullw ; rlwinm ; add` — one channel's float array.
+fn block_channel(stride: u64, index: u64, base: u64) -> u64 {
+    let elements = i64::from(stride as u32 as i32) * i64::from(index as u32 as i32);
+    scale4(elements as u64).wrapping_add(base)
+}
+
+/// Resample one block of a stream (`sub_82B2DBA8`). Returns 1.
+///
+/// `voice` is `r3`, `stream` `r4`, `sp` `r1`. A stream rate that no longer matches the voice's cache
+/// only re-caches it and resets the stream's rate from the format. Otherwise a scratch run is taken
+/// off the arena's bump pointer; the output frame count is `((usable + 1) << 16 - phase - 1) / step`
+/// (8,192 for a zero step), capped at `+78`; each channel's previous tail and new input are copied
+/// into the scratch run, resampled by [`crate::dsp::resample::resample`] with this frame's cursor and
+/// phase slots, and what was not consumed becomes the channel's tail — four singles at a time, then a
+/// chunked copy. The channel count is reloaded every iteration. The pair is swapped, the frame count
+/// and the rate republished, and the arena pointer restored through a re-read system pointer.
+pub fn resample_block(g: &mut Guest, voice: u32, stream: u32, sp: u32) -> Result<u64> {
+    let frame = sp.wrapping_sub(BLOCK_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-224(r1)
+    let index_slot = frame.wrapping_add(80);
+    let phase_slot = frame.wrapping_add(84);
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let rate = fp::load_single(g, stream.wrapping_add(BLOCK_STREAM_RATE))?; // lfs f0,52(r4)
+    let cached = fp::load_single(g, voice.wrapping_add(BLOCK_RATE_CACHE))?; // lfs f13,64(r3)
+    if rate != cached {
+        fp::store_single(g, voice.wrapping_add(BLOCK_RATE_CACHE), rate)?; // stfs f0,64(r3)
+        let format = g.u32(stream.wrapping_add(BLOCK_FORMAT))?; // lwz r11,40(r4)
+        let format_rate = fp::load_single(g, format.wrapping_add(12))?; // after the store above
+        fp::store_single(g, stream.wrapping_add(BLOCK_STREAM_RATE), format_rate)?;
+        return Ok(1);
+    }
+    let system = g.u32(voice.wrapping_add(BLOCK_SYSTEM))?;
+    let input_frames = u64::from(g.u32(stream.wrapping_add(BLOCK_INPUT_FRAMES))?);
+    let carried_in = u64::from(g.u8(voice.wrapping_add(VOICE_BIAS))?); // lbz r11,80(r31)
+    let available = carried_in.wrapping_add(input_frames); // add r22,r11,r10
+    let arena = g.u32(system)?; // lwz r7,0(r8)
+    let block = u64::from((scale4(input_frames).wrapping_add(151) as u32) & 0xFFFF_FF80);
+    let arena_top = g.u32(arena.wrapping_add(ARENA_TOP))?; // lwz r17,32(r7)
+    let scratch = u64::from(arena_top).wrapping_sub(block); // subf r29,r5,r17
+    g.set_u32(arena.wrapping_add(ARENA_TOP), scratch as u32)?; // stw r29,32(r7)
+    let tail_offset = u64::from(g.u16(voice.wrapping_add(BLOCK_TAIL_OFFSET))?);
+    let bias = u64::from(g.u8(voice.wrapping_add(VOICE_CREDIT))?); // lbz r4,81(r31)
+    let usable = available.wrapping_sub(bias);
+    let src_desc = g.u32(stream.wrapping_add(BLOCK_PAIR_BACK))?;
+    let needed = usable.wrapping_add(1); // addic. r11,r3,1
+    let dst_desc = g.u32(stream.wrapping_add(BLOCK_PAIR_FRONT))?;
+    let tail_base = tail_offset.wrapping_add(u64::from(voice)); // add r18,r9,r31
+    let mut frames = 0u32;
+    if needed as u32 as i32 > 0 {
+        let step = g.u32(voice.wrapping_add(VOICE_STEP))?;
+        if step == 0 {
+            frames = 8192; // li r25,8192
+        } else {
+            let phase = u64::from(g.u32(voice.wrapping_add(VOICE_FRACTION))?);
+            let scaled = u64::from((needed as u32) << 16);
+            frames = (scaled.wrapping_sub(phase).wrapping_sub(1) as u32) / step; // divwu r25,r6,r9
+        }
+    }
+    let cap = u32::from(g.u16(voice.wrapping_add(VOICE_FRAMES))?); // lhz r11,78(r31)
+    frames = frames.min(cap);
+
+    let mut channels = u32::from(g.u8(voice.wrapping_add(BLOCK_CHANNELS))?);
+    let mut phase_word = 0u32;
+    let mut leftover = 0u64;
+    if channels != 0 {
+        let run_bytes = scale4(input_frames);
+        let (mut tail_index, mut tail_row, mut channel) = (0u64, tail_base, 0u32);
+        loop {
+            let carried = u64::from(g.u8(voice.wrapping_add(VOICE_BIAS))?); // reloaded
+            if carried != 0 {
+                let bytes = u64::from((carried as u32 & 0xFF).rotate_left(2));
+                crate::mem::memcpy_chunked(g, scratch as u32, tail_row as u32, bytes)?; // bl 0x82f52fb8
+            }
+            let src_stride = u64::from(g.u16(src_desc.wrapping_add(14))?);
+            let dst_stride = u64::from(g.u16(dst_desc.wrapping_add(14))?);
+            let src_base = u64::from(g.u32(src_desc.wrapping_add(4))?);
+            let dst_base = u64::from(g.u32(dst_desc.wrapping_add(4))?);
+            let source = block_channel(src_stride, u64::from(channel), src_base);
+            let body = scale4(carried).wrapping_add(scratch);
+            let destination = block_channel(dst_stride, u64::from(channel), dst_base);
+            crate::mem::memcpy(g, body as u32, source as u32, run_bytes)?; // bl 0x82edf460
+            let phase = g.u32(voice.wrapping_add(VOICE_FRACTION))?; // lwz r11,72(r31)
+            g.set_u32(index_slot, 0)?; // stw r20,80(r1)
+            let step = g.u32(voice.wrapping_add(VOICE_STEP))?;
+            g.set_u32(phase_slot, phase << 16)?; // rlwinm r10,r11,16,0,15 ; stw r10,84(r1)
+            crate::dsp::resample::resample(
+                g, frames, scratch as u32, destination as u32, index_slot, phase_slot, u64::from(step),
+            )?; // bl 0x82b43fb8
+            let consumed = u64::from(g.u32(index_slot)?);
+            let mut copied = 0u64;
+            leftover = available.wrapping_sub(consumed); // subf r30,r10,r22
+            if leftover as u32 as i32 >= 4 {
+                let groups = u64::from(((leftover.wrapping_sub(4) as u32) >> 2) & 0x3FFF_FFFF) + 1;
+                let mut from = scale4(consumed).wrapping_add(scratch).wrapping_sub(4) as u32;
+                let mut to = tail_row.wrapping_sub(4) as u32;
+                copied = scale4(groups);
+                for _ in 0..groups as u32 {
+                    fpscr.disable_flush_mode_unconditional();
+                    let a = fp::load_single(g, from.wrapping_add(4))?;
+                    let b = fp::load_single(g, from.wrapping_add(8))?;
+                    let c = fp::load_single(g, from.wrapping_add(12))?;
+                    from = from.wrapping_add(16); // lfsu f0,16(r8)
+                    let d = fp::load_single(g, from)?;
+                    fp::store_single(g, to.wrapping_add(4), a)?;
+                    fp::store_single(g, to.wrapping_add(8), b)?;
+                    fp::store_single(g, to.wrapping_add(12), c)?;
+                    to = to.wrapping_add(16); // stfsu f0,16(r7)
+                    fp::store_single(g, to, d)?;
+                }
+            }
+            if (copied as u32) < (leftover as u32) {
+                let out_at = scale4(tail_index.wrapping_add(copied)).wrapping_add(tail_base);
+                let in_at = scale4(copied.wrapping_add(consumed)).wrapping_add(scratch);
+                let bytes = scale4(leftover.wrapping_sub(copied));
+                crate::mem::memcpy_chunked(g, out_at as u32, in_at as u32, bytes)?; // bl 0x82f52fb8
+            }
+            channels = u32::from(g.u8(voice.wrapping_add(BLOCK_CHANNELS))?); // reloaded
+            channel += 1;
+            tail_row = tail_row.wrapping_add(24);
+            tail_index = tail_index.wrapping_add(6);
+            if channel >= channels {
+                break;
+            }
+        }
+        phase_word = g.u32(phase_slot)?; // lwz r11,84(r1)
+    }
+    g.set_u8(voice.wrapping_add(VOICE_BIAS), leftover as u8)?; // stb r30,80(r31)
+    g.set_u32(voice.wrapping_add(VOICE_FRACTION), phase_word >> 16)?; // rlwinm r9,r11,16,16,31
+    let format = g.u32(stream.wrapping_add(BLOCK_FORMAT))?;
+    let back = g.u32(stream.wrapping_add(BLOCK_PAIR_BACK))?;
+    let front = g.u32(stream.wrapping_add(BLOCK_PAIR_FRONT))?;
+    g.set_u32(stream.wrapping_add(BLOCK_PAIR_FRONT), back)?;
+    g.set_u32(stream.wrapping_add(BLOCK_PAIR_BACK), front)?;
+    g.set_u32(stream.wrapping_add(BLOCK_INPUT_FRAMES), frames)?; // stw r25,48(r19)
+    fpscr.disable_flush_mode_unconditional();
+    let format_rate = fp::load_single(g, format.wrapping_add(12))?;
+    fp::store_single(g, stream.wrapping_add(BLOCK_STREAM_RATE), format_rate)?;
+    let system_now = g.u32(voice.wrapping_add(BLOCK_SYSTEM))?; // re-read
+    let arena_now = g.u32(system_now)?;
+    g.set_u32(arena_now.wrapping_add(ARENA_TOP), arena_top)?; // stw r17,32(r4)
+    Ok(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +369,100 @@ mod tests {
         assert_eq!(RATIO_SCALE, 0x820B_0000 + 16660);
         assert_eq!(ROUND_HALF, 0x820A_0000 - 26788);
         assert_eq!(RATIO_CEILING, crate::dsp::gain_ramp::STEP_SCALE, "the same cell, reached twice");
+    }
+}
+
+#[cfg(test)]
+mod resample_block_tests {
+    use super::*;
+    use crate::Segment;
+
+    const BASE: u32 = 0x4000_0000;
+    const VOICE: u32 = BASE;
+    const SYSTEM: u32 = BASE + 0x200;
+    const ARENA: u32 = BASE + 0x240;
+    const STREAM: u32 = BASE + 0x300;
+    const SRC: u32 = BASE + 0x400;
+    const DST: u32 = BASE + 0x440;
+    const FORMAT: u32 = BASE + 0x480;
+    const INPUT: u32 = BASE + 0x1000;
+    const OUTPUT: u32 = BASE + 0x2000;
+    const TOP: u32 = BASE + 0x8000;
+    const SP: u32 = BASE + 0xF000;
+
+    /// One channel of eight input samples 1..8 at unit step and zero phase.
+    fn guest(bias: u8) -> Guest {
+        let mut g = Guest::from_segments(vec![
+            Segment { base: BASE, bytes: vec![0u8; 0x10000] },
+            Segment { base: 0x822F_8000, bytes: vec![0u8; 0x1000] },
+        ]);
+        g.set_u32(crate::dsp::resample::FRACTION_SCALE_CELL, (1.0f32 / 65536.0).to_bits()).unwrap();
+        g.set_u32(VOICE + BLOCK_SYSTEM, SYSTEM).unwrap();
+        g.set_u32(SYSTEM, ARENA).unwrap();
+        g.set_u32(ARENA + ARENA_TOP, TOP).unwrap();
+        g.set_u8(VOICE + BLOCK_CHANNELS, 1).unwrap();
+        g.set_u32(VOICE + BLOCK_RATE_CACHE, 48_000.0f32.to_bits()).unwrap();
+        g.set_u32(VOICE + VOICE_STEP, 0x1_0000).unwrap();
+        g.set_u16(VOICE + BLOCK_TAIL_OFFSET, 0x80).unwrap();
+        g.set_u16(VOICE + VOICE_FRAMES, 256).unwrap();
+        g.set_u8(VOICE + VOICE_CREDIT, bias).unwrap();
+        g.set_u32(STREAM + BLOCK_PAIR_BACK, SRC).unwrap();
+        g.set_u32(STREAM + BLOCK_PAIR_FRONT, DST).unwrap();
+        g.set_u32(STREAM + BLOCK_FORMAT, FORMAT).unwrap();
+        g.set_u32(FORMAT + 12, 44_100.0f32.to_bits()).unwrap();
+        g.set_u32(STREAM + BLOCK_INPUT_FRAMES, 8).unwrap();
+        g.set_u32(STREAM + BLOCK_STREAM_RATE, 48_000.0f32.to_bits()).unwrap();
+        g.set_u32(SRC + 4, INPUT).unwrap();
+        g.set_u16(SRC + 14, 256).unwrap();
+        g.set_u32(DST + 4, OUTPUT).unwrap();
+        g.set_u16(DST + 14, 256).unwrap();
+        for i in 0..8u32 {
+            g.set_u32(INPUT + 4 * i, ((i + 1) as f32).to_bits()).unwrap();
+        }
+        g
+    }
+
+    #[test]
+    fn a_moved_rate_only_recaches_and_resets_the_stream_rate() {
+        let mut g = guest(0);
+        g.set_u32(STREAM + BLOCK_STREAM_RATE, 32_000.0f32.to_bits()).unwrap();
+        assert_eq!(resample_block(&mut g, VOICE, STREAM, SP).unwrap(), 1);
+        assert_eq!(g.f32(VOICE + BLOCK_RATE_CACHE).unwrap(), 32_000.0);
+        assert_eq!(g.f32(STREAM + BLOCK_STREAM_RATE).unwrap(), 44_100.0, "from the format");
+        assert_eq!(g.u32(STREAM + BLOCK_PAIR_BACK).unwrap(), SRC, "no swap");
+    }
+
+    #[test]
+    fn a_block_resamples_through_the_scratch_run_and_swaps_the_pair() {
+        let mut g = guest(0);
+        let mut h = g.clone();
+        assert_eq!(resample_block(&mut g, VOICE, STREAM, SP).unwrap(), 1);
+        // Eight frames at unit step consume all eight inputs: no tail is left.
+        assert_eq!(g.u32(STREAM + BLOCK_INPUT_FRAMES).unwrap(), 8);
+        assert_eq!(g.u8(VOICE + VOICE_BIAS).unwrap(), 0);
+        assert_eq!(g.u32(STREAM + BLOCK_PAIR_BACK).unwrap(), DST);
+        assert_eq!(g.u32(STREAM + BLOCK_PAIR_FRONT).unwrap(), SRC);
+        assert_eq!(g.u32(ARENA + ARENA_TOP).unwrap(), TOP, "the arena pointer is restored");
+        assert_eq!(g.f32(STREAM + BLOCK_STREAM_RATE).unwrap(), 44_100.0);
+        // The destination is what the resampler makes of the input copied to the scratch run.
+        let scratch = TOP - 128;
+        for i in 0..8u32 {
+            h.set_u32(scratch + 4 * i, ((i + 1) as f32).to_bits()).unwrap();
+        }
+        crate::dsp::resample::resample(&mut h, 8, scratch, OUTPUT, SP - 144, SP - 140, 0x1_0000).unwrap();
+        for i in 0..8u32 {
+            assert_eq!(g.u32(OUTPUT + 4 * i).unwrap(), h.u32(OUTPUT + 4 * i).unwrap(), "output {i}");
+        }
+    }
+
+    #[test]
+    fn what_the_resampler_does_not_consume_becomes_the_tail() {
+        // A bias of four holds four samples back: four frames, four consumed, 5..8 kept.
+        let mut g = guest(4);
+        resample_block(&mut g, VOICE, STREAM, SP).unwrap();
+        assert_eq!(g.u32(STREAM + BLOCK_INPUT_FRAMES).unwrap(), 4);
+        assert_eq!(g.u8(VOICE + VOICE_BIAS).unwrap(), 4);
+        let tail: Vec<f32> = (0..4).map(|i| g.f32(VOICE + 0x80 + 4 * i).unwrap()).collect();
+        assert_eq!(tail, [5.0, 6.0, 7.0, 8.0]);
     }
 }
