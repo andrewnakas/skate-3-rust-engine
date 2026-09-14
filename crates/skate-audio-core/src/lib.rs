@@ -337,3 +337,7 @@ pub mod symbols;
 /// Patch banks at run time: load an `.abk`, post to an object, spawn evaluator instances.
 /// Unverified new work; see the module note.
 pub mod patch;
+
+/// The evaluator voice op and the voice-object helpers, against a host voice device.
+/// Unverified; see the module note.
+pub mod voice;

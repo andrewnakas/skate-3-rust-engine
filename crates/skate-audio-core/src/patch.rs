@@ -17,6 +17,8 @@
 //! | `sub_828E2C78` | [`release_message`] |
 //! | `sub_828E2E08`, `sub_828E2EA0`, `sub_828E30B8`, `sub_828E2D78` | the unregister helpers |
 //!
+//! Evaluator slot 27, the voice op, is in [`crate::voice`]; [`PatchHost`] runs it and slot 4.
+//!
 //! What is left out, and why: the audio system's critical section around the installer and the
 //! listener, which only serialises threads; the installer's registration of an `AEMS` unload handler
 //! (`sub_82B48260`); and, on the first bank, the registration of the interpreter `sub_82B1E290` with
@@ -35,6 +37,7 @@ use crate::eval::TABLE_BASE;
 use crate::eval::interp::LIST_HEAD;
 use crate::mem::memcpy;
 use crate::symbols::{lookup_table0, lookup_table1, lookup_table2};
+use crate::voice::{VoiceDevice, voice_op};
 use crate::{Error, Guest, Result};
 
 /// `lis -31997` + 28500: the list of installed banks, linked through each bank's `+80`.
@@ -90,12 +93,14 @@ impl Heap for BumpHeap {
 /// The runtime half of the evaluator table, for [`crate::eval::interp::tick_with`].
 pub struct PatchHost<'a> {
     pub heap: &'a mut dyn Heap,
+    pub device: &'a mut dyn VoiceDevice,
 }
 
 impl crate::eval::interp::Host for PatchHost<'_> {
     fn op(&mut self, g: &mut Guest, opcode: u8, block: u32) -> Option<Result<u64>> {
         match opcode {
-            4 => Some(end_instance(g, self.heap, block)),
+            4 => Some(end_instance(g, self.heap, self.device, block)),
+            27 => Some(voice_op(g, self.device, block)),
             _ => None,
         }
     }
@@ -120,7 +125,7 @@ fn unlink(g: &mut Guest, item: u32) -> Result<()> {
 /// Evaluator slot 4, `sub_82B1C150`: when `triple+12` is set, unlink the instance from its record's
 /// live list and from the interpreter's list, then free it. `triple` is the instance's
 /// `{record, instance, post node}` back-pointer block. Always returns 0.
-pub fn end_instance(g: &mut Guest, heap: &mut dyn Heap, triple: u32) -> Result<u64> {
+pub fn end_instance(g: &mut Guest, heap: &mut dyn Heap, device: &mut dyn VoiceDevice, triple: u32) -> Result<u64> {
     if g.u32(triple + 12)? as i32 == 0 {
         return Ok(0);
     }
@@ -139,13 +144,13 @@ pub fn end_instance(g: &mut Guest, heap: &mut dyn Heap, triple: u32) -> Result<u
         g.set_u32(LIST_HEAD, next)?;
     }
     unlink(g, node)?;
-    free_instance(g, heap, triple)?;
+    free_instance(g, heap, device, triple)?;
     Ok(0)
 }
 
 /// `sub_82B1BF98`: take an instance's entries off every list they joined, release what it owns,
 /// drop the record's live count and free the instance.
-fn free_instance(g: &mut Guest, heap: &mut dyn Heap, triple: u32) -> Result<()> {
+fn free_instance(g: &mut Guest, heap: &mut dyn Heap, device: &mut dyn VoiceDevice, triple: u32) -> Result<()> {
     let record = g.u32(triple)?;
     let mut entry = g.u32(triple + 4)?.wrapping_add(24);
     if g.u8(record + 37)? != 0 {
@@ -196,8 +201,8 @@ fn free_instance(g: &mut Guest, heap: &mut dyn Heap, triple: u32) -> Result<()> 
             let object = off.wrapping_add(g.u32(triple + 4)?);
             let voice = g.u32(object + 8)?;
             if voice != 0 {
-                // The voice's vtable slot 0. Voices only exist once slot 27 is ported.
-                return Err(Error::new(0x82B1_C0B8, format!("releasing voice {voice:#010x} is not implemented")));
+                device.release(g, voice)?; // the voice's vtable slot 0
+                g.set_u32(object + 8, 0)?; // stw r28,8(r30)
             }
             record = g.u32(triple)?;
             i += 1;
@@ -718,6 +723,7 @@ pub fn on_release(g: &mut Guest, ctx: u32) -> Result<()> {
 mod tests {
     use super::*;
     use crate::symbols::{GENERATION, PROJECT_LIST_HEAD, install_project};
+    use crate::voice::NoDevice;
 
     const MEM: u32 = 0x5000_0000;
     const CSI: u32 = MEM;
@@ -857,10 +863,10 @@ mod tests {
         let instance = g.u32(rec + 56).unwrap();
         let node = g.u32(MSG).unwrap();
         let triple = instance + 72;
-        assert_eq!(end_instance(&mut g, &mut heap, triple).unwrap(), 0);
+        assert_eq!(end_instance(&mut g, &mut heap, &mut NoDevice, triple).unwrap(), 0);
         assert_eq!(g.u16(rec + 28).unwrap(), 1, "an unflagged instance is left alone");
         g.set_u32(triple + 12, 1).unwrap();
-        end_instance(&mut g, &mut heap, triple).unwrap();
+        end_instance(&mut g, &mut heap, &mut NoDevice, triple).unwrap();
         assert_eq!(g.u32(rec + 56).unwrap(), 0, "off the record's live list");
         assert_eq!(g.u32(LIST_HEAD).unwrap(), 0, "off the interpreter's list");
         assert_eq!(g.u16(rec + 28).unwrap(), 0);
@@ -884,7 +890,7 @@ mod tests {
         }
         g.put(interp::ZERO_SINGLE, vec![0; 4]);
         g.put(interp::SCALE_GLOBAL, vec![0; 16]);
-        let t = tick_with(&mut g, 1.0, &mut PatchHost { heap: &mut heap }).unwrap();
+        let t = tick_with(&mut g, 1.0, &mut PatchHost { heap: &mut heap, device: &mut NoDevice }).unwrap();
         assert_eq!((t.walked, t.ops), (true, 2));
         assert_eq!(g.u32(LIST_HEAD).unwrap(), 0, "slot 4 took the instance off the list");
     }

@@ -10,7 +10,72 @@
 
 use skate_audio_core::eval::interp;
 use skate_audio_core::patch::{self, BumpHeap};
-use skate_audio_core::{Guest, Segment, symbols};
+use skate_audio_core::voice::{OpenRequest, VoiceDevice};
+use skate_audio_core::{Guest, Result as CoreResult, Segment, symbols};
+use skate_audio_formats::eaac;
+
+/// Logs every call a patch makes on its voices, and keeps each voice alive.
+struct LoggingDevice {
+    voices: u32,
+    frame: usize,
+    lines: Vec<String>,
+    last: std::collections::HashMap<(u32, u32), u32>,
+}
+
+impl LoggingDevice {
+    fn log(&mut self, line: String) {
+        self.lines.push(format!("  frame {:4}: {line}", self.frame));
+    }
+}
+
+impl VoiceDevice for LoggingDevice {
+    fn open(&mut self, g: &mut Guest, r: &OpenRequest) -> CoreResult<u32> {
+        self.voices += 1;
+        let voice = 0x7F00_0000 + self.voices * 0x100;
+        let header = g
+            .span(r.sample as u32, 16)
+            .ok()
+            .and_then(|bytes| eaac::Header::parse(bytes, 0).ok())
+            .map(|h| format!("{} Hz, {} ch, {} samples ({:.2} s){}", h.sample_rate, h.channels(), h.num_samples, h.duration_secs(), if h.looping { ", looping" } else { "" }))
+            .unwrap_or_else(|| "no EAAC header".into());
+        self.log(format!(
+            "open voice {voice:#x}: sample index {} at {:#x} [{header}], byte2 {}, descriptor {:x?}, bank+72 {:#x}, arg8 {:#x}, {} records",
+            r.index, r.sample, r.byte2, r.shifted, r.bank_72, r.arg8, r.record_count
+        ));
+        Ok(voice)
+    }
+    fn release(&mut self, _g: &mut Guest, v: u32) -> CoreResult<()> {
+        self.log(format!("release {v:#x}"));
+        Ok(())
+    }
+    fn suspend(&mut self, _g: &mut Guest, v: u32) -> CoreResult<()> {
+        self.log(format!("suspend {v:#x}"));
+        Ok(())
+    }
+    fn resume(&mut self, _g: &mut Guest, v: u32) -> CoreResult<()> {
+        self.log(format!("resume {v:#x}"));
+        Ok(())
+    }
+    fn set(&mut self, _g: &mut Guest, v: u32, id: u32, value: u32) -> CoreResult<()> {
+        if self.last.insert((v, id), value) != Some(value) {
+            self.log(format!("{v:#x} property {id} = {value}"));
+        }
+        Ok(())
+    }
+    fn set_alternate(&mut self, _g: &mut Guest, v: u32, value: u32) -> CoreResult<()> {
+        if self.last.insert((v, 3), value) != Some(value) {
+            self.log(format!("{v:#x} property 3 = {value}"));
+        }
+        Ok(())
+    }
+    fn query(&mut self, _g: &mut Guest, _v: u32, out: &mut [u32; 11]) -> CoreResult<()> {
+        out[0] = 1;
+        Ok(())
+    }
+    fn poke(&mut self, _g: &mut Guest, _v: u32) -> CoreResult<()> {
+        Ok(())
+    }
+}
 use skate_audio_formats::eb;
 
 const MISC: u32 = 0x4000_0000;
@@ -111,12 +176,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 256 samples at 48 kHz per audio frame.
     let delta = (256.0f32 / 48_000.0) as f64;
     let mut ops = 0usize;
-    for frame in 0..2000 {
-        match interp::tick_with(&mut g, delta, &mut patch::PatchHost { heap: &mut heap }) {
+    let mut device = LoggingDevice { voices: 0, frame: 0, lines: Vec::new(), last: Default::default() };
+    let frames = 375; // two seconds of audio frames
+    for frame in 0..frames {
+        device.frame = frame;
+        match interp::tick_with(&mut g, delta, &mut patch::PatchHost { heap: &mut heap, device: &mut device }) {
             Ok(t) => {
                 ops += t.ops;
                 if frame < 12 && t.walked {
                     println!("  frame {frame}: walked {} nodes, {} ops", t.nodes, t.ops);
+                }
+                if frame + 1 == frames {
+                    println!("  ran {frames} frames, {ops} ops, the instance still live");
                 }
                 if t.walked && g.u32(interp::LIST_HEAD)? == 0 {
                     println!("  frame {frame}: the list emptied");
@@ -131,6 +202,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
         }
+    }
+    for line in device.lines.iter().take(80) {
+        println!("{line}");
+    }
+    if device.lines.len() > 80 {
+        println!("  ... {} more device calls", device.lines.len() - 80);
     }
     Ok(())
 }
