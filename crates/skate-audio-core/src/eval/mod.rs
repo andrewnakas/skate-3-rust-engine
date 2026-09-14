@@ -13,7 +13,7 @@
 //! stream. That is what makes every op here `s32 op(block*)` with no direct call site anywhere in
 //! the lifted tree, and why each one's whole result is the value it returns.
 //!
-//! **This module is the table's slots, not the interpreter.** `sub_82B1E290` itself fails the port
+//! **This module is the table's slots; the interpreter is [`interp`], unverified new work (2026-09-14).** `sub_82B1E290` itself fails the port
 //! screen's gate 1 — its `bctrl` dispatches a data word, so its callee set is whatever the program
 //! bytes name — and gate 2, since its write set is the union over an unbounded node list of an
 //! unbounded record stream whose store addresses the dispatched ops may rewrite mid-walk. It has no
@@ -61,6 +61,7 @@
 
 pub mod accessors;
 pub mod arith;
+pub mod interp;
 pub mod state;
 pub mod wave;
 
