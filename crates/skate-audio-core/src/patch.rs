@@ -15,6 +15,7 @@
 //! | `sub_82B1D7E8`, `sub_82B1D7F8`, `sub_82B1D808`, `sub_82B1D840` | the instance's callbacks |
 //! | `sub_82B1C150` (evaluator slot 4), `sub_82B1BF98` | [`end_instance`]: unlink and free |
 //! | `sub_828E2C78` | [`release_message`] |
+//! | `sub_828E2D18` | [`redeliver`]: hand a held message's rewritten payload to its instances again |
 //! | `sub_828E2E08`, `sub_828E2EA0`, `sub_828E30B8`, `sub_828E2D78` | the unregister helpers |
 //!
 //! Evaluator slot 27, the voice op, is in [`crate::voice`]; [`PatchHost`] runs it and slot 4.
@@ -504,6 +505,20 @@ pub fn post(g: &mut Guest, heap: &mut dyn Heap, slot: u32, payload: u32, message
     Ok(0)
 }
 
+/// `sub_828E2D18`: re-deliver a held message. The game rewrites the payload of a message it keeps
+/// (a grind's volume, cutoffs and speed, every frame) and calls this, which runs each payload
+/// callback on the post node's `+8` list again. Returns 0.
+pub fn redeliver(g: &mut Guest, node: u32, payload: u32) -> Result<i32> {
+    let mut callback = g.u32(node + 8)?;
+    while callback != 0 {
+        let function = g.u32(callback + 8)?;
+        let ctx = g.u32(callback + 12)?;
+        call_payload_callback(g, function, payload, ctx)?;
+        callback = g.u32(callback)?; // reloaded after the call
+    }
+    Ok(0)
+}
+
 fn call_listener(g: &mut Guest, heap: &mut dyn Heap, function: u32, node: u32, payload: u32, ctx: u32) -> Result<()> {
     match function {
         LISTENER => listener(g, heap, node, payload, ctx),
@@ -830,6 +845,19 @@ mod tests {
         assert_eq!(g.u32(instance + 24 + 24).unwrap(), 0xBBBB, "payload word 1");
         let node = g.u32(MSG).unwrap();
         assert_eq!(g.u32(node + 4).unwrap(), 2, "the payload callback took a reference");
+    }
+
+    #[test]
+    fn a_redelivery_rewrites_the_instance_copy() {
+        let (mut g, mut heap) = installed();
+        resolve_game_slot(&mut g);
+        w(&mut g, MSG + 4, &[0, 1]);
+        post(&mut g, &mut heap, SLOT, MSG + 4, MSG).unwrap();
+        let instance = g.u32(BANK + 0x5C + 56).unwrap();
+        w(&mut g, MSG + 4, &[32767, 7]);
+        let node = g.u32(MSG).unwrap();
+        assert_eq!(redeliver(&mut g, node, MSG + 4).unwrap(), 0);
+        assert_eq!((g.u32(instance + 44).unwrap(), g.u32(instance + 48).unwrap()), (32767, 7));
     }
 
     #[test]

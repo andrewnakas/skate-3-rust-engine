@@ -173,18 +173,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let first_words: Vec<String> = (0..12).map(|i| format!("{:08x}", g.u32(block + 4 * i).unwrap())).collect();
     println!("instance {instance:#x}: program {program:#x}, block {block:#x}, block words {}", first_words.join(" "));
 
+    // With DISASM set, list the program: each op's absolute block offset and where its pairs write.
+    if std::env::var_os("DISASM").is_some() {
+        let mut at = program;
+        let mut blk: i64 = 0;
+        let mut n = 0;
+        loop {
+            let op = g.u8(at)?;
+            if op == 255 {
+                println!("  [{n:3}] end at block +{blk}");
+                break;
+            }
+            let pairs = g.u8(at + 1)? as u32;
+            let mut wiring = Vec::new();
+            for p in 0..pairs {
+                let src = g.u32(at + 4 + 8 * p)? as i32 as i64;
+                let dst = g.u32(at + 8 + 8 * p)? as i32 as i64;
+                if src == -1 {
+                    wiring.push(format!("r3->+{}", blk + dst));
+                } else {
+                    wiring.push(format!("+{}->+{}", blk + src, blk + dst));
+                }
+            }
+            let advance = g.u32(at + 4 + 8 * pairs)? as i32 as i64;
+            let name = skate_audio_core::eval::TABLE.get(op as usize).map(|s| s.name).unwrap_or("?");
+            println!("  [{n:3}] op {op:2} {name} block +{blk} {}", wiring.join(" "));
+            blk += advance;
+            at += 8 + 8 * pairs;
+            n += 1;
+        }
+    }
+
     // 256 samples at 48 kHz per audio frame.
     let delta = (256.0f32 / 48_000.0) as f64;
     let mut ops = 0usize;
     let mut device = LoggingDevice { voices: 0, frame: 0, lines: Vec::new(), last: Default::default() };
     let frames = 375; // two seconds of audio frames
+    // UPDATES re-delivers the payload every frame the way the grind updater sub_824C39E0 does:
+    // word 0 becomes 32767, and volume, two cutoffs and speed are refreshed (values chosen here).
+    let updates = std::env::var_os("UPDATES").is_some();
+    let node = g.u32(message)?;
     for frame in 0..frames {
         device.frame = frame;
+        if updates && frame >= 20 {
+            for (field, value) in [(4u32, 32767u32), (8, 20000), (12, 0), (16, 0), (20, 0), (24, 25000), (28, 25000), (32, 5000)] {
+                g.set_u32(message + field, value)?;
+            }
+            patch::redeliver(&mut g, node, message + 4)?;
+        }
         match interp::tick_with(&mut g, delta, &mut patch::PatchHost { heap: &mut heap, device: &mut device }) {
             Ok(t) => {
                 ops += t.ops;
                 if frame < 12 && t.walked {
                     println!("  frame {frame}: walked {} nodes, {} ops", t.nodes, t.ops);
+                }
+                // WATCH="off,off,..." prints those operand-block words after chosen walks.
+                if t.walked && matches!(frame, 5 | 11 | 17 | 59 | 179 | 371) {
+                    if let Ok(list) = std::env::var("WATCH") {
+                        let words: Vec<String> = list
+                            .split(',')
+                            .filter_map(|o| o.trim().parse::<u32>().ok())
+                            .map(|o| format!("+{o}={}", g.u32(block + o).map(|w| w as i32).unwrap_or(i32::MIN)))
+                            .collect();
+                        println!("  watch frame {frame}: {}", words.join(" "));
+                    }
                 }
                 if frame + 1 == frames {
                     println!("  ran {frames} frames, {ops} ops, the instance still live");

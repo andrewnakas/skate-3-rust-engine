@@ -52,7 +52,7 @@ than at a misunderstanding of the engine.
 | `meters.rs` | `sub_82B373C8` and `sub_82B376B8`: per-channel mean-square and peak meters over one quarter of each block — four accumulators fed the same vector, so the sum is four times the squares, as the original computes it — kept in ring histories; and the tick that re-sizes the rings when the rate moves, then runs the meters and the layout expansion | unit-tested, recording pending |
 | `mem.rs` | the write-set contract of `sub_82EDF460` (memcpy) and `sub_82EE5E80` (memset), which six of the bodies above call | not a port; see its module note; plus `sub_82F52FB8`, a chunked forward memcpy whose overlap behaviour the tests pin |
 
-`cargo test` runs 641 unit tests. **Read the next two sections before reading that as one number:
+`cargo test` runs 642 unit tests. **Read the next two sections before reading that as one number:
 the modules are checked in different ways, and only the ones whose table row gives a replay figure
 have one.**
 
