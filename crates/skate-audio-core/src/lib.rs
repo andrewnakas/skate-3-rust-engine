@@ -350,3 +350,6 @@ pub mod sndplayer;
 
 /// A voice graph's per-block pass and node mixer fill. Unverified; see the module note.
 pub mod graph;
+
+/// The voice classes' kernels by address, a GraphHost for a voice graph. Routing unverified.
+pub mod kernels;
