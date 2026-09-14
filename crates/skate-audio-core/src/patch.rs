@@ -13,6 +13,9 @@
 //! | `sub_82B1D880` | [`allocate_instance`] |
 //! | `sub_828E2FF8` | [`subscribe`] |
 //! | `sub_82B1D7E8`, `sub_82B1D7F8`, `sub_82B1D808`, `sub_82B1D840` | the instance's callbacks |
+//! | `sub_82B1C150` (evaluator slot 4), `sub_82B1BF98` | [`end_instance`]: unlink and free |
+//! | `sub_828E2C78` | [`release_message`] |
+//! | `sub_828E2E08`, `sub_828E2EA0`, `sub_828E30B8`, `sub_828E2D78` | the unregister helpers |
 //!
 //! What is left out, and why: the audio system's critical section around the installer and the
 //! listener, which only serialises threads; the installer's registration of an `AEMS` unload handler
@@ -56,6 +59,8 @@ pub const INSTALL_FRAME: u32 = 176;
 pub trait Heap {
     /// Allocate `size` bytes aligned to `align`; 0 when out of memory, as the original's allocator.
     fn alloc(&mut self, g: &mut Guest, size: u32, align: u32) -> Result<u32>;
+    /// Free an allocation (the allocator vtable's `+12`).
+    fn free(&mut self, g: &mut Guest, at: u32) -> Result<()>;
 }
 
 /// A bump allocator over a guest span. Never frees, which is enough for a test or a session.
@@ -76,6 +81,216 @@ impl Heap for BumpHeap {
             _ => Ok(0),
         }
     }
+
+    fn free(&mut self, _g: &mut Guest, _at: u32) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The runtime half of the evaluator table, for [`crate::eval::interp::tick_with`].
+pub struct PatchHost<'a> {
+    pub heap: &'a mut dyn Heap,
+}
+
+impl crate::eval::interp::Host for PatchHost<'_> {
+    fn op(&mut self, g: &mut Guest, opcode: u8, block: u32) -> Option<Result<u64>> {
+        match opcode {
+            4 => Some(end_instance(g, self.heap, block)),
+            _ => None,
+        }
+    }
+}
+
+/// Unlink a `{next, prev}` item from its neighbours, the way every helper here does: the previous
+/// item's next first, then the next item's prev, each tested (signed, equality only) for null.
+fn unlink(g: &mut Guest, item: u32) -> Result<()> {
+    let prev = g.u32(item + 4)?;
+    if prev as i32 != 0 {
+        let next = g.u32(item)?;
+        g.set_u32(prev, next)?;
+    }
+    let next = g.u32(item)?;
+    if next as i32 != 0 {
+        let prev = g.u32(item + 4)?;
+        g.set_u32(next + 4, prev)?;
+    }
+    Ok(())
+}
+
+/// Evaluator slot 4, `sub_82B1C150`: when `triple+12` is set, unlink the instance from its record's
+/// live list and from the interpreter's list, then free it. `triple` is the instance's
+/// `{record, instance, post node}` back-pointer block. Always returns 0.
+pub fn end_instance(g: &mut Guest, heap: &mut dyn Heap, triple: u32) -> Result<u64> {
+    if g.u32(triple + 12)? as i32 == 0 {
+        return Ok(0);
+    }
+    let record = g.u32(triple)?;
+    let instance = g.u32(triple + 4)?;
+    let head = g.u32(record + 56)?;
+    if instance == head {
+        let next = g.u32(head)?;
+        g.set_u32(record + 56, next)?;
+    }
+    unlink(g, instance)?;
+    let node = g.u32(triple + 4)?.wrapping_add(8);
+    let head = g.u32(LIST_HEAD)?;
+    if node == head {
+        let next = g.u32(head)?;
+        g.set_u32(LIST_HEAD, next)?;
+    }
+    unlink(g, node)?;
+    free_instance(g, heap, triple)?;
+    Ok(0)
+}
+
+/// `sub_82B1BF98`: take an instance's entries off every list they joined, release what it owns,
+/// drop the record's live count and free the instance.
+fn free_instance(g: &mut Guest, heap: &mut dyn Heap, triple: u32) -> Result<()> {
+    let record = g.u32(triple)?;
+    let mut entry = g.u32(triple + 4)?.wrapping_add(24);
+    if g.u8(record + 37)? != 0 {
+        let node = g.u32(triple + 8)?;
+        unregister_node_callback(g, heap, node, entry, 12)?; // sub_828E2E08
+        entry = entry.wrapping_add(20);
+    }
+    let mut record = g.u32(triple)?;
+    if g.u16(record + 32)? != 0 {
+        let mut i = 0i32;
+        loop {
+            unsubscribe(g, entry, entry + 8, 12)?; // sub_828E30B8
+            record = g.u32(triple)?;
+            i += 1;
+            entry = entry.wrapping_add(28);
+            if !(i < g.u16(record + 32)? as i32) {
+                break;
+            }
+        }
+    }
+    let mut next = entry;
+    if g.u8(record + 38)? != 0 {
+        let node = g.u32(triple + 8)?;
+        unregister_node_callback(g, heap, node, entry, 8)?; // sub_828E2EA0
+        next = (((g.u8(entry + 16)? as u32 + 5) << 2) & !3).wrapping_add(entry);
+    }
+    record = g.u32(triple)?;
+    if g.u16(record + 34)? != 0 {
+        let mut i = 0i32;
+        loop {
+            unsubscribe(g, next, next + 8, 8)?; // sub_828E2D78
+            let words = g.u8(next + 24)? as u32;
+            record = g.u32(triple)?;
+            i += 1;
+            let count = g.u16(record + 34)? as i32;
+            next = (((words + 7) << 2) & !3).wrapping_add(next);
+            if !(i < count) {
+                break;
+            }
+        }
+    }
+    let mut cursor = record + 60;
+    if g.u8(record + 36)? != 0 {
+        let mut i = 0i32;
+        loop {
+            let off = g.u32(cursor)?;
+            cursor += 4;
+            let object = off.wrapping_add(g.u32(triple + 4)?);
+            let voice = g.u32(object + 8)?;
+            if voice != 0 {
+                // The voice's vtable slot 0. Voices only exist once slot 27 is ported.
+                return Err(Error::new(0x82B1_C0B8, format!("releasing voice {voice:#010x} is not implemented")));
+            }
+            record = g.u32(triple)?;
+            i += 1;
+            if !(i < g.u8(record + 36)? as i32) {
+                break;
+            }
+        }
+    }
+    if g.u8(record + 39)? != 0 {
+        let mut i = 0i32;
+        let mut at = cursor.wrapping_sub(4);
+        loop {
+            at = at.wrapping_add(4);
+            let object = g.u32(at)?.wrapping_add(g.u32(triple + 4)?);
+            let message = g.u32(object + 8)?;
+            if message != 0 {
+                release_message(g, heap, message)?; // sub_828E2C78
+            }
+            record = g.u32(triple)?;
+            i += 1;
+            if !(i < g.u8(record + 39)? as i32) {
+                break;
+            }
+        }
+    }
+    let live = g.u16(record + 28)?.wrapping_sub(1);
+    g.set_u16(record + 28, live)?;
+    let instance = g.u32(triple + 4)?;
+    heap.free(g, instance) // allocator vtable +12
+}
+
+/// `sub_828E2E08` (`list_at` 12) and `sub_828E2EA0` (`list_at` 8): take `item` off one of a post
+/// node's callback lists, drop the node's reference and free it at zero.
+fn unregister_node_callback(g: &mut Guest, heap: &mut dyn Heap, node: u32, item: u32, list_at: u32) -> Result<()> {
+    let head = g.u32(node + list_at)?;
+    if item == head {
+        let next = g.u32(head)?;
+        g.set_u32(node + list_at, next)?;
+    }
+    unlink(g, item)?;
+    let refs = g.u32(node + 4)?.wrapping_sub(1); // addic. r11,r11,-1
+    g.set_u32(node + 4, refs)?;
+    if refs == 0 {
+        heap.free(g, node)?;
+    }
+    Ok(())
+}
+
+/// `sub_828E30B8` (`word_at` 12, a table-2 binding) and `sub_828E2D78` (`word_at` 8): take `node`
+/// off the bound symbol's listener list. Returns 0, the binding's negative id, -6 or -3.
+fn unsubscribe(g: &mut Guest, binding: u32, node: u32, word_at: u32) -> Result<i32> {
+    let id = g.u32(binding + 4)?;
+    if (id as i32) < 0 {
+        return Ok(id as i32);
+    }
+    let symbol = g.u32(binding)?;
+    if symbol == 0 {
+        return Ok(-6);
+    }
+    if id as i32 != g.u32(symbol + word_at)? as i32 {
+        g.set_u32(binding + 4, (-3i32) as u32)?;
+        g.set_u32(binding, 0)?;
+        return Ok(-3);
+    }
+    let head = g.u32(symbol)?;
+    if node == head {
+        let next = g.u32(head)?;
+        g.set_u32(symbol, next)?;
+    }
+    unlink(g, node)?;
+    Ok(0)
+}
+
+/// `sub_828E2C78`: release a post node. Run its release callbacks, drop its reference, and free it
+/// at zero. Always returns 0.
+pub fn release_message(g: &mut Guest, heap: &mut dyn Heap, node: u32) -> Result<i32> {
+    let mut callback = g.u32(node + 12)?;
+    while callback != 0 {
+        let function = g.u32(callback + 8)?;
+        let next = g.u32(callback)?;
+        let ctx = g.u32(callback + 12)?;
+        match function {
+            ON_RELEASE => on_release(g, ctx)?,
+            other => return Err(Error::new(other, format!("release callback {other:#010x} is not implemented"))),
+        }
+        callback = next;
+    }
+    let refs = g.u32(node + 4)?.wrapping_sub(1);
+    g.set_u32(node + 4, refs)?;
+    if refs == 0 {
+        heap.free(g, node)?;
+    }
+    Ok(0)
 }
 
 fn link_head(g: &mut Guest, head_cell: u32, node: u32) -> Result<()> {
@@ -548,7 +763,8 @@ mod tests {
         g.set_u16(rec + 30, 2).unwrap();
         g.set_u8(rec + 36, 1).unwrap(); // one back-pointer entry
         g.set_u8(rec + 38, 1).unwrap(); // a payload copy
-        w(g, rec + 40, &[0x180, 0x200, 64, 40, 0, 8]); // program, template, size, back, live, entry
+        // program, template, size 96, back-pointer triple at +72, no live instances, one object at +56
+        w(g, rec + 40, &[0x180, 0x200, 96, 72, 0, 56]);
         g.set_u8(BANK + 0x200 + 24 + 16, 2).unwrap(); // the payload copy takes two words
         w(g, BANK + 0x300, &[0x123]);
         w(g, BANK + 0x400, &[0]); // no code references
@@ -579,7 +795,7 @@ mod tests {
         assert_eq!(g.u32(rec + 20).unwrap(), LISTENER);
         assert_eq!(g.u32(rec + 24).unwrap(), rec, "the listener's context is the record");
         assert_eq!(g.u32(CSI + 40).unwrap(), rec + 12, "the listener node heads the symbol's list");
-        assert_eq!(g.u32(BANK + 0x200 + 8).unwrap(), BANK, "the template's back-pointer");
+        assert_eq!(g.u32(BANK + 0x200 + 56).unwrap(), BANK, "the template's back-pointer");
         assert_eq!(g.u32(BANK_LIST).unwrap(), BANK + 80);
     }
 
@@ -603,7 +819,7 @@ mod tests {
         assert_eq!(g.u32(LIST_HEAD).unwrap(), instance + 8, "queued for the interpreter");
         assert_eq!(g.u32(instance + 16).unwrap(), BANK + 0x180, "node program");
         assert_eq!(g.u32(instance + 20).unwrap(), instance + 24, "node block");
-        assert_eq!(g.u32(instance + 40).unwrap(), rec, "back-pointer triple at +40");
+        assert_eq!(g.u32(instance + 72).unwrap(), rec, "back-pointer triple at +72");
         assert_eq!(g.u32(instance + 24 + 20).unwrap(), 0xAAAA, "payload word 0");
         assert_eq!(g.u32(instance + 24 + 24).unwrap(), 0xBBBB, "payload word 1");
         let node = g.u32(MSG).unwrap();
@@ -630,6 +846,47 @@ mod tests {
         assert_eq!(post(&mut g, &mut heap, SLOT, MSG + 4, MSG).unwrap(), -3, "now its own negative id");
         g.set_u32(SLOT + 4, 0).unwrap();
         assert_eq!(post(&mut g, &mut heap, SLOT, MSG + 4, MSG).unwrap(), -6);
+    }
+
+    #[test]
+    fn slot_four_unlinks_and_frees_only_when_flagged() {
+        let (mut g, mut heap) = installed();
+        resolve_game_slot(&mut g);
+        assert_eq!(post(&mut g, &mut heap, SLOT, MSG + 4, MSG).unwrap(), 0);
+        let rec = BANK + 0x5C;
+        let instance = g.u32(rec + 56).unwrap();
+        let node = g.u32(MSG).unwrap();
+        let triple = instance + 72;
+        assert_eq!(end_instance(&mut g, &mut heap, triple).unwrap(), 0);
+        assert_eq!(g.u16(rec + 28).unwrap(), 1, "an unflagged instance is left alone");
+        g.set_u32(triple + 12, 1).unwrap();
+        end_instance(&mut g, &mut heap, triple).unwrap();
+        assert_eq!(g.u32(rec + 56).unwrap(), 0, "off the record's live list");
+        assert_eq!(g.u32(LIST_HEAD).unwrap(), 0, "off the interpreter's list");
+        assert_eq!(g.u16(rec + 28).unwrap(), 0);
+        assert_eq!(g.u32(node + 8).unwrap(), 0, "the payload callback was unregistered");
+        assert_eq!(g.u32(node + 4).unwrap(), 1, "and gave back its reference");
+    }
+
+    #[test]
+    fn the_interpreter_hands_slot_four_to_the_host() {
+        use crate::eval::interp::{self, tick_with};
+        let (mut g, mut heap) = installed();
+        resolve_game_slot(&mut g);
+        post(&mut g, &mut heap, SLOT, MSG + 4, MSG).unwrap();
+        let instance = g.u32(BANK + 0x5C + 56).unwrap();
+        // A program at the bank's 0x180 that moves the block to the triple (+48 from +24) and ends
+        // the instance.
+        w(&mut g, BANK + 0x180, &[0x0000_0000, 48, 0x0400_0000, 0, 0xFF00_0000]);
+        g.set_u32(instance + 72 + 12, 1).unwrap();
+        for cell in [interp::PERIOD_NUMER, interp::PERIOD_DENOM, interp::SCALE_UNIT] {
+            g.put(cell, 1.0f32.to_bits().to_be_bytes().to_vec());
+        }
+        g.put(interp::ZERO_SINGLE, vec![0; 4]);
+        g.put(interp::SCALE_GLOBAL, vec![0; 16]);
+        let t = tick_with(&mut g, 1.0, &mut PatchHost { heap: &mut heap }).unwrap();
+        assert_eq!((t.walked, t.ops), (true, 2));
+        assert_eq!(g.u32(LIST_HEAD).unwrap(), 0, "slot 4 took the instance off the list");
     }
 
     #[test]

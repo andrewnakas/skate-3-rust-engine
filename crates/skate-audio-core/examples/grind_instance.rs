@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let delta = (256.0f32 / 48_000.0) as f64;
     let mut ops = 0usize;
     for frame in 0..2000 {
-        match interp::tick(&mut g, delta) {
+        match interp::tick_with(&mut g, delta, &mut patch::PatchHost { heap: &mut heap }) {
             Ok(t) => {
                 ops += t.ops;
                 if frame < 12 && t.walked {

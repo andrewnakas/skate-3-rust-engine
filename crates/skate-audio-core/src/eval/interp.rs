@@ -66,6 +66,22 @@ const RECORD_BODY: u32 = 4;
 const PAIR_BYTES: u32 = 8;
 const SRC_IS_RESULT: i32 = -1;
 
+/// Opcodes the pure table cannot run because they touch the runtime: allocation, other threads'
+/// objects, voices. The host gets the first say on any slot without a pure port.
+pub trait Host {
+    /// Run `opcode` over `block` if this host implements it; `None` leaves it unported.
+    fn op(&mut self, g: &mut Guest, opcode: u8, block: u32) -> Option<Result<u64>>;
+}
+
+/// A host that implements nothing, for callers that only need the pure table.
+pub struct NoHost;
+
+impl Host for NoHost {
+    fn op(&mut self, _g: &mut Guest, _opcode: u8, _block: u32) -> Option<Result<u64>> {
+        None
+    }
+}
+
 /// What one call did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tick {
@@ -78,8 +94,13 @@ pub struct Tick {
     pub ops: usize,
 }
 
-/// One call of `sub_82B1E290` with `delta` in `f1`.
+/// One call of `sub_82B1E290` with `delta` in `f1`, running only the pure table.
 pub fn tick(g: &mut Guest, delta: f64) -> Result<Tick> {
+    tick_with(g, delta, &mut NoHost)
+}
+
+/// One call of `sub_82B1E290`, with `host` running the slots the pure table does not port.
+pub fn tick_with(g: &mut Guest, delta: f64, host: &mut dyn Host) -> Result<Tick> {
     let mut out = Tick { recounted: false, walked: false, nodes: 0, ops: 0 };
     let cached = load_single(g, DELTA_CACHE)?; // lfs f0,30172(r11)
 
@@ -143,7 +164,14 @@ pub fn tick(g: &mut Guest, delta: f64) -> Result<Tick> {
         let mut opcode = g.u8(record as u32)?; // lbz r11,0(r30)
         while opcode != END_OPCODE {
             // lwzx r11,r11,r29 ; mr r3,r31 ; bctrl. `Op` takes the low word of r3.
-            let result = dispatch(g, opcode, block as u32)? as u32;
+            let pure = super::TABLE.get(opcode as usize).and_then(|slot| slot.port);
+            let result = match pure {
+                Some(op) => op(g, block as u32)?,
+                None => match host.op(g, opcode, block as u32) {
+                    Some(result) => result?,
+                    None => dispatch(g, opcode, block as u32)?, // the error naming the slot
+                },
+            } as u32;
             out.ops += 1;
             let mut pair = record + RECORD_BODY as u64; // addi r11,r30,4
             let mut index: i32 = 0; // li r8,0
