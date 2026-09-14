@@ -344,3 +344,6 @@ pub mod voice;
 
 /// A stream object's frame delivery with a host fill function. Unverified; see the module note.
 pub mod stream;
+
+/// SndPlayer1's block render and fade. Unverified; see the module note.
+pub mod sndplayer;
