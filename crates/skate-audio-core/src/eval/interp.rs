@@ -44,8 +44,9 @@ pub const FRAME_COUNT: u32 = 0x8307_75E0;
 pub const COUNTDOWN: u32 = 0x8307_75E4;
 /// `lis -32206` + -22460: the period's numerator, 1.0 in the image dump.
 pub const PERIOD_NUMER: u32 = 0x8231_A844;
-/// `lis -32003` + 13812: the period's denominator, 41.6 in the image dump. So one period is
-/// `1 / 41.6` s, about 24.04 ms.
+/// `lis -32003` + 13812: the period's denominator. 41.6 in the boot-time image dump, but game init
+/// (`sub_826D4C30`) overwrites it with 30.0 from `0x820D4924` and zeroes [`DELTA_CACHE`]. So in play
+/// one period is 1/30 s.
 pub const PERIOD_DENOM: u32 = 0x82FD_35F4;
 /// `lis -32234` + 23056: 0.0, the accumulator's start.
 pub const ZERO_SINGLE: u32 = 0x8216_5A10;

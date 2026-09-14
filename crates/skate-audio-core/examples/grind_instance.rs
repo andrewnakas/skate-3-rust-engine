@@ -42,6 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         g.set_u32(cell, 0)?;
     }
     g.set_u16(symbols::GENERATION, 0)?;
+    // Game init (sub_826D4C30) sets the evaluator's period denominator to 30.0 after the dump was
+    // taken, so a period is 1/30 s in play, not the dump's 1/41.6.
+    g.set_u32(interp::PERIOD_DENOM, 30.0f32.to_bits())?;
 
     let data = std::fs::read(&archive_path)?;
     let archive = eb::Archive::parse(&data)?;
