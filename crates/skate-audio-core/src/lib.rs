@@ -329,3 +329,7 @@ pub(crate) mod testutil {
         g.set_u32(PLAYER + crate::player::PLAYER_SOURCE, SOURCE).unwrap();
     }
 }
+
+/// The `.csi` symbol tables at run time: install a project, resolve a symbol into a slot.
+/// Unverified new work; see the module note.
+pub mod symbols;
