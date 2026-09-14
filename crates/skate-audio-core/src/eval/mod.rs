@@ -173,8 +173,8 @@ const fn missing(guest: u32, name: &'static str, absent: &'static str) -> Slot {
 /// The table as the guest image holds it, slot for slot.
 pub static TABLE: [Slot; TABLE_SLOTS] = [
     ported(0x82B1_BF68, "sub_82B1BF68", accessors::op_take_word_16),
-    missing(0x8283_2BA8, "sub_82832BA8", "outside the audio corpus; never screened"),
-    missing(0x82C8_CDC8, "sub_82C8CDC8", "outside the audio corpus; never screened"),
+    missing(0x8283_2BA8, "sub_82832BA8", "outside the audio corpus: `lwz r3,20(r3); blr`, i.e. return block[20], folded with game code"),
+    missing(0x82C8_CDC8, "sub_82C8CDC8", "outside the audio corpus: `lwz r3,24(r3); blr`, i.e. return block[24], folded with game code"),
     ported(0x82B1_BF80, "sub_82B1BF80", accessors::op_take_word_0),
     missing(0x82B1_C150, "sub_82B1C150", "gate 1: sub_82B1BF98's closure leaves the audio corpus"),
     missing(0x82B1_C210, "sub_82B1C210", "pending path split: comparable only when the broadcast is skipped"),
