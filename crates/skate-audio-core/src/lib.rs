@@ -357,3 +357,7 @@ pub mod kernels;
 /// Voice graph construction: the module classes' sizes and constructors, the builder and its install
 /// command. Unverified; see the module note.
 pub mod modules;
+
+/// The voice module classes: registration, cooked parameter defaults, and a parameter's default block.
+/// Unverified; see the module note.
+pub mod classes;
