@@ -32,6 +32,75 @@ sound events yet.
 | per-block driver: drain, evaluator tick, graph passes, mix to output | — | **missing** |
 | gameplay posting player events, with per-frame updates | — | **missing** |
 
+## Trick and landing sounds: the target
+
+The user wants every trick and landing sound, and the skateboard sounds around them, to match the
+game. These are the player sound objects, from the game's object table at `0x8302D4A4`:
+- the bank that plays each one, from `list_exports`;
+- the message constructor that posts it, found by the scan for its handle slot `0x8302EE28 + 8i`;
+- the gameplay function that calls that constructor;
+- how many posts the one traced session (`msgs1`) caught.
+
+The "sound" column is a reading of the names, not verified.
+
+| sound (by name) | object | bank | constructor | gameplay caller (instructions) | msgs1 posts |
+|---|---|---|---|---|---|
+| flip tricks | `Class_Flips` | `Sk8_Air_Flip_Tricks.abk` (33) | `sub_824AFAD8` | `sub_824CBFB8` (373) | 3 |
+| trick cloth foley: ollie, kickflip, pop shuv, spins | `cloth_trick` | `Foley_Cloth.abk` (28) | `sub_824B71C0` | `sub_824CC590` (59), `sub_824CC680` (86) | 3 |
+| bail cloth | `c_cloth_falls` | `Foley_Cloth.abk` | `sub_824B72D8` | `sub_824DBF10` (118) | 0 |
+| impacts ("treatments") | `Class_Treatment` | `Treatments.abk` (18) | `sub_824B0080` | `sub_824DD408` (185), which also posts `hall_of_meat_slo_mo` | 1 |
+| board squeaks | `Class_Squeaks` | `Brd_Squeaks.abk` (18) | `sub_824AFF48` | `sub_824C7738` (185) | 6 |
+| seams under the wheels | `Class_Seams` | `Seams_Bank.abk` (234) | `sub_824AFDD0` | `sub_824C13D0` (62) | 32 |
+| rolling surface | `Class_rolling` | `PatchBank_Rolling_Surfaces`, `_Objects`, `_SpiderCracks`, `_RocksBounce` | `sub_824C4C18` | `sub_824C5CA8` (315), `sub_824C9830` (70), `sub_824C9F68` (51) | 2 |
+| truck rattle | `Rolling_Rattle_Class` | `Rolling_Rattles.abk` (18) | `sub_824B0248` | `sub_824C6198` (568) | 14 |
+| wheel skid (powerslide, revert) | `Class_wheels_skid` | `WHEEL_SKID_BANK.abk` (96) | `sub_824AF678` | `sub_824C7438` (191) | 18 |
+| grind | `Class_grind` | `GRINDS.abk` (123) | `sub_824AF8C8` | `sub_824C28B0` (276), `sub_824C39E0` (378) | 0 |
+| board slide | `c_board_slide` | `board_scrapes.abk` (30) | `sub_824B0670` | `sub_824CB3C8` (62) | 0 |
+| body slide | `c_body_slide` | `Bodyslide.abk` (20) | `sub_824B7070` | `sub_824DC0E8` (113) | 0 |
+| footsteps and foot landings (`foot_impact_speed`, `footstep_jump_landed`) | `playercharacter_footstep` | `fstep_skateshoe1_sm.abk` (192) | `sub_824B73E0` | `sub_824E9FD8` (635) | 16 |
+| foot drag (braking) | `Class_foot_drag` | `FOOT_DRAG.abk` (168) | `sub_824AF498` | `sub_824BB540` (229) | 1 |
+| speed wind and rattle | `SenseOfSpeed_wind`, `SenseOfSpeed_rattle` | `sense_of_speed.abk` (17) | `sub_824B0388`, `sub_824B0520` | `sub_824E7980` (203) | 20, 0 |
+| foley utility | `c_foley_utility` | `Foley_Cloth.abk` | `sub_82488120` | `sub_82487A60` (77) | 1 |
+| Hall of Meat slow motion (bails) | `hall_of_meat_slo_mo` | `hom_slo_mo.abk` (14) | `sub_824AF368` | `sub_824DD408` | 0 |
+
+**Not needed:** `Class_wheels_flip`, `Class_pre_lands_whsh`, `c_board_tumble`, `SenseOfSpeed_tone` and
+`Ollie_Rattles` are named in the `.csi` tables. No bank in `audiofiles.big` exports them, and no
+constructor for them was found, so they look unused in retail. Treat them as unused unless a trace
+shows a post. `wheels.big` and `grains.big` have no known poster yet.
+
+**What "match perfectly" can mean.** Say this to the user before promising more.
+- **Can match exactly, and can be checked against traces:**
+  - which object is posted for an event, with its payload and per-frame updates;
+  - which layers open, from which sample groups;
+  - every voice property: pitch base, gains, cutoffs, pan;
+  - timing relative to the event;
+  - the graph and the mix.
+- **Random, by design:** which variant of a sample plays, small pitch offsets, some start gains.
+  - They come from **one global counter at `0x830775F0`** that every patch in the game draws from,
+    including ambience and other skaters.
+  - The game itself does not repeat them from run to run.
+  - Reproducing them exactly would mean replaying every draw in the whole game.
+  - The practical target is the same logic and the same distribution. That is the user's call.
+- **Bit-for-bit output** (sk8Audio `tools/mixdiff.py` against the recomp's `audio_dump_path`) needs
+  a reproducible scene. Two recomp runs do not produce the same capture.
+
+**Traces are recorded on Linux only.** The recomp harness, gdb and the message probe live there.
+The one session so far (`msgs1`) ran `probe/trace/scripts/bail_replay_v2.txt`. It caught no grinds,
+slides or bail foley, and only three flips. Record more on Linux: flips, landings, grinds, slides,
+powerslides, bails. The existing input scripts are `ollie_check_v4.txt`, `late_flip_v5.txt`,
+`bail_replay_v2.txt` and `bail_attribution_v3.txt`. The recording command, from sk8Audio's root:
+
+```sh
+OUT=$PWD/probe/harness/out SHADOW=false DURATION=150 AUDIO_DUMP_FRAMES=0 PLAY_MOVIES=true \
+  INPUT_SCRIPT=probe/trace/scripts/late_flip_v5.txt \
+  EXTRA_ARGS="--skate3_audio_probe_messages=true --skate3_audio_probe_messages_count=20000" \
+  probe/harness/run_session.sh flips1
+```
+
+It needs a free, unlocked desktop and no running `skate3`. Each session logs every post
+(`skate3-audio-msg`), re-delivery (`skate3-audio-update`), voice open (`skate3-audio-open`) and
+graph build (`skate3-audio-graph`).
+
 ## Evidence so far
 
 Everything below uses `crates/skate-audio-core/examples/grind_instance.rs` against real data.
@@ -188,6 +257,9 @@ core) resolves every bank export.
 
 ## Work order
 
+0. **On Linux, before or between Windows sessions:** record trick and landing traces (see "Trick
+   and landing sounds" above). Without them nothing past the footstep can be checked.
+
 1. **Drain.** A Rust dispatcher by handler address over the ported handlers; an unknown handler
    is an `Err` naming it. Locking and the `mftb` timing stores are not reproduced; say so in the
    module note.
@@ -200,8 +272,13 @@ core) resolves every bank export.
 5. **Voice lifetime.** The voice vtable `+0` release `0x82B1E458` has a C++ `.inc`. Also SndPlayer1
    configure ids 1-4 (only 0 and 5 are ported) and bus creation `sub_824916E8`, which is a host stub
    today.
-6. **Gameplay events.** Post and update each player object from the engine's skating state. The
-   payload layouts are in the constructors above; read each one, and check against `msgs1.log`.
+6. **Gameplay events: the trick and landing table above.**
+   - Transcribe the 18 message constructors. They clamp their arguments and post, so the payload
+     layout is in each one.
+   - Read each gameplay caller to learn which skater state feeds each argument, rather than
+     guessing.
+   - Map that onto the engine's own skating state, and post and update from the same moments.
+   - Check every object against a trace of the same move.
 7. **Grinds and other looping sounds** need the play command's long path (7 above).
 8. **Guest image at runtime.** Development can load the dumped `g_*.bin`. A release must build
    those regions from the user's own `default.xex` during setup (XEX2 decrypt and decompress). Not
