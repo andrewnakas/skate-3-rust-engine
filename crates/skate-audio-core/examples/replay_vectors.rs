@@ -1147,6 +1147,14 @@ fn main() {
                     .map(|r| Some(r as u32))
                     .map_err(|e| e.to_string())
             }
+            "sub_82B43340" => dsp::ramps::sine_ramp(
+                &mut g, &mut mathlib::Image, v.r3, v.r6 as i32, v.r7 as i32,
+                f64::from_bits(v.f[0]), f64::from_bits(v.f[1]))
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
+            "sub_82B238A8" => gains::advance_gain_ramp(&mut g, &mut mathlib::Image, v.r3, v.r4)
+                .map(|r| Some(r as u32))
+                .map_err(|e| e.to_string()),
             // The evaluator's opcode table: every ported slot is `fn(&mut Guest, u32) -> u64` with the
             // operand block in r3, so one arm covers all of them by looking the name up.
             name if eval::TABLE.iter().any(|slot| slot.name == name && slot.port.is_some()) => {

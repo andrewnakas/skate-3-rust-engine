@@ -56,6 +56,8 @@ fn int_to_single(v: i32) -> f64 {
 /// `dst`, four vector stores at a time while whole groups remain, then one store replicated over the
 /// rest by a forward copy. Nothing for `units <= 0`.
 unsafe fn fill_vector_units(g: &mut Guest, dst: u32, units: i32, value: __m128) -> Result<()> {
+    // SAFETY: the callers check vmx support; every guest access is bounds-checked.
+    unsafe {
     let bulk = aligned4(units);
     if bulk > 0 {
         let mut p = dst.wrapping_add(32);
@@ -77,6 +79,7 @@ unsafe fn fill_vector_units(g: &mut Guest, dst: u32, units: i32, value: __m128) 
     }
     Ok(())
 }
+}
 
 /// What both writers do before their vector bodies: the flat `start` lead-in below index zero, then
 /// the linear alignment padding. Returns the index and cursor the bodies start from. `threshold` is
@@ -91,6 +94,8 @@ unsafe fn lead_in(
     ramp: (f64, f64, f64, f64, f64),
     threshold: Option<f64>,
 ) -> Result<(i32, u32)> {
+    // SAFETY: the callers check vmx support; every guest access is bounds-checked.
+    unsafe {
     let (start, end, step, length_f, delta) = ramp;
     let (mut index, mut cursor) = (first, out);
     if index >= 0 {
@@ -142,6 +147,7 @@ unsafe fn lead_in(
     }
     Ok((index, cursor))
 }
+}
 
 /// Past the ramp: single `end` entries until the count left is a multiple of four, then the
 /// 16-byte fill for the unit count taken **before** that loop trimmed it, as the original's `r5`.
@@ -153,6 +159,8 @@ unsafe fn trailing_fill(
     block_last: i32,
     end: f64,
 ) -> Result<()> {
+    // SAFETY: the callers check vmx support; every guest access is bounds-checked.
+    unsafe {
     if tail_index > block_last {
         return Ok(());
     }
@@ -173,13 +181,17 @@ unsafe fn trailing_fill(
     fpscr.disable_flush_mode_unconditional();
     fill_vector_units(g, cursor, units, _mm_set1_ps(end as f32))
 }
+}
 
 /// `stfs float(i+1..i+4)` into the frame, read back by `lvx128`: the lane reversal puts `i + 4` in
 /// lane 0.
 unsafe fn index_vector(index: i32) -> __m128 {
+    // SAFETY: the callers check vmx support; every guest access is bounds-checked.
+    unsafe {
     let i0 = index as u32;
     let f = |k: u32| int_to_single(i0.wrapping_add(k) as i32) as f32;
     _mm_setr_ps(f(4), f(3), f(2), f(1))
+}
 }
 
 /// The ramp span in whole vectors, and those taken four at a time.
@@ -263,13 +275,18 @@ pub fn linear_ramp(g: &mut Guest, out: u32, first: i32, length: i32, start: f64,
 
 /// `vspltisw128 1 ; vcsxwfp128 v0,v61,1` — 0.5 in every lane, kept as the lifted expression.
 unsafe fn half_vector() -> __m128 {
+    // SAFETY: the callers check vmx support; every guest access is bounds-checked.
+    unsafe {
     _mm_mul_ps(_mm_cvtepi32_ps(_mm_set1_epi32(1)), _mm_castsi128_ps(_mm_set1_epi32(0x3F00_0000)))
+}
 }
 
 /// The vector square root: the `vrsqrtefp` estimate, one Newton step, and a mask selecting `x` in
 /// exactly the lanes where the estimate cannot be refined (`+0` and `+inf`, their own roots). Every
 /// multiply is separate and both multiply-adds round twice; the operand order is the lifted one.
 unsafe fn sqrt_vector(x: __m128, half: __m128) -> __m128 {
+    // SAFETY: the callers check vmx support; every guest access is bounds-checked.
+    unsafe {
     let e = vmx::vrsqrtefp(x); // vrsqrtefp128 v13,v63
     let scaled = _mm_mul_ps(x, half); // vmulfp128 v10,v63,v0
     let square = _mm_mul_ps(e, e); // vmulfp128 v7,v13,v13
@@ -283,6 +300,7 @@ unsafe fn sqrt_vector(x: __m128, half: __m128) -> __m128 {
         _mm_andnot_si128(mask, _mm_castps_si128(product)),
         _mm_and_si128(mask, _mm_castps_si128(x)),
     )) // vsel v2,v12,v4,v31
+}
 }
 
 /// The square-root ramp writer (`sub_82B42C98`). Returns 1.
@@ -365,6 +383,119 @@ pub fn sqrt_ramp(g: &mut Guest, out: u32, first: i32, length: i32, start: f64, e
                 } else {
                     let back = fp::sub_single(length_f, int_to_single(n)); // frsp ; fsubs
                     fp::nmsub_single(fp::sqrt_single(back), step, end) // fsqrts ; fnmsubs
+                };
+                n = n.wrapping_add(1);
+                fp::store_single(g, cursor, value)?;
+                cursor = cursor.wrapping_add(4);
+            }
+        }
+        trailing_fill(g, &mut fpscr, cursor, tail_index, block_last, end)?;
+    }
+    Ok(1) // li r3,1
+}
+
+// ===================================================== sub_82B43340: the sine-curve writer
+
+/// `lis -32250 ; lfs f13,3140(r10)` — the phase step's numerator.
+pub const RAMP_ANGLE_NUMERATOR: u32 = (((-32250i32 as u32) & 0xFFFF) << 16) + 3140;
+/// `addi r9,r10,3140 ; lfs f0,12(r9)` — the length's scale in the phase step's denominator.
+pub const RAMP_ANGLE_LENGTH_SCALE: u32 = RAMP_ANGLE_NUMERATOR + 12;
+const _: () = assert!(RAMP_ANGLE_NUMERATOR == 0x8206_0C44);
+
+/// The four-lane sine kernel on a vector register's lanes.
+unsafe fn sine_lanes(g: &Guest, x: __m128) -> Result<__m128> {
+    // SAFETY: plain lane copies; the kernel checks vmx support itself.
+    unsafe {
+        let mut lanes = [0u32; 4];
+        _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, _mm_castps_si128(x));
+        let s = crate::dsp::sine::sine4_value(g, lanes)?; // bl 0x824531c8
+        Ok(_mm_castsi128_ps(_mm_loadu_si128(s.as_ptr() as *const __m128i)))
+    }
+}
+
+/// The sine-curve ramp writer (`sub_82B43340`). Returns 1.
+///
+/// The siblings' arguments, lead-in, flat fills and window, with the phase step
+/// `k / (float(length) * c)` and the curve `fma(sin(step * (i + 1)), delta, start)` — or, descending,
+/// `end - sin(step * (length - (i + 1))) * delta` in the scalar tail and the lifted vector form
+/// `delta * sin((-step) * (length - idx)) + end` in the body. The vector sine is
+/// [`crate::dsp::sine::sine4_value`], the scalar one `trig`. Its alignment padding is linear in the
+/// phase step, as in both siblings.
+pub fn sine_ramp<T: crate::mathlib::Trig>(
+    g: &mut Guest,
+    trig: &mut T,
+    out: u32,
+    first: i32,
+    length: i32,
+    start: f64,
+    end: f64,
+) -> Result<u64> {
+    if !vmx::supported() {
+        return Err(vmx::unsupported());
+    }
+    let (block_last, last) = block_bounds(first, length);
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let delta = fp::sub_single(end, start); // fsubs f29,f2,f1
+    let length_f = int_to_single(length); // fcfid ; frsp f30
+    let length_scale = fp::load_single(g, RAMP_ANGLE_LENGTH_SCALE)?; // lfs f0,12(r9)
+    let numerator = fp::load_single(g, RAMP_ANGLE_NUMERATOR)?; // lfs f13,3140(r10)
+    let threshold = fp::load_single(g, RAMP_THRESHOLD)?; // lfs f26,23056(r8)
+    let step = fp::div_single(numerator, fp::mul_single(length_f, length_scale)); // fmuls ; fdivs f31
+    // SAFETY: vmx support was checked above; guest accesses are bounds-checked.
+    unsafe {
+        let ramp = (start, end, step, length_f, delta);
+        let (index, mut cursor) = lead_in(g, &mut fpscr, out, first, last, ramp, Some(threshold))?;
+        fpscr.disable_flush_mode_unconditional();
+        let step_v = _mm_set1_ps(step as f32);
+        let delta_v = _mm_set1_ps(delta as f32);
+        let start_v = _mm_set1_ps(start as f32);
+        let idx = index_vector(index);
+        let (groups, bulk) = groups_for(last, index);
+        let stride_up = vmx::lvx128_ps(g, RAMP_INDEX_STRIDE)?; // lvx128 v123,r0,r9
+        let ascending = !(delta < threshold);
+        let (mut x, stride, angle, base_v) = if ascending {
+            (idx, stride_up, step_v, start_v)
+        } else {
+            let scale = fp::load_single(g, RAMP_DESCENDING_SCALE)?; // lfs f0,-8480(r8)
+            let angle = _mm_set1_ps(fp::mul_single(step, scale) as f32); // fmuls f0,f31,f0
+            let base_v = _mm_set1_ps(end as f32);
+            let length_v = _mm_set1_ps(length_f as f32);
+            fpscr.enable_flush_mode(); // vsubfp128 v127,v63,v62
+            let stride = _mm_castsi128_ps(_mm_set1_epi32(0xC080_0000u32 as i32)); // lis r11,-16256
+            (_mm_sub_ps(length_v, idx), stride, angle, base_v)
+        };
+        // Four vectors a pass while whole passes remain, then one at a time: the same count either way.
+        let vectors = bulk.max(0) + (groups - bulk).max(0);
+        for _ in 0..vectors {
+            fpscr.enable_flush_mode_unconditional();
+            let arg = _mm_mul_ps(angle, x); // vmulfp128 v1,v126,v127
+            let s = sine_lanes(g, arg)?; // bl 0x824531c8
+            fpscr.enable_flush_mode_unconditional();
+            x = _mm_add_ps(x, stride); // vaddfp128 v127,v127,v123
+            let a = vmx::vmaddfp(delta_v, s, base_v); // vmaddfp v0,v125,v0,v124
+            vmx::stvx128_ps(g, cursor, a)?;
+            cursor = cursor.wrapping_add(16);
+        }
+        let mut tail_index = (index as u32).wrapping_add((groups as u32) << 2) as i32;
+        fpscr.disable_flush_mode_unconditional();
+        if tail_index <= last {
+            let passes = (last.wrapping_sub(tail_index) as u32).wrapping_add(1);
+            let mut n = (tail_index as u32).wrapping_add(1) as i32;
+            tail_index = (tail_index as u32).wrapping_add(passes) as i32;
+            for _ in 0..passes {
+                fpscr.disable_flush_mode_unconditional();
+                let arg = if ascending {
+                    fp::mul_single(int_to_single(n), step) // fmuls f1,f12,f31
+                } else {
+                    fp::mul_single(fp::sub_single(length_f, int_to_single(n)), step) // fsubs ; fmuls
+                };
+                let s = fp::frsp(trig.sine(g, arg)?); // bl 0x82f4ded0 ; frsp
+                fpscr.disable_flush_mode_unconditional();
+                let value = if ascending {
+                    fp::fmadd_single(s, delta, start) // fmadds f10,f11,f29,f28
+                } else {
+                    fp::nmsub_single(s, delta, end) // fnmsubs f9,f10,f29,f27
                 };
                 n = n.wrapping_add(1);
                 fp::store_single(g, cursor, value)?;
@@ -482,5 +613,63 @@ mod tests {
             let want = ((255 - i) as f32).sqrt();
             assert!((v - want).abs() <= want.max(1.0) * 1e-4, "entry {i}: {v} against {want}");
         }
+    }
+}
+
+#[cfg(test)]
+mod sine_ramp_tests {
+    use super::*;
+    use crate::mathlib::tests::Scripted;
+
+    const BASE: u32 = 0x4000_0000;
+    const OUT: u32 = BASE + 0x100;
+
+    /// The sine kernel's pool, the ramp constants, and a numerator of pi/2 over a length scale of 1.
+    fn guest() -> Guest {
+        let mut g = crate::dsp::sine::tests::image();
+        g.put(BASE, vec![0u8; 0x1000]);
+        g.put(0x8206_0000, vec![0u8; 0x1000]);
+        g.put(0x8216_0000, vec![0u8; 0x10000]);
+        g.put(0x8231_B000, vec![0u8; 0x1000]);
+        let cell = |g: &mut Guest, at: u32, v: f32| g.set_u32(at, v.to_bits()).unwrap();
+        cell(&mut g, RAMP_ANGLE_NUMERATOR, core::f32::consts::FRAC_PI_2);
+        cell(&mut g, RAMP_ANGLE_LENGTH_SCALE, 1.0);
+        cell(&mut g, RAMP_THRESHOLD, 0.0);
+        cell(&mut g, RAMP_DESCENDING_SCALE, -1.0);
+        for k in 0..4 {
+            cell(&mut g, RAMP_INDEX_STRIDE + 4 * k, 4.0);
+        }
+        g
+    }
+
+    fn out(g: &Guest, n: u32) -> Vec<f32> {
+        (0..n).map(|k| g.f32(OUT + 4 * k).unwrap()).collect()
+    }
+
+    fn scripted(sine: f64) -> Scripted {
+        Scripted { sine, cosine: 0.0, asked: vec![] }
+    }
+
+    #[test]
+    fn a_quarter_period_over_the_block_tracks_the_sine() {
+        let mut g = guest();
+        assert_eq!(sine_ramp(&mut g, &mut scripted(0.0), OUT, 0, 256, 0.0, 1.0).unwrap(), 1);
+        let step = core::f64::consts::FRAC_PI_2 / 256.0;
+        for (i, v) in out(&g, 256).iter().enumerate() {
+            let want = ((i + 1) as f64 * step).sin() as f32;
+            assert!((v - want).abs() < 2e-4, "entry {i}: {v} against {want}");
+        }
+    }
+
+    #[test]
+    fn the_scalar_tail_uses_the_scalar_sine_and_the_block_goes_flat() {
+        // Length 6: one vector of four, two scalar samples through `trig`, then the flat end.
+        let mut g = guest();
+        let mut trig = scripted(0.5);
+        sine_ramp(&mut g, &mut trig, OUT, 0, 6, 0.0, 2.0).unwrap();
+        let o = out(&g, 256);
+        assert_eq!((o[4], o[5]), (1.0, 1.0), "0 + 0.5 * 2 from the scripted sine");
+        assert_eq!(trig.asked.len(), 2);
+        assert!(o[6..].iter().all(|v| *v == 2.0));
     }
 }

@@ -220,7 +220,7 @@ unsafe fn lanes_ps(v: __m128) -> [u32; 4] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The four coefficient vectors as they appear in the validated image dump, guest word order
@@ -231,7 +231,7 @@ mod tests {
     const C_WORDS: [u32; 4] = [0x3638_EF1D, 0xB2D7_322B, 0x2F30_9231, 0xAB57_3F9F];
     const D_WORDS: [u32; 4] = [0x274A_963C, 0xA317_A4DA, 0x1EB8_DC78, 0x9A3B_0DA1];
 
-    fn image() -> Guest {
+    pub(crate) fn image() -> Guest {
         // 0x822F97C0 .. 0x822F9860 covers all four vectors in one span.
         let mut g = Guest::single(VECTOR_B, 0xA0);
         for (base, words) in

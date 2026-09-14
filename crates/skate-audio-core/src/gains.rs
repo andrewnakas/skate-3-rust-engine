@@ -785,6 +785,218 @@ pub fn republish_mix<T: crate::mathlib::Trig>(
     Ok(1) // li r3,1
 }
 
+// ====================================================== sub_82B238A8: advancing a voice's gain ramp
+
+/// `lbz r11,41(r31)` — channels to scale, reloaded after every channel.
+pub const VOICE_RAMP_CHANNELS: u32 = 0x29;
+/// `stw r10,48(r31)` — stamped with `0x7FF7FFF1` on the way out.
+pub const VOICE_RAMP_LAST_WORD: u32 = 0x30;
+/// `stfs f0,52(r31)` — the block's last envelope sample.
+pub const VOICE_RAMP_LAST_GAIN: u32 = 0x34;
+/// `lfd f10,56(r3)` — latched into [`VOICE_RAMP_TIME`] on a start request.
+pub const VOICE_RAMP_START_TIME: u32 = 0x38;
+/// `lfs f0,64(r3)` — the requested length, in seconds.
+pub const VOICE_RAMP_REQUEST_SPAN: u32 = 0x40;
+/// `lfs f9,68(r3)` — the requested end value.
+pub const VOICE_RAMP_REQUEST_EXTRA: u32 = 0x44;
+/// `lwz r10,72(r3)` — the requested curve, narrowed to [`VOICE_RAMP_CURVE`].
+pub const VOICE_RAMP_REQUEST_CURVE: u32 = 0x48;
+/// `stfd f10,80(r3)` — the ramp's start time.
+pub const VOICE_RAMP_TIME: u32 = 0x50;
+/// `stfs f0,88(r3)` — a copy of the requested span.
+pub const VOICE_RAMP_SPAN_COPY: u32 = 0x58;
+/// `stw r9,92(r3)` — the ramp length in samples, at least 1.
+pub const VOICE_RAMP_SAMPLES: u32 = 0x5C;
+/// `stw r11,96(r31)` — samples produced so far; starts at or below zero.
+pub const VOICE_RAMP_CURSOR: u32 = 0x60;
+/// `stfs f11,100(r3)` — the gain the ramp starts from.
+pub const VOICE_RAMP_FROM: u32 = 0x64;
+/// `stfs f9,104(r3)` — the gain it ends at.
+pub const VOICE_RAMP_EXTRA: u32 = 0x68;
+/// `lfs f11,108(r3)` — the gain now.
+pub const VOICE_RAMP_CURRENT_GAIN: u32 = 0x6C;
+/// `lbz r10,112(r3)` — 1 when a start request is waiting.
+pub const VOICE_RAMP_START_PENDING: u32 = 0x70;
+/// `lbz r11,113(r31)` — 0 steady, 1 armed, 2 running.
+pub const VOICE_RAMP_STATE: u32 = 0x71;
+/// `lbz r11,114(r31)` — 0 linear, 1 square root, anything else sine.
+pub const VOICE_RAMP_CURVE: u32 = 0x72;
+/// The mix descriptor's `+16`: the time base subtracted from the ramp's start time.
+pub const MIX_DESC_TIME_BASE: u32 = 0x10;
+/// `+28`: the channel-buffer descriptor.
+pub const MIX_DESC_CHANNELS: u32 = 0x1C;
+/// `+32`: the mixer, whose `+4` is the envelope buffer.
+pub const MIX_DESC_MIXER: u32 = 0x20;
+/// `+40`: the clock, whose `+12` is samples per second.
+pub const MIX_DESC_CLOCK: u32 = 0x28;
+/// `lfd f0,256(r10)` — the double the ramp time is compared against.
+pub const VOICE_RAMP_TIME_SENTINEL: u32 = crate::leaves::SENTINEL_DOUBLE;
+/// `lfs f0,-22460(r11)` — the gain a steady voice needs no envelope for.
+pub const VOICE_RAMP_GAIN_SENTINEL: u32 = crate::routing::UNITY_GAIN;
+
+/// Advance a voice's gain ramp for one block and scale all its channels by it (`sub_82B238A8`).
+/// Returns 1.
+///
+/// `state` is `r3` and `desc` the mix descriptor in `r4`. A pending start request latches the ramp's
+/// parameters and arms it, its length `fctiwz(span * rate)` floored at one sample. An armed ramp is
+/// placed from the clock — a cursor of `-(rate * (time - base))`, or dropped if it already finished —
+/// and runs. A running ramp has [`crate::dsp::ramps`]'s curve writer fill the block's 256 envelope
+/// samples and advances the cursor a block; otherwise a gain other than the sentinel fills the envelope
+/// flat, reloading the gain before every store. Then every channel is multiplied by the envelope, 16
+/// samples to a vector with the envelope the first operand, and the last envelope sample becomes the
+/// gain now.
+pub fn advance_gain_ramp<T: crate::mathlib::Trig>(
+    g: &mut Guest,
+    trig: &mut T,
+    state: u32,
+    desc: u32,
+) -> Result<u64> {
+    use crate::fp::{fctiwz_low_word, load_single, mul_single, store_single};
+    use core::arch::x86_64::_mm_mul_ps;
+    let at = |offset: u32| state.wrapping_add(offset);
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let clock = g.u32(desc.wrapping_add(MIX_DESC_CLOCK))?; // lwz r11,40(r4)
+    let rate = load_single(g, clock.wrapping_add(12))?; // lfs f12,12(r11) -- unconditional
+
+    if g.u8(at(VOICE_RAMP_START_PENDING))? == 1 {
+        let span = load_single(g, at(VOICE_RAMP_REQUEST_SPAN))?;
+        let curve = g.u32(at(VOICE_RAMP_REQUEST_CURVE))?;
+        let samples_f = mul_single(span, rate); // fmuls f13,f0,f12
+        let gain = load_single(g, at(VOICE_RAMP_CURRENT_GAIN))?;
+        let start_time = g.u64(at(VOICE_RAMP_START_TIME))?; // lfd f10,56(r3)
+        let extra = load_single(g, at(VOICE_RAMP_REQUEST_EXTRA))?;
+        store_single(g, at(VOICE_RAMP_FROM), gain)?;
+        g.set_u64(at(VOICE_RAMP_TIME), start_time)?; // stfd f10,80(r3)
+        g.set_u8(at(VOICE_RAMP_CURVE), curve as u8)?;
+        store_single(g, at(VOICE_RAMP_SPAN_COPY), span)?;
+        store_single(g, at(VOICE_RAMP_EXTRA), extra)?;
+        let samples = fctiwz_low_word(samples_f);
+        g.set_u32(at(VOICE_RAMP_SAMPLES), samples)?;
+        if samples as i32 <= 0 {
+            g.set_u32(at(VOICE_RAMP_SAMPLES), 1)?;
+        }
+        g.set_u8(at(VOICE_RAMP_STATE), 1)?;
+        g.set_u8(at(VOICE_RAMP_START_PENDING), 0)?;
+    }
+
+    if g.u8(at(VOICE_RAMP_STATE))? == 1 {
+        fpscr.disable_flush_mode_unconditional();
+        let when = f64::from_bits(g.u64(at(VOICE_RAMP_TIME))?); // lfd f13,80(r31)
+        let sentinel = f64::from_bits(g.u64(VOICE_RAMP_TIME_SENTINEL)?); // lfd f0,256(r10)
+        let mut position = sentinel; // f0 survives when the two are equal
+        if when != sentinel {
+            let base_time = f64::from_bits(g.u64(desc.wrapping_add(MIX_DESC_TIME_BASE))?);
+            position = when - base_time; // fsub f0,f13,f0 -- a double, not rounded
+        }
+        fpscr.disable_flush_mode_unconditional();
+        let raw = fctiwz_low_word(rate * position); // fmul f0,f12,f0 ; fctiwz
+        if (raw as i32) < 256 {
+            let samples = g.u32(at(VOICE_RAMP_SAMPLES))?;
+            let cursor = raw.wrapping_neg(); // neg r11,r11
+            g.set_u32(at(VOICE_RAMP_CURSOR), cursor)?;
+            if cursor as i32 > samples.wrapping_sub(1) as i32 {
+                g.set_u8(at(VOICE_RAMP_STATE), 0)?; // already finished
+            } else {
+                if cursor as i32 > 0 {
+                    g.set_u32(at(VOICE_RAMP_CURSOR), 0)?;
+                }
+                g.set_u8(at(VOICE_RAMP_STATE), 2)?;
+            }
+        }
+    }
+
+    let mixer = g.u32(desc.wrapping_add(MIX_DESC_MIXER))?; // lwz r10,32(r4)
+    let ramp_state = g.u8(at(VOICE_RAMP_STATE))?;
+    let channels = g.u32(desc.wrapping_add(MIX_DESC_CHANNELS))?; // lwz r30,28(r4)
+    let envelope = g.u32(mixer.wrapping_add(4))?; // lwz r28,4(r10)
+    if ramp_state != 0 && ramp_state != 1 {
+        let curve = g.u8(at(VOICE_RAMP_CURVE))?;
+        fpscr.disable_flush_mode_unconditional();
+        let end = load_single(g, at(VOICE_RAMP_EXTRA))?; // lfs f2,104(r31)
+        let start = load_single(g, at(VOICE_RAMP_FROM))?; // lfs f1,100(r31)
+        let samples = g.u32(at(VOICE_RAMP_SAMPLES))? as i32;
+        let cursor = g.u32(at(VOICE_RAMP_CURSOR))? as i32;
+        match curve {
+            0 => crate::dsp::ramps::linear_ramp(g, envelope, cursor, samples, start, end)?,
+            1 => crate::dsp::ramps::sqrt_ramp(g, envelope, cursor, samples, start, end)?,
+            _ => crate::dsp::ramps::sine_ramp(g, trig, envelope, cursor, samples, start, end)?,
+        };
+        let advanced = g.u32(at(VOICE_RAMP_CURSOR))?.wrapping_add(256); // reloaded
+        let samples_now = g.u32(at(VOICE_RAMP_SAMPLES))?;
+        g.set_u32(at(VOICE_RAMP_CURSOR), advanced)?;
+        if advanced as i32 >= samples_now as i32 {
+            g.set_u8(at(VOICE_RAMP_STATE), 0)?;
+        }
+    } else {
+        fpscr.disable_flush_mode_unconditional();
+        let gain = load_single(g, at(VOICE_RAMP_CURRENT_GAIN))?;
+        let sentinel = load_single(g, VOICE_RAMP_GAIN_SENTINEL)?;
+        if gain == sentinel {
+            return Ok(1); // beq -- straight out, not one store
+        }
+        let mut cursor = envelope.wrapping_sub(4); // addi r11,r28,-4
+        for _ in 0..32 {
+            fpscr.disable_flush_mode_unconditional();
+            for slot in (4..=32).step_by(4) {
+                let held = load_single(g, at(VOICE_RAMP_CURRENT_GAIN))?; // reloaded every store
+                store_single(g, cursor.wrapping_add(slot), held)?;
+            }
+            cursor = cursor.wrapping_add(32);
+        }
+    }
+
+    let mut count = g.u8(at(VOICE_RAMP_CHANNELS))?; // lbz r11,41(r31)
+    if count != 0 {
+        if !crate::vmx::supported() {
+            return Err(crate::vmx::unsupported());
+        }
+        let row = envelope.wrapping_add(48); // addi r29,r28,48
+        let mut channel = 0u32;
+        loop {
+            let stride = u32::from(g.u16(channels.wrapping_add(14))?); // reloaded per channel
+            let first = g.u32(channels.wrapping_add(4))?;
+            let index = (stride as i32).wrapping_mul(channel as i32) as u32; // mullw
+            let start = first.wrapping_add(index << 2);
+            let mut dst = start.wrapping_add(32);
+            let bias = envelope.wrapping_sub(start); // subf r9,r9,r28
+            let mut src = row;
+            // SAFETY: vmx support was checked above; guest accesses are bounds-checked.
+            unsafe {
+                for _ in 0..16 {
+                    let chan0 = crate::vmx::lvx128_ps(g, dst.wrapping_sub(32))?;
+                    let env0 = crate::vmx::lvx128_ps(g, src.wrapping_sub(48))?;
+                    fpscr.enable_flush_mode_unconditional();
+                    crate::vmx::stvx128_ps(g, dst.wrapping_sub(32), _mm_mul_ps(env0, chan0))?;
+                    let chan1 = crate::vmx::lvx128_ps(g, dst.wrapping_sub(16))?;
+                    let env1 = crate::vmx::lvx128_ps(g, src.wrapping_sub(32))?;
+                    crate::vmx::stvx128_ps(g, dst.wrapping_sub(16), _mm_mul_ps(env1, chan1))?;
+                    let env2 = crate::vmx::lvx128_ps(g, bias.wrapping_add(dst))?;
+                    let chan2 = crate::vmx::lvx128_ps(g, dst)?;
+                    crate::vmx::stvx128_ps(g, dst, _mm_mul_ps(env2, chan2))?;
+                    let env3 = crate::vmx::lvx128_ps(g, src)?;
+                    src = src.wrapping_add(64);
+                    let chan3 = crate::vmx::lvx128_ps(g, dst.wrapping_add(16))?;
+                    crate::vmx::stvx128_ps(g, dst.wrapping_add(16), _mm_mul_ps(env3, chan3))?;
+                    dst = dst.wrapping_add(64);
+                }
+            }
+            count = g.u8(at(VOICE_RAMP_CHANNELS))?; // reloaded each pass
+            channel += 1;
+            if channel >= u32::from(count) {
+                break;
+            }
+        }
+    }
+
+    fpscr.disable_flush_mode_unconditional();
+    let last = load_single(g, envelope.wrapping_add(1020))?; // lfs f0,1020(r28)
+    store_single(g, at(VOICE_RAMP_CURRENT_GAIN), last)?;
+    store_single(g, at(VOICE_RAMP_LAST_GAIN), last)?;
+    g.set_u32(at(VOICE_RAMP_LAST_WORD), 0x7FF7_FFF1)?; // lis r11,32759 ; ori
+    Ok(1) // li r3,1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1491,5 +1703,89 @@ mod tests {
         }
         assert_eq!(mixer_words(&g), mixer_words(&h));
         swapped(&g);
+    }
+}
+
+#[cfg(test)]
+mod gain_ramp_advance_tests {
+    use super::*;
+    use crate::mathlib::tests::Scripted;
+
+    const BASE: u32 = 0x4000_0000;
+    const STATE: u32 = BASE;
+    const DESC: u32 = BASE + 0x200;
+    const CLOCK: u32 = BASE + 0x300;
+    const MIXER: u32 = BASE + 0x400;
+    const CHANNELS: u32 = BASE + 0x500;
+    const ENVELOPE: u32 = BASE + 0x1000;
+    const CHANNEL0: u32 = BASE + 0x2000;
+
+    /// One channel of 2.0s at 256 samples a second; the gain sentinel 1.0 and the time sentinel -1.
+    fn guest(gain: f32) -> Guest {
+        let mut g = Guest::single(BASE, 0x4000);
+        g.put(crate::routing::UNITY_GAIN, 1.0f32.to_bits().to_be_bytes().to_vec());
+        g.put(VOICE_RAMP_TIME_SENTINEL, (-1.0f64).to_bits().to_be_bytes().to_vec());
+        g.put(crate::leaves::ZERO_CELL, 0.0f32.to_bits().to_be_bytes().to_vec());
+        g.put(crate::dsp::ramps::RAMP_INDEX_STRIDE, [4.0f32; 4].iter().flat_map(|v| v.to_bits().to_be_bytes()).collect());
+        g.set_u32(DESC + MIX_DESC_CLOCK, CLOCK).unwrap();
+        g.set_u32(CLOCK + 12, 256.0f32.to_bits()).unwrap();
+        g.set_u32(DESC + MIX_DESC_MIXER, MIXER).unwrap();
+        g.set_u32(MIXER + 4, ENVELOPE).unwrap();
+        g.set_u32(DESC + MIX_DESC_CHANNELS, CHANNELS).unwrap();
+        g.set_u32(CHANNELS + 4, CHANNEL0).unwrap();
+        g.set_u16(CHANNELS + 14, 256).unwrap();
+        g.set_u8(STATE + VOICE_RAMP_CHANNELS, 1).unwrap();
+        g.set_u32(STATE + VOICE_RAMP_CURRENT_GAIN, gain.to_bits()).unwrap();
+        for i in 0..256u32 {
+            g.set_u32(CHANNEL0 + 4 * i, 2.0f32.to_bits()).unwrap();
+            g.set_u32(ENVELOPE + 4 * i, 0x7777_7777).unwrap();
+        }
+        g
+    }
+
+    fn trig() -> Scripted {
+        Scripted { sine: 0.0, cosine: 0.0, asked: vec![] }
+    }
+
+    #[test]
+    fn a_steady_voice_at_the_sentinel_gain_changes_nothing() {
+        let mut g = guest(1.0);
+        assert_eq!(advance_gain_ramp(&mut g, &mut trig(), STATE, DESC).unwrap(), 1);
+        assert_eq!(g.u32(ENVELOPE).unwrap(), 0x7777_7777);
+        assert_eq!(g.f32(CHANNEL0).unwrap(), 2.0);
+        assert_eq!(g.u32(STATE + VOICE_RAMP_LAST_WORD).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_steady_gain_fills_the_envelope_and_scales_the_channel() {
+        let mut g = guest(0.5);
+        advance_gain_ramp(&mut g, &mut trig(), STATE, DESC).unwrap();
+        assert!((0..256).all(|i| g.f32(ENVELOPE + 4 * i).unwrap() == 0.5));
+        assert!((0..256).all(|i| g.f32(CHANNEL0 + 4 * i).unwrap() == 1.0));
+        assert_eq!(g.f32(STATE + VOICE_RAMP_CURRENT_GAIN).unwrap(), 0.5);
+        assert_eq!(g.u32(STATE + VOICE_RAMP_LAST_WORD).unwrap(), 0x7FF7_FFF1);
+    }
+
+    #[test]
+    fn a_start_request_runs_a_one_block_linear_ramp_to_its_end() {
+        let mut g = guest(0.0);
+        g.set_u8(STATE + VOICE_RAMP_START_PENDING, 1).unwrap();
+        g.set_u32(STATE + VOICE_RAMP_REQUEST_SPAN, 1.0f32.to_bits()).unwrap(); // 256 samples
+        g.set_u32(STATE + VOICE_RAMP_REQUEST_EXTRA, 256.0f32.to_bits()).unwrap();
+        g.set_u32(STATE + VOICE_RAMP_REQUEST_CURVE, 0).unwrap();
+        g.set_u64(STATE + VOICE_RAMP_START_TIME, 10.0f64.to_bits()).unwrap();
+        g.set_u64(DESC + MIX_DESC_TIME_BASE, 10.0f64.to_bits()).unwrap();
+        let mut h = g.clone();
+        advance_gain_ramp(&mut g, &mut trig(), STATE, DESC).unwrap();
+        crate::dsp::ramps::linear_ramp(&mut h, ENVELOPE, 0, 256, 0.0, 256.0).unwrap();
+        for i in 0..256u32 {
+            assert_eq!(g.u32(ENVELOPE + 4 * i).unwrap(), h.u32(ENVELOPE + 4 * i).unwrap(), "envelope {i}");
+            let scaled = h.f32(ENVELOPE + 4 * i).unwrap() * 2.0;
+            assert_eq!(g.f32(CHANNEL0 + 4 * i).unwrap(), scaled, "channel {i}");
+        }
+        assert_eq!(g.u32(STATE + VOICE_RAMP_SAMPLES).unwrap(), 256);
+        assert_eq!(g.u32(STATE + VOICE_RAMP_CURSOR).unwrap(), 256);
+        assert_eq!(g.u8(STATE + VOICE_RAMP_STATE).unwrap(), 0, "the ramp finished within the block");
+        assert_eq!(g.f32(STATE + VOICE_RAMP_CURRENT_GAIN).unwrap(), 256.0);
     }
 }
