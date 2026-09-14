@@ -15,7 +15,7 @@ than at a misunderstanding of the engine.
 | `buffers.rs` | buffer-pair init | **214 replayed** |
 | `fp.rs` | the guest's scalar FP idioms: `lfs`/`lfd`/`stfs`, `fcfid`/`frsp`, the single-rounded forms, `fsqrts`, `fmsubs`, `fabs`/`fneg`, `fsel`, `fctiwz`, `fctidz`, `rlwinm` | unit-tested only |
 | `spatial.rs` | `sub_82B453D8`, `sub_82B269C0`, `sub_82B454B8`, `sub_82B45788`, `sub_82B45B60`: a source's position becoming a gain per speaker — the unit-disc clamp, the panner placement, distance panning, the seven-sector angular pass, and the power-normalised scale | **2,369 replayed**, all five (474 + 473 + 473 + 482 + 467); `sub_82B45C50`, which lays a source's panner entries out about a centre point (a mirrored pair, or spread pairs, by count), and `sub_82B460A0`, which fills the 8x8 mix matrix from them, unit-tested against direct calls to the five spatial bodies they compose, recording pending |
-| `gains.rs` | `sub_82B29AF0`, `sub_82B23B50` and `sub_82B298E0`: the channel gain matrix, the per-channel gain ramp, and the matrix applied through a ramp, all driving `dsp/` kernels over a `+4`/`+14` channel descriptor | **1,384 replayed** (795 + 185 + 404) |
+| `gains.rs` | `sub_82B29AF0`, `sub_82B23B50` and `sub_82B298E0`: the channel gain matrix, the per-channel gain ramp, and the matrix applied through a ramp, all driving `dsp/` kernels over a `+4`/`+14` channel descriptor | **1,384 replayed** (795 + 185 + 404); `sub_82B29BE0`, which republishes a source's spatial mix — re-lays the panners and the matrix when a cached placement parameter moved (or the flag asks), then mixes hard or ramps out of the matrix it saved in its frame, and swaps the pair — unit-tested against direct calls to what it composes, recording pending |
 | `mathlib.rs` | `sub_82F4DE80` (`floor`, 2.87 M calls a boot — the hottest body ported anywhere in this project), `Image`'s sine (`sub_82F4DED0`) and cosine (`sub_82F4DFB0`), `log10` (`sub_82F55068`) with the natural log `sub_82F54ED8` under it, and `atan2` (`sub_82F52318`) — the last four ported beyond the 216 because callers here needed them | **10,015 replayed** (2,000 floor + 999 sine + 1,001 cosine + 3,000 log10 + 3,015 atan2), all compared by the bits of the returned `f1` |
 | `counter.rs` | `sub_82B1F360`, the six-word cascading counter the evaluator draws from | **7,479 replayed** — recorded in two sessions on 2026-09-12 and replayable all along; it lacked only a replay arm |
 | `eval/` | the expression evaluator's 40-slot opcode table at guest `0x82FD3600` — **31 slots**, every one that has a verified C++ body | verified C++ reference; unit-tested only |
@@ -47,7 +47,7 @@ than at a misunderstanding of the engine.
 | `meters.rs` | `sub_82B373C8` and `sub_82B376B8`: per-channel mean-square and peak meters over one quarter of each block — four accumulators fed the same vector, so the sum is four times the squares, as the original computes it — kept in ring histories; and the tick that re-sizes the rings when the rate moves, then runs the meters and the layout expansion | unit-tested, recording pending |
 | `mem.rs` | the write-set contract of `sub_82EDF460` (memcpy) and `sub_82EE5E80` (memset), which six of the bodies above call | not a port; see its module note |
 
-`cargo test` runs 565 unit tests. **Read the next two sections before reading that as one number:
+`cargo test` runs 568 unit tests. **Read the next two sections before reading that as one number:
 the modules are checked in different ways, and only the ones whose table row gives a replay figure
 have one.**
 

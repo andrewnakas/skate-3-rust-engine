@@ -1008,6 +1008,23 @@ fn main() {
                     .map(|_| None)
                     .map_err(|e| e.to_string())
             }
+            // The republish keeps a 496-byte frame whose saved matrix the ramp reads, with the ramp's
+            // own frame and the panner layout's below it.
+            "sub_82B29BE0" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where the saved matrix lives", v.run));
+                }
+                continue;
+            }
+            "sub_82B29BE0" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                let depth = gains::REPUBLISH_STACK_DEPTH;
+                g.put(sp.wrapping_sub(depth), vec![0u8; depth as usize]);
+                gains::republish_mix(&mut g, &mut mathlib::Image, v.r3, v.r4, v.r5, sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
             // The evaluator's opcode table: every ported slot is `fn(&mut Guest, u32) -> u64` with the
             // operand block in r3, so one arm covers all of them by looking the name up.
             name if eval::TABLE.iter().any(|slot| slot.name == name && slot.port.is_some()) => {

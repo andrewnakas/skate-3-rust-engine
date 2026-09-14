@@ -639,6 +639,152 @@ pub fn ramp_gain_matrix(
     Ok(last)
 }
 
+// ================================================== sub_82B29BE0: republishing the spatial mix
+
+/// `lfs f31,52(r3)` — the first of the ten live placement parameters, 8 bytes apart.
+pub const LIVE_FIRST: u32 = 52;
+/// The stride between live parameters.
+pub const LIVE_STRIDE: u32 = 8;
+/// Ten live parameters, and ten cached copies.
+pub const LIVE_COUNT: u32 = 10;
+/// `addi r3,r31,128` — the configuration [`crate::spatial::fill_mix_matrix`] takes.
+pub const MIX_CONFIG: u32 = 128;
+/// `addi r30,r3,316` — eight panner entries.
+pub const MIX_ENTRIES: u32 = 316;
+/// `addi r10,r31,444` — the 8x8 gain matrix.
+pub const MIX_MATRIX: u32 = 444;
+/// `stfs f30,700(r31)` — the seventh live parameter, stored on the recompute path.
+pub const MIX_COMPARED: u32 = 700;
+/// The ten cached parameters, 4 bytes apart.
+pub const MIX_CACHED: u32 = 704;
+/// `lfs f4,744(r31)` — the matrix fill's gain.
+pub const MIX_TAIL: u32 = 744;
+/// `lwz r28,28(r4)` — the descriptor this call mixes from.
+pub const REPUBLISH_PAIR_BACK: u32 = 28;
+/// `lwz r27,32(r4)` — the descriptor it mixes into.
+pub const REPUBLISH_PAIR_FRONT: u32 = 32;
+/// `stwu r1,-496(r1)`. Real: the saved matrix at `r1+96` is handed to [`ramp_gain_matrix`].
+pub const REPUBLISH_FRAME_BYTES: u32 = 496;
+/// `addi r6,r1,96` — the saved matrix, 32 bytes a source row.
+pub const REPUBLISH_SAVED: u32 = 96;
+/// The deepest stack the call reaches: its own frame and [`ramp_gain_matrix`]'s below it.
+pub const REPUBLISH_STACK_DEPTH: u32 = REPUBLISH_FRAME_BYTES + RAMP_FRAME_BYTES;
+
+/// Recompute the panner entries, then the matrix from them. The source count is reloaded for the
+/// matrix, after the layout's stores.
+fn recompute_placement<T: crate::mathlib::Trig>(
+    g: &mut Guest,
+    trig: &mut T,
+    mixer: u32,
+    count: u32,
+    live: &[f64; LIVE_COUNT as usize],
+    frame: u32,
+) -> Result<()> {
+    let layout = crate::spatial::PannerLayout {
+        angle: live[0],
+        distance: live[1],
+        radius: live[2],
+        turn: live[3],
+        spreads: [live[7], live[8], live[9]],
+    };
+    let entries = mixer.wrapping_add(MIX_ENTRIES);
+    crate::spatial::lay_out_panners(g, trig, entries, count as i32, layout, frame)?; // bl 0x82b45c50
+    let tail = fp::load_single(g, mixer.wrapping_add(MIX_TAIL))?; // lfs f4,744(r31)
+    let sources = g.u32(mixer.wrapping_add(SOURCE_COUNT))? as i32; // lwz r5,748(r31)
+    let gains = crate::spatial::MatrixGains { weight: live[5], focus: live[4], fill: live[6], gain: tail };
+    let config = mixer.wrapping_add(MIX_CONFIG);
+    let matrix = mixer.wrapping_add(MIX_MATRIX);
+    crate::spatial::fill_mix_matrix(g, trig, config, entries, sources, matrix, gains) // bl 0x82b460a0
+}
+
+/// Republish a source's spatial mix (`sub_82B29BE0`). Returns 1.
+///
+/// `mixer` is `r3`, `pair` the two-descriptor pair in `r4`, `flag` `r5` (only its low byte is
+/// tested) and `sp` `r1`. The ten live placement parameters are compared with their cached copies,
+/// stopping at the first that differs; a NaN always differs.
+///
+/// - **Nothing moved:** the panners and the matrix are recomputed only if the flag asks, then the
+///   hard mix [`apply_gain_matrix`] runs. Nothing is cached.
+/// - **Something moved:** the seventh parameter is stored at +700, the matrix is saved into the
+///   frame row by row (every row's eight loads before its eight stores, for as many rows as the
+///   source count says, eight or not), the panners and matrix are recomputed, and the flag picks
+///   the hard mix or [`ramp_gain_matrix`] out of the saved matrix. Then the ten parameters are cached.
+///
+/// Either way the pair is swapped, both words **reloaded** first.
+pub fn republish_mix<T: crate::mathlib::Trig>(
+    g: &mut Guest,
+    trig: &mut T,
+    mixer: u32,
+    pair: u32,
+    flag: u32,
+    sp: u32,
+) -> Result<u64> {
+    let frame = sp.wrapping_sub(REPUBLISH_FRAME_BYTES);
+    g.set_u32(frame, sp)?; // stwu r1,-496(r1)
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let mut live = [0.0f64; LIVE_COUNT as usize];
+    for (i, value) in live.iter_mut().enumerate() {
+        *value = fp::load_single(g, mixer.wrapping_add(LIVE_FIRST + LIVE_STRIDE * i as u32))?;
+    }
+    let back = g.u32(pair.wrapping_add(REPUBLISH_PAIR_BACK))?; // lwz r28,28(r4)
+    let front = g.u32(pair.wrapping_add(REPUBLISH_PAIR_FRONT))?; // lwz r27,32(r4)
+    let mut unchanged = true;
+    for (i, value) in live.iter().enumerate() {
+        if *value != fp::load_single(g, mixer.wrapping_add(MIX_CACHED + 4 * i as u32))? {
+            unchanged = false; // fcmpu ; bne -- the first difference ends the compare
+            break;
+        }
+    }
+
+    if unchanged {
+        if flag & 0xFF != 0 {
+            let count = g.u32(mixer.wrapping_add(SOURCE_COUNT))?; // lwz r4,748(r3)
+            recompute_placement(g, trig, mixer, count, &live, frame)?;
+        }
+        apply_gain_matrix(g, mixer, front, back)?; // loc_82B29D04: bl 0x82b29af0
+    } else {
+        // loc_82B29D18
+        let count = g.u32(mixer.wrapping_add(SOURCE_COUNT))?; // lwz r4,748(r31)
+        fp::store_single(g, mixer.wrapping_add(MIX_COMPARED), live[6])?; // stfs f30,700(r31)
+        if count as i32 > 0 {
+            let mut src = mixer.wrapping_add(MIX_MATRIX).wrapping_sub(4); // addi r11,r31,440
+            let mut dst = frame.wrapping_add(REPUBLISH_SAVED).wrapping_sub(4); // addi r10,r1,92
+            for _ in 0..count {
+                let mut row = [0.0f64; 8];
+                for (k, word) in row.iter_mut().take(7).enumerate() {
+                    *word = fp::load_single(g, src.wrapping_add(4 + 4 * k as u32))?; // lfs 4..28(r11)
+                }
+                src = src.wrapping_add(32); // lfsu f0,32(r11)
+                row[7] = fp::load_single(g, src)?;
+                for (k, word) in row.iter().take(7).enumerate() {
+                    fp::store_single(g, dst.wrapping_add(4 + 4 * k as u32), *word)?; // stfs 4..28(r10)
+                }
+                dst = dst.wrapping_add(32); // stfsu f0,32(r10)
+                fp::store_single(g, dst, row[7])?;
+            }
+        }
+        recompute_placement(g, trig, mixer, count, &live, frame)?;
+        if flag & 0xFF != 0 {
+            apply_gain_matrix(g, mixer, front, back)?; // bl 0x82b29af0
+        } else {
+            let saved = frame.wrapping_add(REPUBLISH_SAVED); // addi r6,r1,96
+            ramp_gain_matrix(g, mixer, front, back, saved, frame)?; // bl 0x82b298e0
+        }
+        fpscr.disable_flush_mode_unconditional();
+        for (i, value) in live.iter().enumerate() {
+            fp::store_single(g, mixer.wrapping_add(MIX_CACHED + 4 * i as u32), *value)?; // stfs 704..740
+        }
+    }
+
+    // loc_82B29E18: both words reloaded, then swapped.
+    let swap_front = g.u32(pair.wrapping_add(REPUBLISH_PAIR_FRONT))?; // lwz r11,32(r26)
+    let swap_back = g.u32(pair.wrapping_add(REPUBLISH_PAIR_BACK))?; // lwz r10,28(r26)
+    g.set_u32(pair.wrapping_add(REPUBLISH_PAIR_BACK), swap_front)?; // stw r11,28(r26)
+    g.set_u32(pair.wrapping_add(REPUBLISH_PAIR_FRONT), swap_back)?; // stw r10,32(r26)
+    Ok(1) // li r3,1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,5 +1383,113 @@ mod tests {
         assert_eq!(crate::vmx::get_mxcsr(), before, "apply_gain_matrix");
         ramp_channels(&mut g, RAMP_OBJ, PAIR, 0).unwrap();
         assert_eq!(crate::vmx::get_mxcsr(), before, "ramp_channels");
+    }
+
+    // ------------------------------------------------------------------ sub_82B29BE0
+
+    const RP_PAIR: u32 = 0x4003_0000;
+    const RP_DESC_BACK: u32 = 0x4003_0100;
+    const RP_DESC_FRONT: u32 = 0x4003_0200;
+    const RP_STACK_TOP: u32 = 0x4005_0000;
+    const RP_LIVE: [f32; 10] = [0.1, 0.5, 0.25, 0.2, 0.5, 2.0, 0.75, 0.1, 0.3, 0.4];
+
+    /// Set a word whether or not a segment already covers it.
+    fn word(g: &mut Guest, at: u32, w: u32) {
+        if g.set_u32(at, w).is_err() {
+            g.put(at, w.to_be_bytes().to_vec());
+        }
+    }
+
+    /// Two sources, no destinations (so both mixes touch no channel), a stereo configuration for the
+    /// matrix, the panner layout's constants and pools, a stack, and the pair.
+    fn republish_guest(cached_equal: bool) -> Guest {
+        let mut g = guest();
+        g.put(RP_PAIR, vec![0u8; 0x300]);
+        g.put(RP_STACK_TOP - 0x1000, vec![0u8; 0x1000]);
+        for (at, v) in [
+            (crate::spatial::ONE_SINGLE, 1.0f32),
+            (crate::spatial::SNAP_SINGLE, 0.999),
+            (crate::spatial::ZERO_SINGLE, 0.0),
+            (crate::spatial::HALF_SINGLE, 0.5),
+            (crate::spatial::LAYOUT_ANGLE_SCALE, 1.0),
+            (crate::spatial::LAYOUT_SPREAD_SCALE, 1.0),
+            (crate::spatial::LAYOUT_MIRROR_MARKER, 7.0),
+            (crate::spatial::LAYOUT_MIRROR_BIAS, 0.5),
+        ] {
+            word(&mut g, at, v.to_bits());
+        }
+        crate::mathlib::tests::with_atan_pool(&mut g);
+        for (i, v) in RP_LIVE.iter().enumerate() {
+            word(&mut g, MIXER + LIVE_FIRST + LIVE_STRIDE * i as u32, v.to_bits());
+            let cached = if cached_equal { *v } else { v + 1.0 };
+            word(&mut g, MIXER + MIX_CACHED + 4 * i as u32, cached.to_bits());
+        }
+        word(&mut g, MIXER + MIX_COMPARED, 0xDEAD_BEEF);
+        word(&mut g, MIXER + MIX_TAIL, 0.5f32.to_bits());
+        word(&mut g, MIXER + SOURCE_COUNT, 2);
+        word(&mut g, MIXER + DEST_COUNT, 0);
+        word(&mut g, MIXER + MIX_CONFIG + crate::spatial::MATRIX_DEST_COUNT, 2);
+        for k in 0..64u32 {
+            word(&mut g, MIXER + MIX_MATRIX + 4 * k, (k as f32 * 0.01).to_bits());
+        }
+        word(&mut g, RP_PAIR + REPUBLISH_PAIR_BACK, RP_DESC_BACK);
+        word(&mut g, RP_PAIR + REPUBLISH_PAIR_FRONT, RP_DESC_FRONT);
+        g
+    }
+
+    fn scripted() -> crate::mathlib::tests::Scripted {
+        crate::mathlib::tests::Scripted { sine: 0.25, cosine: 0.5, asked: vec![] }
+    }
+
+    fn mixer_words(g: &Guest) -> Vec<u32> {
+        (MIX_ENTRIES / 4..(MIX_TAIL + 12) / 4).map(|k| g.u32(MIXER + 4 * k).unwrap()).collect()
+    }
+
+    fn swapped(g: &Guest) {
+        assert_eq!(g.u32(RP_PAIR + REPUBLISH_PAIR_BACK).unwrap(), RP_DESC_FRONT);
+        assert_eq!(g.u32(RP_PAIR + REPUBLISH_PAIR_FRONT).unwrap(), RP_DESC_BACK);
+    }
+
+    #[test]
+    fn nothing_moved_and_no_flag_only_mixes_and_swaps() {
+        let mut g = republish_guest(true);
+        let before = mixer_words(&g);
+        assert_eq!(republish_mix(&mut g, &mut scripted(), MIXER, RP_PAIR, 0x100, RP_STACK_TOP).unwrap(), 1);
+        assert_eq!(mixer_words(&g), before, "no recompute, no cache, no +700: the flag's low byte is 0");
+        swapped(&g);
+    }
+
+    #[test]
+    fn nothing_moved_with_the_flag_recomputes_without_caching() {
+        let mut g = republish_guest(true);
+        let mut h = g.clone();
+        republish_mix(&mut g, &mut scripted(), MIXER, RP_PAIR, 1, RP_STACK_TOP).unwrap();
+        let live: [f64; 10] = RP_LIVE.map(f64::from);
+        recompute_placement(&mut h, &mut scripted(), MIXER, 2, &live, RP_STACK_TOP - REPUBLISH_FRAME_BYTES).unwrap();
+        assert_eq!(mixer_words(&g), mixer_words(&h));
+        assert_eq!(g.u32(MIXER + MIX_COMPARED).unwrap(), 0xDEAD_BEEF, "+700 only on the moved path");
+    }
+
+    #[test]
+    fn a_moved_parameter_saves_the_matrix_recomputes_ramps_and_caches() {
+        let mut g = republish_guest(false);
+        let mut h = g.clone();
+        let old: Vec<u32> = (0..16).map(|k| g.u32(MIXER + MIX_MATRIX + 4 * k).unwrap()).collect();
+        republish_mix(&mut g, &mut scripted(), MIXER, RP_PAIR, 0, RP_STACK_TOP).unwrap();
+        let frame = RP_STACK_TOP - REPUBLISH_FRAME_BYTES;
+        let saved: Vec<u32> = (0..16).map(|k| g.u32(frame + REPUBLISH_SAVED + 4 * k).unwrap()).collect();
+        assert_eq!(saved, old, "two source rows saved before the recompute overwrote them");
+        let live: [f64; 10] = RP_LIVE.map(f64::from);
+        for k in 0..16u32 {
+            h.set_u32(frame + REPUBLISH_SAVED + 4 * k, old[k as usize]).unwrap();
+        }
+        recompute_placement(&mut h, &mut scripted(), MIXER, 2, &live, frame).unwrap();
+        ramp_gain_matrix(&mut h, MIXER, RP_DESC_FRONT, RP_DESC_BACK, frame + REPUBLISH_SAVED, frame).unwrap();
+        fp::store_single(&mut h, MIXER + MIX_COMPARED, 0.75).unwrap();
+        for (i, v) in RP_LIVE.iter().enumerate() {
+            h.set_u32(MIXER + MIX_CACHED + 4 * i as u32, v.to_bits()).unwrap();
+        }
+        assert_eq!(mixer_words(&g), mixer_words(&h));
+        swapped(&g);
     }
 }
