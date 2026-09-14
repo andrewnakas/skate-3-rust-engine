@@ -600,6 +600,199 @@ pub fn settle_levels(g: &mut Guest, object: u32) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------- sub_82B2F2C8: resampling the bands
+
+const BAND_TABLE: u32 = ((-32239i32 as u32) & 0xFFFF) << 16;
+/// `lis -32239 ; addi 24992` — three segment edges: `+0` low, `+4` mid, `+8` high.
+pub const BAND_EDGES: u32 = BAND_TABLE + 24992;
+/// `addi 25008` — nine knot abscissae, then the rows the two segments blend between.
+pub const BAND_KNOT_X: u32 = BAND_TABLE + 25008;
+/// The row cursor, `BAND_KNOT_X + 104`, read at `-68` and `+4` and moved 72 bytes a segment.
+pub const BAND_KNOT_ROWS: u32 = BAND_KNOT_X + 104;
+const _: () = assert!(BAND_EDGES == 0x8211_61A0 && BAND_KNOT_X == 0x8211_61B0);
+/// `lfs f0,1120(r9)` / `lfs f0,1124(r9)` — the lower and upper segments' rates.
+pub const BAND_RATE_LOWER: u32 = RAMP_POOL + 1120;
+/// The upper segment's rate.
+pub const BAND_RATE_UPPER: u32 = RAMP_POOL + 1124;
+/// `lis -32250 ; lfs 14920` — added to the last band before normalising.
+pub const BAND_HEADROOM: u32 = (((-32250i32 as u32) & 0xFFFF) << 16) + 14920;
+const _: () = assert!(BAND_HEADROOM == 0x8206_3A48);
+/// `lfs f13,68(r3)` / `lfs f0,360(r3)` — equal levels end the call after the resample.
+pub const BAND_CURRENT_LEVEL: u32 = 68;
+/// The level the current one is compared with.
+pub const BAND_TARGET_LEVEL: u32 = 360;
+/// `addi r8,r3,392` — the pending sizes, a stride-12 cursor read at `-4`, `+0` and `+4`.
+pub const BAND_PENDING_SIZES: u32 = 392;
+/// `addi r10,r3,480` — the envelope slots, pre-incremented 36 bytes a store.
+pub const BAND_ENVELOPES: u32 = 480;
+/// `addi r11,r3,720` — two queues of three 60-byte reservation records, 180 bytes a queue.
+pub const BAND_QUEUES: u32 = 720;
+/// The abscissae's red-zone copy, `r1 - 80`; the blended ordinates follow at `r1 - 44`.
+pub const BAND_RED_ZONE: u32 = 80;
+
+/// `addi r7,r9,35 ; rlwinm r7,r7,0,0,26 ; add r10,r7,r10` — the size plus a four-byte header,
+/// rounded up to 32, added to the write position.
+fn reservation_needed(size: u32, pos: u32) -> u32 {
+    (size.wrapping_add(35) & 0xFFFF_FFE0).wrapping_add(pos)
+}
+
+/// `subfc ; eqv ; rlwinm ; addze ; clrlwi ; cmplwi ; bne` — the carry plus sign-equality idiom,
+/// kept in its raw form. It works out to a signed `limit >= needed`.
+fn reservation_fits(limit: u32, needed: u32) -> bool {
+    let carry = u32::from(limit >= needed);
+    let signs_equal = !(needed ^ limit) >> 31;
+    (signs_equal + carry) & 1 == 0
+}
+
+/// Resample six band values through a blended knot curve, normalise them, and re-arm the ring
+/// reservations (`sub_82B2F2C8`). Returns 1.
+///
+/// `object` is `r3`, `out` the six singles in `r4`, `input` the six in `r6`, `band` is `f1` and `sp`
+/// is `r1`. Where `band` falls between the three edges picks a segment and a blend weight; the nine
+/// knot ordinates are the blend of two table rows, written with the abscissae into the red zone
+/// below `sp`. Each input is then located by an **unbounded** walk up the abscissae — an input above
+/// every knot walks on into the ordinates and past them, as in the original — and interpolated
+/// linearly with one fused `fmadds`.
+///
+/// When the object's two levels differ, the bands are normalised by the larger of the current level
+/// and the last band plus the headroom, six envelope slots are cleared, and each of the six
+/// reservation records whose pending size fits is re-armed. Record 0 of each queue stores its five
+/// fields in a different order from the other two; both orders are kept.
+pub fn resample_bands(
+    g: &mut Guest,
+    object: u32,
+    out: u32,
+    input: u32,
+    band: f64,
+    sp: u32,
+) -> Result<u64> {
+    use crate::fp::{add_single, div_single, fmadd_single, load_single, mul_single, store_single, sub_single};
+    let xs = sp.wrapping_sub(BAND_RED_ZONE); // addi r8,r1,-80
+    let ys = xs.wrapping_add(36); // addi r7,r1,-44
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    let high_edge = load_single(g, BAND_EDGES + 8)?; // lfs f12,8(r11)
+    let (mut span, mut rate, mut segment) = (0.0, 0.0, 0u32);
+    let mut upper = !(band < high_edge); // fcmpu cr6,f1,f12 ; blt -- a NaN band takes the upper path
+    let mut anchor = high_edge;
+    if !upper {
+        let low_edge = load_single(g, BAND_EDGES)?; // lfs f0,0(r11)
+        let mid_edge = load_single(g, BAND_EDGES + 4)?; // lfs f13,4(r11)
+        anchor = low_edge;
+        if band > low_edge {
+            anchor = band; // fmr f0,f1
+            upper = band > mid_edge; // fcmpu cr6,f1,f13 ; bgt
+        }
+        if !upper {
+            span = sub_single(mid_edge, anchor); // fsubs f13,f13,f0
+            rate = load_single(g, BAND_RATE_LOWER)?; // lfs f0,1120(r9)
+        }
+    }
+    if upper {
+        span = sub_single(high_edge, anchor); // fsubs f13,f12,f0
+        segment = 1;
+        rate = load_single(g, BAND_RATE_UPPER)?; // lfs f0,1124(r9)
+    }
+    let weight = mul_single(span, rate); // fmuls f0,f13,f0
+    let one = load_single(g, crate::routing::UNITY_GAIN)?; // lfs f11,0(r10)
+    let nine = segment.wrapping_add((segment << 3) & 0xFFFF_FFF8); // rlwinm ; add r11,r11,r9
+    let row = ((nine << 3) & 0xFFFF_FFF8).wrapping_add(BAND_KNOT_ROWS); // rlwinm r7 ; add r10
+    let rest = sub_single(one, weight); // fsubs f13,f11,f0
+    let mut walk = row;
+    for k in 0..9u32 {
+        let row_a = load_single(g, walk.wrapping_sub(68))?; // lfs f10,-68(r10)
+        walk = walk.wrapping_add(4); // lfsu f12,4(r10)
+        let row_b = load_single(g, walk)?;
+        let scaled_b = mul_single(row_b, rest); // fmuls f9,f12,f13
+        let knot_x = load_single(g, BAND_KNOT_X + 4 * k)?; // lfsx f8,r11,r9
+        store_single(g, xs.wrapping_add(4 * k), knot_x)?; // stfsx f8,r11,r8
+        store_single(g, ys.wrapping_add(4 * k), fmadd_single(row_a, weight, scaled_b))?; // fmadds ; stfsx
+    }
+    let x1 = load_single(g, xs.wrapping_add(4))?; // lfs f0,-76(r1)
+    let x0 = load_single(g, xs)?; // lfs f13,-80(r1)
+    let inv_step = div_single(one, sub_single(x1, x0)); // fsubs f12 ; fdivs f12,f11,f12
+    let mut cursor = out;
+    for i in 0..6u32 {
+        let value = load_single(g, input.wrapping_add(4 * i))?; // lfsx f13,r8,r9
+        let (mut index, mut probe) = (0u32, xs);
+        loop {
+            probe = probe.wrapping_add(4); // lfsu f0,4(r10)
+            let edge = load_single(g, probe)?;
+            index = index.wrapping_add(1);
+            if !(value > edge) {
+                break; // fcmpu cr6,f13,f0 ; bgt -- unbounded, as the original
+            }
+        }
+        let slot = (index << 2) & 0xFFFF_FFFC;
+        let behind = sub_single(load_single(g, xs.wrapping_add(slot))?, value); // fsubs f13,f0,f13
+        let y_below = load_single(g, ys.wrapping_sub(4).wrapping_add(slot))?; // lfsx f10 (r1-48)
+        let y_at = load_single(g, ys.wrapping_add(slot))?; // lfsx f9 (r1-44)
+        let frac = mul_single(behind, inv_step); // fmuls f8,f13,f12
+        let ahead = sub_single(one, frac); // fsubs f7,f11,f8
+        let lower = mul_single(y_below, frac); // fmuls f6,f10,f8
+        store_single(g, cursor, fmadd_single(y_at, ahead, lower))?; // fmadds f5 ; stfs f5,0(r9)
+        cursor = cursor.wrapping_add(4);
+    }
+
+    let current = load_single(g, object.wrapping_add(BAND_CURRENT_LEVEL))?;
+    let reference = load_single(g, object.wrapping_add(BAND_TARGET_LEVEL))?;
+    if current == reference {
+        return Ok(1); // beq cr6,0x82b2f54c
+    }
+    let last = load_single(g, out.wrapping_add(20))?; // lfs f12,20(r4) -- reloaded
+    let mut ceiling = add_single(last, load_single(g, BAND_HEADROOM)?); // fadds f0,f12,f0
+    if current > ceiling {
+        ceiling = current; // fmr f0,f13
+    }
+    let norm = div_single(one, ceiling); // fdivs f0,f11,f0
+    let mut src = out.wrapping_sub(4); // addi r11,r4,-4
+    let mut envelope = object.wrapping_add(BAND_ENVELOPES); // addi r10,r3,480
+    let zero = load_single(g, ZERO_CELL)?; // lfs f13,23056(r9)
+    for _ in 0..6 {
+        envelope = envelope.wrapping_add(36); // stfsu f13,36(r10)
+        store_single(g, envelope, zero)?;
+        let raw = load_single(g, src.wrapping_add(4))?; // lfs f12,4(r11)
+        src = src.wrapping_add(4); // stfsu f11,4(r11)
+        store_single(g, src, mul_single(raw, norm))?;
+    }
+
+    let mut sizes = object.wrapping_add(BAND_PENDING_SIZES); // addi r8,r3,392
+    let mut queue = object.wrapping_add(BAND_QUEUES); // addi r11,r3,720
+    for _ in 0..2 {
+        // Record 0: the size word BEFORE the cursor, and its own store order.
+        let size = g.u32(sizes.wrapping_sub(4))?; // lwz r9,-4(r8)
+        let pos = g.u32(queue.wrapping_add(4))?; // lwz r10,4(r11)
+        let limit = g.u32(queue)?; // lwz r6,0(r11)
+        if reservation_fits(limit, reservation_needed(size, pos)) {
+            let limit_again = g.u32(queue)?; // lwz r7,0(r11)
+            let pos_again = g.u32(queue.wrapping_add(4))?; // lwz r6,4(r11)
+            g.set_u32(queue.wrapping_add(20), size.wrapping_add(1))?; // stw r10,20(r11)
+            g.set_u32(queue.wrapping_add(16), 0)?; // stw r5,16(r11)
+            g.set_u8(queue.wrapping_add(36), 0)?; // stb r5,36(r11)
+            g.set_u32(queue.wrapping_add(12), limit_again)?; // stw r7,12(r11)
+            g.set_u32(queue.wrapping_add(32), pos_again)?; // stw r6,32(r11)
+        }
+        // Records 1 and 2, sixty bytes apart, sizes at +0 and +4.
+        for (rec, size_at) in [(queue.wrapping_add(60), sizes), (queue.wrapping_add(120), sizes.wrapping_add(4))] {
+            let size = g.u32(size_at)?;
+            let pos = g.u32(rec.wrapping_add(4))?;
+            let limit = g.u32(rec)?;
+            if reservation_fits(limit, reservation_needed(size, pos)) {
+                g.set_u32(rec.wrapping_add(16), 0)?; // stw r5,76(r11)
+                let limit_again = g.u32(rec)?;
+                g.set_u32(rec.wrapping_add(12), limit_again)?; // stw r9,72(r11)
+                let pos_again = g.u32(rec.wrapping_add(4))?;
+                g.set_u32(rec.wrapping_add(32), pos_again)?; // stw r7,92(r11)
+                g.set_u32(rec.wrapping_add(20), size.wrapping_add(1))?; // stw r10,80(r11)
+                g.set_u8(rec.wrapping_add(36), 0)?; // stb r5,96(r11)
+            }
+        }
+        sizes = sizes.wrapping_add(12); // addi r8,r8,12
+        queue = queue.wrapping_add(180); // addi r11,r11,180
+    }
+    Ok(1) // li r3,1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1114,5 +1307,108 @@ mod settle_levels_tests {
         settle_levels(&mut g, OBJECT).unwrap();
         let term1 = 3.0f32 - (3.0f32 * 10.0) / log(&g, 100.0);
         assert_eq!(g.f32(OBJECT + LEVEL).unwrap(), term1);
+    }
+}
+
+#[cfg(test)]
+mod resample_bands_tests {
+    use super::*;
+
+    const BASE: u32 = 0x4000_0000;
+    const OBJECT: u32 = BASE;
+    const OUT: u32 = BASE + 0x800;
+    const INPUT: u32 = BASE + 0x840;
+    const SP: u32 = BASE + 0x1000;
+
+    fn cell(g: &mut Guest, at: u32, v: f32) {
+        if g.set_u32(at, v.to_bits()).is_err() {
+            g.put(at, v.to_bits().to_be_bytes().to_vec());
+        }
+    }
+
+    /// Edges 0, 1, 2; rates 1; knots at 0..8; every table row holding `k` at knot `k`, so whatever the
+    /// blend weight the curve is the identity and each output equals its input.
+    fn guest(inputs: [f32; 6]) -> Guest {
+        let mut g = Guest::single(BASE, 0x1000);
+        g.put(BAND_EDGES, [0.0f32, 1.0, 2.0].iter().flat_map(|v| v.to_bits().to_be_bytes()).collect());
+        g.put(BAND_KNOT_X, vec![0u8; 216]);
+        for k in 0..9u32 {
+            cell(&mut g, BAND_KNOT_X + 4 * k, k as f32);
+            for row in 1..6u32 {
+                cell(&mut g, BAND_KNOT_X + 36 * row + 4 * k, k as f32);
+            }
+        }
+        for (at, v) in [(BAND_RATE_LOWER, 1.0f32), (BAND_RATE_UPPER, 1.0), (crate::routing::UNITY_GAIN, 1.0),
+                        (BAND_HEADROOM, 0.5), (ZERO_CELL, 0.0)] {
+            cell(&mut g, at, v);
+        }
+        for (i, v) in inputs.iter().enumerate() {
+            g.set_u32(INPUT + 4 * i as u32, v.to_bits()).unwrap();
+        }
+        g
+    }
+
+    fn out(g: &Guest) -> Vec<f32> {
+        (0..6).map(|i| g.f32(OUT + 4 * i).unwrap()).collect()
+    }
+
+    #[test]
+    fn an_identity_curve_interpolates_each_input_to_itself() {
+        let inputs = [0.5f32, 2.25, 3.0, 4.75, 6.5, 7.125];
+        let mut g = guest(inputs);
+        assert_eq!(resample_bands(&mut g, OBJECT, OUT, INPUT, 0.25, SP).unwrap(), 1);
+        assert_eq!(out(&g), inputs);
+        assert_eq!(g.f32(SP - BAND_RED_ZONE + 4 * 8).unwrap(), 8.0, "the abscissae copied into the red zone");
+    }
+
+    #[test]
+    fn the_segment_weight_blends_two_rows() {
+        // Band 0.25 is in the lower segment: weight (1 - 0.25) * 1, so each ordinate is
+        // 0.75 * row0 + 0.25 * row2. With row0 = 1 and row2 = 3 everywhere, every output is 1.5.
+        let mut g = guest([0.5; 6]);
+        for k in 0..9u32 {
+            cell(&mut g, BAND_KNOT_X + 36 + 4 * k, 1.0);
+            cell(&mut g, BAND_KNOT_X + 108 + 4 * k, 3.0);
+        }
+        resample_bands(&mut g, OBJECT, OUT, INPUT, 0.25, SP).unwrap();
+        assert_eq!(out(&g), [1.5; 6]);
+    }
+
+    #[test]
+    fn equal_levels_stop_after_the_resample() {
+        let mut g = guest([1.0; 6]);
+        g.set_u32(OBJECT + BAND_ENVELOPES + 36, 0x7777_7777).unwrap();
+        resample_bands(&mut g, OBJECT, OUT, INPUT, 0.25, SP).unwrap();
+        assert_eq!(g.u32(OBJECT + BAND_ENVELOPES + 36).unwrap(), 0x7777_7777);
+    }
+
+    #[test]
+    fn differing_levels_normalise_clear_the_envelopes_and_rearm_what_fits() {
+        let mut g = guest([1.0, 1.0, 1.0, 1.0, 1.0, 1.5]);
+        g.set_u32(OBJECT + BAND_CURRENT_LEVEL, 1.0f32.to_bits()).unwrap();
+        g.set_u32(OBJECT + BAND_ENVELOPES + 36, 0x7777_7777).unwrap();
+        // Queue 0, record 0: size 10 at +388, needing 32 bytes from position 0 in a limit of 100.
+        g.set_u32(OBJECT + BAND_PENDING_SIZES - 4, 10).unwrap();
+        g.set_u32(OBJECT + BAND_QUEUES, 100).unwrap();
+        // Queue 0, record 1: size 100 needs (100 + 35) & !31 = 128, over its limit of 100.
+        g.set_u32(OBJECT + BAND_PENDING_SIZES, 100).unwrap();
+        g.set_u32(OBJECT + BAND_QUEUES + 60, 100).unwrap();
+        g.set_u32(OBJECT + BAND_QUEUES + 60 + 20, 0x5555).unwrap();
+        resample_bands(&mut g, OBJECT, OUT, INPUT, 0.25, SP).unwrap();
+        // The ceiling is the last band plus the headroom, 2.0, above the current level of 1.0.
+        assert_eq!(out(&g), [0.5, 0.5, 0.5, 0.5, 0.5, 0.75]);
+        assert_eq!(g.u32(OBJECT + BAND_ENVELOPES + 36).unwrap(), 0);
+        let rec = OBJECT + BAND_QUEUES;
+        assert_eq!(g.u32(rec + 20).unwrap(), 11, "size + 1");
+        assert_eq!(g.u32(rec + 12).unwrap(), 100, "the limit copied");
+        assert_eq!(g.u32(rec + 60 + 20).unwrap(), 0x5555, "the record that does not fit is left");
+    }
+
+    #[test]
+    fn the_fit_test_is_a_signed_compare() {
+        assert!(reservation_fits(100, 32));
+        assert!(!reservation_fits(100, 128));
+        assert!(!reservation_fits(0x8000_0000, 32), "a negative limit fits nothing");
+        assert!(reservation_fits(32, 0x8000_0000), "anything fits above a negative need");
     }
 }

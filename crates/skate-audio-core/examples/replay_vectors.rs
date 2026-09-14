@@ -1025,6 +1025,50 @@ fn main() {
                     .map(|r| Some(r as u32))
                     .map_err(|e| e.to_string())
             }
+            // The band resample keeps its knots in 80 bytes of red zone below r1.
+            "sub_82B2F2C8" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where the knots live", v.run));
+                }
+                continue;
+            }
+            "sub_82B2F2C8" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(leaves::BAND_RED_ZONE), vec![0u8; leaves::BAND_RED_ZONE as usize]);
+                leaves::resample_bands(&mut g, v.r3, v.r4, v.r6, f64::from_bits(v.f[0]), sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
+            // Three stream parsers whose readers and decoders live in their own frames below r1.
+            "sub_82B335A8" | "sub_82B474B8" | "sub_82B50100" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where the decoder state lives", v.run));
+                }
+                continue;
+            }
+            "sub_82B335A8" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(bitstream::HEADER_FRAME), vec![0u8; bitstream::HEADER_FRAME as usize]);
+                bitstream::parse_voice_header(&mut g, v.r3, v.r4, u64::from(v.r5), sp)
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B474B8" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(bitstream::SEEK_FRAME), vec![0u8; bitstream::SEEK_FRAME as usize]);
+                bitstream::seek_record(&mut g, v.r3, u64::from(v.r4), u64::from(v.r5), sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
+            "sub_82B50100" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(bitstream::PACKET_FRAME), vec![0u8; bitstream::PACKET_FRAME as usize]);
+                bitstream::seek_packet(&mut g, v.r3, v.r4, v.r5, u64::from(v.r6), sp)
+                    .map(|r| Some(r as u32))
+                    .map_err(|e| e.to_string())
+            }
             // The evaluator's opcode table: every ported slot is `fn(&mut Guest, u32) -> u64` with the
             // operand block in r3, so one arm covers all of them by looking the name up.
             name if eval::TABLE.iter().any(|slot| slot.name == name && slot.port.is_some()) => {

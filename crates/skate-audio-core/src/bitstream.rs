@@ -400,6 +400,353 @@ pub fn unpack_stream_header(g: &mut Guest, stream: u32, out: u32, sp: u32) -> Re
     g.set_u32(out + 8, field29 as u32) // stw r3,8(r31)
 }
 
+// ============================================================ sub_82B335A8: a voice's bit header
+
+/// `lwz r10,96(r3)` — the base of the 80-byte voice records.
+pub const HEADER_VOICE_ARRAY: u32 = 96;
+/// `lhz r9,464(r3)` — the byte offset, inside the object, of the 48-byte control slots.
+pub const HEADER_SLOT_TABLE: u32 = 464;
+/// Voice `+8`: the first byte after the header.
+pub const VOICE_DATA_BASE: u32 = 8;
+/// Voice `+12`: the tenth field, or 0.
+pub const VOICE_DELTA: u32 = 12;
+/// Voice `+16`: the ninth field, mode 2 only.
+pub const VOICE_FIELD_16: u32 = 16;
+/// Voice `+72`: the second field, four bits.
+pub const VOICE_FORMAT_INDEX: u32 = 72;
+/// Voice `+73`: the fifth field, two bits, then **reloaded**.
+pub const VOICE_MODE: u32 = 73;
+/// Voice `+76`: the first field, four bits.
+pub const VOICE_STATE: u32 = 76;
+/// Slot `+16`: the fourth field, eighteen bits, as a single.
+pub const SLOT_FIELD_16: u32 = 16;
+/// Slot `+20`: the seventh field, 29 bits.
+pub const SLOT_FIELD_20: u32 = 20;
+/// Slot `+24`: the eighth field, or -1.
+pub const SLOT_CURSOR: u32 = 24;
+/// Slot `+47`: the third field, six bits, plus one.
+pub const SLOT_TYPE: u32 = 47;
+/// `lbz r11,0(r29) ; cmplwi cr6,r11,72` — an `'H'` tag word, skipped.
+pub const VOICE_HEADER_TAG: u8 = 72;
+/// `stwu r1,-160(r1)`. Real: the bit reader's `{data, cursor}` pair lives at `r1 + 80`.
+pub const HEADER_FRAME: u32 = 160;
+const VOICE_HEADER_READER: u32 = 80;
+
+/// Parse a stream's packed bit header into voice `index`'s record and control slot, or write the
+/// defaults when there is no stream (`sub_82B335A8`).
+///
+/// `object` is `r3`, `index` `r4`, `stream` `r5` and `sp` `r1`. Both records are addressed once at
+/// entry: the voice at `*(object + 96) + 80 * index`, the slot at `object + u16(object + 464) +
+/// 48 * index`. The fields are read MSB-first through [`read_bits`] over a reader built in the frame:
+/// 4, 4, 6, 18, 2, 1 and 29 bits, then a 32-bit cursor if the one-bit flag is set, a 32-bit field if
+/// the mode (**re-read from the record**) is 2, and a 32-bit delta if the flag is set and the mode is
+/// 1, or 2 with the cursor at or past that field — a signed compare of two words re-read after this
+/// call stored them. The data base is the stream plus the header's whole bytes.
+///
+/// The original converts the eighteen-bit field through a doubleword at `r1 + 88`; the conversion is
+/// exact, so it is done in registers here and that frame word is not written.
+pub fn parse_voice_header(g: &mut Guest, object: u32, index: u32, stream: u64, sp: u32) -> Result<()> {
+    let slot_off = u32::from(g.u16(object.wrapping_add(HEADER_SLOT_TABLE))?);
+    let slot = slot_off.wrapping_add(index.wrapping_mul(3) << 4).wrapping_add(object); // r30
+    let array = g.u32(object.wrapping_add(HEADER_VOICE_ARRAY))?;
+    let voice = (index.wrapping_mul(5) << 4).wrapping_add(array); // r31
+    let frame = sp.wrapping_sub(HEADER_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-160(r1)
+    let mut fpscr = crate::vmx::Fpscr::capture();
+    if stream as u32 == 0 {
+        g.set_u8(slot.wrapping_add(SLOT_TYPE), 0)?; // stb r27,47(r30)
+        fpscr.disable_flush_mode_unconditional();
+        let default = crate::fp::load_single(g, crate::routing::UNITY_GAIN)?; // lfs f0,-22460(r10)
+        crate::fp::store_single(g, slot.wrapping_add(SLOT_FIELD_16), default)?;
+        g.set_u32(slot.wrapping_add(SLOT_FIELD_20), 0x7FFF_FFFF)?; // lis ; ori ; stw r8,20(r30)
+        g.set_u32(slot.wrapping_add(SLOT_CURSOR), u32::MAX)?; // li r7,-1 ; stw r7,24(r30)
+        g.set_u8(voice.wrapping_add(VOICE_FORMAT_INDEX), 255)?;
+        g.set_u8(voice.wrapping_add(VOICE_MODE), 1)?;
+        g.set_u32(voice.wrapping_add(VOICE_FIELD_16), 0)?;
+        g.set_u32(voice.wrapping_add(VOICE_DELTA), 0)?;
+        g.set_u32(voice.wrapping_add(VOICE_DATA_BASE), 0)?;
+        g.set_u8(voice.wrapping_add(VOICE_STATE), 1)?;
+        return Ok(());
+    }
+    let mut stream = stream;
+    if g.u8(stream as u32)? == VOICE_HEADER_TAG {
+        stream = stream.wrapping_add(4); // addi r29,r29,4
+    }
+    let reader = frame.wrapping_add(VOICE_HEADER_READER);
+    g.set_u32(reader + READER_DATA, stream as u32)?; // stw r29,80(r1)
+    g.set_u32(reader + READER_CURSOR, 0)?; // stw r27,84(r1)
+    let state = read_bits(g, reader, 4)?;
+    g.set_u8(voice.wrapping_add(VOICE_STATE), state as u8)?;
+    let format = read_bits(g, reader, 4)?;
+    g.set_u8(voice.wrapping_add(VOICE_FORMAT_INDEX), format as u8)?;
+    let kind = read_bits(g, reader, 6)?;
+    g.set_u8(slot.wrapping_add(SLOT_TYPE), kind.wrapping_add(1) as u8)?; // addi r9,r3,1 ; stb
+    let wide = read_bits(g, reader, 18)?;
+    fpscr.disable_flush_mode_unconditional();
+    let converted = f64::from((wide & 0xFFFF_FFFF) as i64 as f64 as f32); // clrldi ; std ; lfd ; fcfid ; frsp
+    crate::fp::store_single(g, slot.wrapping_add(SLOT_FIELD_16), converted)?; // stfs f12,16(r30)
+    let mode = read_bits(g, reader, 2)?;
+    g.set_u8(voice.wrapping_add(VOICE_MODE), mode as u8)?;
+    let has_cursor = read_bits(g, reader, 1)? & 0xFF; // clrlwi r28,r3,24
+    let field20 = read_bits(g, reader, 29)?;
+    g.set_u32(slot.wrapping_add(SLOT_FIELD_20), field20 as u32)?;
+    if has_cursor != 0 {
+        let cursor = read_bits(g, reader, 32)?;
+        g.set_u32(slot.wrapping_add(SLOT_CURSOR), cursor as u32)?;
+    } else {
+        g.set_u32(slot.wrapping_add(SLOT_CURSOR), u32::MAX)?; // loc_82B33700
+    }
+    let mode = g.u8(voice.wrapping_add(VOICE_MODE))?; // lbz r28,73(r31) -- reloaded
+    if mode == 2 {
+        let field16 = read_bits(g, reader, 32)?;
+        g.set_u32(voice.wrapping_add(VOICE_FIELD_16), field16 as u32)?;
+    }
+    if has_cursor != 0 {
+        let read_delta = match mode {
+            1 => true,
+            2 => {
+                let cursor = g.u32(slot.wrapping_add(SLOT_CURSOR))? as i32; // lwz r11,24(r30)
+                let limit = g.u32(voice.wrapping_add(VOICE_FIELD_16))? as i32; // lwz r10,16(r31)
+                cursor >= limit // cmpw ; bge
+            }
+            _ => false,
+        };
+        let delta = if read_delta { read_bits(g, reader, 32)? as u32 } else { 0 };
+        g.set_u32(voice.wrapping_add(VOICE_DELTA), delta)?;
+    }
+    let header_bytes = u64::from(g.u32(reader + READER_CURSOR)? >> 3); // lwz r11,84(r1) ; rlwinm 29,3,31
+    g.set_u32(voice.wrapping_add(VOICE_DATA_BASE), header_bytes.wrapping_add(stream) as u32)?;
+    Ok(())
+}
+
+// ============================================================ sub_82B474B8: seeking a record
+
+/// `stwu r1,-272(r1)`. Real: the four run-length decoders and their shared cursor live in it.
+pub const SEEK_FRAME: u32 = 272;
+const SEEK_DECODED: u32 = 80;
+const SEEK_CURSOR: u32 = 96;
+/// Published: 0, or the entry value of this word plus stream 1's running sum.
+pub const SEEK_PUBLISH_BASE: u32 = 4;
+/// Published: the record's start position.
+pub const SEEK_PUBLISH_POSITION: u32 = 8;
+/// Published: `(target - length) - position`.
+pub const SEEK_PUBLISH_SKIP: u32 = 12;
+/// Published: `min(target - position, [+28])`, signed.
+pub const SEEK_PUBLISH_LENGTH: u32 = 16;
+/// Published: stream 0's running sum.
+pub const SEEK_PUBLISH_OFFSET: u32 = 20;
+/// Read only, twice: caps the published length.
+pub const SEEK_MIN_LENGTH: u32 = 28;
+/// Published byte: 1 when the mode word is exactly 1.
+pub const SEEK_PUBLISH_EXACT: u32 = 32;
+
+/// Walk four interleaved run-length streams until the record containing `target` is found, and
+/// publish it (`sub_82B474B8`). Returns 1 when a negative record length ends the walk, 0 when the
+/// walk passes the target.
+///
+/// `object` is `r3`, `stream` `r4`, `target` `r5`, `sp` `r1`. The four decoders are built in the
+/// frame over one shared cursor, primed with [`decode_four`], then stepped with [`run_length_step`]
+/// in stream order: 0 is an offset, 1 a base, 2 the record length and 3 a mode. A record is published
+/// when it contains `max(target - [+28], 0)` — or on every record when the mode is 1 — and the walk
+/// keeps going until it passes the target, so a later match overwrites an earlier one. Every compare
+/// is signed on the low words; the sums are 64-bit and truncated at the stores.
+pub fn seek_record(g: &mut Guest, object: u32, stream: u64, target: u64, sp: u32) -> Result<u64> {
+    let frame = sp.wrapping_sub(SEEK_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-272(r1)
+    let shared = frame.wrapping_add(SEEK_CURSOR);
+    g.set_u32(shared, stream as u32)?; // stw r4,96(r1)
+    let min_entry = u64::from(g.u32(object.wrapping_add(SEEK_MIN_LENGTH))?); // lwz r10,28(r3)
+    for offset in FIELD_OFFSETS {
+        let sub = shared.wrapping_add(offset);
+        g.set_u32(sub + RUN_CURSOR, 0)?;
+        g.set_u32(sub + RUN_ACCUMULATED, 0)?;
+        g.set_u32(sub + RUN_REMAINING, 0)?;
+        g.set_u8(sub + RUN_FLAG, 0)?;
+    }
+    for offset in FIELD_OFFSETS {
+        g.set_u32(shared.wrapping_add(offset) + RUN_CURSOR, shared)?; // all four at r1+96
+    }
+    // subf ; subfic ; rlwinm ; addme ; and -- the span when it is a positive int32, else zero.
+    let span = target.wrapping_sub(min_entry);
+    let carry = u64::from(span as u32 == 0);
+    let sign = u64::from((span as u32) >> 31);
+    let limit = (sign + carry).wrapping_sub(1) & span;
+    let decoded = frame.wrapping_add(SEEK_DECODED);
+    decode_four(g, decoded, shared)?; // bl 0x82b47658
+    let mut step = u64::from(g.u32(decoded + 8)?); // lwz r28,88(r1)
+    let base_entry = u64::from(g.u32(object.wrapping_add(SEEK_PUBLISH_BASE))?); // before any store
+    let mut result = 1;
+    if step as u32 as i32 >= 0 {
+        let mut mode = u64::from(g.u32(decoded + 12)?);
+        let mut value_b = u64::from(g.u32(decoded + 4)?);
+        let mut value_a = u64::from(g.u32(decoded)?);
+        let (mut position, mut sum_a, mut sum_b) = (0u64, 0u64, 0u64);
+        loop {
+            let in_range = (position as u32 as i32) <= (limit as u32 as i32)
+                && (limit as u32 as i32) < (step.wrapping_add(position) as u32 as i32);
+            if in_range || mode as u32 as i32 == 1 {
+                let published = if value_b as u32 as i32 == 0 { 0 } else { sum_b.wrapping_add(base_entry) };
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_BASE), published as u32)?;
+                let min_length = u64::from(g.u32(object.wrapping_add(SEEK_MIN_LENGTH))?); // reloaded
+                let remaining = target.wrapping_sub(position);
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_POSITION), position as u32)?;
+                let length =
+                    if (remaining as u32 as i32) < (min_length as u32 as i32) { remaining } else { min_length };
+                let leading = (mode.wrapping_sub(1) as u32).leading_zeros(); // cntlzw
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_LENGTH), length as u32)?;
+                let tail = target.wrapping_sub(length);
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_OFFSET), sum_a as u32)?;
+                g.set_u32(object.wrapping_add(SEEK_PUBLISH_SKIP), tail.wrapping_sub(position) as u32)?;
+                g.set_u8(object.wrapping_add(SEEK_PUBLISH_EXACT), ((leading >> 5) & 1) as u8)?;
+            }
+            position = step.wrapping_add(position); // add r29,r28,r29
+            if (target as u32 as i32) < (position as u32 as i32) {
+                result = 0; // walked past the target
+                break;
+            }
+            sum_a = value_a.wrapping_add(sum_a);
+            sum_b = value_b.wrapping_add(sum_b);
+            value_a = run_length_step(g, shared.wrapping_add(FIELD_OFFSETS[0]))?;
+            value_b = run_length_step(g, shared.wrapping_add(FIELD_OFFSETS[1]))?;
+            step = run_length_step(g, shared.wrapping_add(FIELD_OFFSETS[2]))?;
+            mode = run_length_step(g, shared.wrapping_add(FIELD_OFFSETS[3]))?;
+            if (step as u32 as i32) < 0 {
+                break; // a negative record length ends the walk, with 1
+            }
+        }
+    }
+    Ok(result)
+}
+
+// ============================================================ sub_82B50100: seeking a packet
+
+/// `stwu r1,-160(r1)`. Real: the bit cell at `r1 + 80` and the packet pointer at `r1 + 88` are the
+/// two callees' arguments.
+pub const PACKET_FRAME: u32 = 160;
+const PACKET_BITS_CELL: u32 = 80;
+const PACKET_POINTER_CELL: u32 = 88;
+/// Cursor `+4`: the packet the target frame starts in.
+pub const PACKET_CURSOR_PACKET: u32 = 4;
+/// Cursor `+8`: bytes from that packet to the end of the chunk, less four.
+pub const PACKET_CURSOR_REMAINING: u32 = 8;
+/// Cursor `+20`: the bit offset inside that packet, or -1.
+pub const PACKET_CURSOR_BITS: u32 = 20;
+/// Descriptor `+4`: the seek table, or 0.
+pub const PACKET_DESC_TABLE: u32 = 4;
+/// Descriptor `+8`: the sample position.
+pub const PACKET_DESC_SAMPLES: u32 = 8;
+/// Descriptor `+20`: clear adds the 384-sample bias before the divide.
+pub const PACKET_DESC_FLAG: u32 = 20;
+/// The packet size.
+pub const PACKET_BYTES: u64 = 2048;
+/// At or past this the bit position is poisoned to -1.
+pub const PACKET_PAGE_BITS: i32 = 16_352;
+
+/// `srawi ; addze` — a signed divide of the low word by `2^shift`, truncating toward zero.
+fn divide_toward_zero(value: u32, shift: u32) -> i64 {
+    let signed = value as i32;
+    let carry = signed < 0 && value & ((1 << shift) - 1) != 0;
+    i64::from(signed >> shift) + i64::from(carry)
+}
+
+/// `lwz ; srawi r6,r7,11 ; clrlwi r10,r6,17 ; cmpwi 16352 ; blt ; li -1` — the four header bytes,
+/// just stored into the cell, read back as one big-endian word.
+fn bit_position_from_cell(g: &Guest, cell: u32) -> Result<i64> {
+    let word = g.u32(cell)?;
+    let value = (((word as i32) >> 11) as u32 & 0x7FFF) as i32;
+    Ok(if value < PACKET_PAGE_BITS { i64::from(value) } else { -1 })
+}
+
+/// Store a packet's four header bytes into the cell, in the original's order, and turn them into a
+/// bit position stored back over them.
+fn load_packet_header(g: &mut Guest, cell: u32, packet: u32, order: [u32; 4]) -> Result<i64> {
+    let mut bytes = [0u8; 4];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = g.u8(packet.wrapping_add(i as u32))?;
+    }
+    for i in order {
+        g.set_u8(cell + i, bytes[i as usize])?;
+    }
+    let position = bit_position_from_cell(g, cell)?;
+    g.set_u32(cell, position as u32)?;
+    Ok(position)
+}
+
+/// Seek a packetised bit stream to a frame, recording the packet, the bytes left and the bit offset
+/// in the cursor record (`sub_82B50100`). Returns the chunk's byte length, the length field with its
+/// two flag bits shifted out.
+///
+/// `cursor` is `r3`, `substream` `r4`, `desc` `r5`, `chunk` `r6` (full width: the packet arithmetic is
+/// 64-bit and truncated at the stores), `sp` `r1`. The sample position becomes 512-sample frames,
+/// biased by 384 samples when the descriptor's flag is clear. With a seek table, the substream's
+/// entry is walked with [`decode_unsigned`] one packet at a time while the frames counted so far do
+/// not pass the target — signed compares on the low words — and the chosen packet's header gives a
+/// fresh bit position. Each frame still ahead is then skipped with [`advance_bit_cursor`], which may
+/// step the packet pointer across a page wrap.
+pub fn seek_packet(g: &mut Guest, cursor: u32, substream: u32, desc: u32, chunk: u64, sp: u32) -> Result<u64> {
+    let frame = sp.wrapping_sub(PACKET_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-160(r1)
+    let bits_cell = frame.wrapping_add(PACKET_BITS_CELL);
+    let pointer_cell = frame.wrapping_add(PACKET_POINTER_CELL);
+    let chunk32 = chunk as u32;
+    let samples = g.u32(desc.wrapping_add(PACKET_DESC_SAMPLES))?; // lwz r11,8(r5)
+    let length_field = g.u32(chunk32)?; // lwz r10,0(r6)
+    let flag = g.u8(desc.wrapping_add(PACKET_DESC_FLAG))?; // lbz r9,20(r5)
+    let chunk_bytes = u64::from(length_field >> 2); // rlwinm r25,r10,30,2,31
+    let mut frames = if flag == 0 {
+        divide_toward_zero(samples.wrapping_add(384), 9) // addi r11,r11,384 ; srawi ; addze
+    } else {
+        divide_toward_zero(samples, 9)
+    };
+    let payload = chunk.wrapping_add(4); // addi r27,r6,4
+    let mut packet = payload;
+    g.set_u32(pointer_cell, packet as u32)?; // stw r27,88(r1)
+    // lbz 5,4,6,7 ; stb 81,80,82,83 -- the header of the chunk's first packet.
+    load_packet_header(g, bits_cell, payload as u32, [1, 0, 2, 3])?;
+    let table = g.u32(desc.wrapping_add(PACKET_DESC_TABLE))?; // lwz r11,4(r5)
+    let mut consumed = 0u64;
+    if table != 0 {
+        let entry = g.u32((substream << 2).wrapping_add(table))?; // lwzx
+        let mut reader = u64::from(entry).wrapping_add(u64::from(table)); // add r30,r10,r11
+        let length = decode_unsigned(g, reader as u32, bits_cell)?; // bl 0x82b4f5f8
+        let mut counted = u64::from(g.u32(bits_cell)?);
+        reader = length.wrapping_add(reader);
+        if (frames as u32 as i32) >= (counted as u32 as i32) {
+            loop {
+                packet = packet.wrapping_add(PACKET_BYTES); // addi r29,r29,2048
+                consumed = consumed.wrapping_add(counted);
+                let length = decode_unsigned(g, reader as u32, bits_cell)?;
+                counted = u64::from(g.u32(bits_cell)?);
+                reader = length.wrapping_add(reader);
+                if (frames as u32 as i32) < (counted.wrapping_add(consumed) as u32 as i32) {
+                    break; // add r10,r11,r31 ; cmpw ; bge
+                }
+            }
+            g.set_u32(pointer_cell, packet as u32)?; // stw r29,88(r1)
+        }
+        frames = (frames as u64).wrapping_sub(consumed) as i64; // subf r28,r31,r28
+        // lbz 0,2,1,3 ; stb 80,82,81,83 -- the chosen packet's header.
+        load_packet_header(g, bits_cell, packet as u32, [0, 2, 1, 3])?;
+    }
+    if frames as u32 as i32 > 0 {
+        loop {
+            advance_bit_cursor(g, pointer_cell, bits_cell)?; // bl 0x82b50270
+            frames = frames.wrapping_sub(1);
+            if frames as u32 as i32 == 0 {
+                break; // addic. r28,r28,-1 -- the low word
+            }
+        }
+        packet = u64::from(g.u32(pointer_cell)?); // lwz r29,88(r1)
+    }
+    let behind = payload.wrapping_sub(packet); // subf r11,r29,r27
+    let bits = g.u32(bits_cell)?; // lwz r10,80(r1)
+    g.set_u32(cursor.wrapping_add(PACKET_CURSOR_PACKET), packet as u32)?; // stw r29,4(r26)
+    let remaining = behind.wrapping_add(chunk_bytes); // add r11,r11,r25
+    g.set_u32(cursor.wrapping_add(PACKET_CURSOR_BITS), bits)?; // stw r10,20(r26)
+    g.set_u32(cursor.wrapping_add(PACKET_CURSOR_REMAINING), remaining.wrapping_sub(4) as u32)?; // addi -4 ; stw
+    Ok(chunk_bytes) // mr r3,r25
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,5 +1136,222 @@ mod tests {
             assert_eq!(g.u32(reader + READER_CURSOR).unwrap(), 64, "all 64 bits consumed");
             assert_eq!(g.u32(sp - HEADER_FRAME_BYTES).unwrap(), sp, "the back chain");
         }
+    }
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+
+    const BASE: u32 = 0x4000_0000;
+    const SP: u32 = BASE + 0xF000;
+
+    fn guest() -> Guest {
+        Guest::single(BASE, 0x10000)
+    }
+
+    /// Bytes into memory the guest already maps: a `put` there would be shadowed by the segment.
+    fn fill(g: &mut Guest, at: u32, bytes: &[u8]) {
+        for (i, b) in bytes.iter().enumerate() {
+            g.set_u8(at + i as u32, *b).unwrap();
+        }
+    }
+
+    /// Packs fields MSB-first, as [`read_bits`] reads them.
+    struct Bits(Vec<u8>, u32);
+    impl Bits {
+        fn push(&mut self, value: u64, width: u32) {
+            for i in (0..width).rev() {
+                if self.1 % 8 == 0 {
+                    self.0.push(0);
+                }
+                let bit = ((value >> i) & 1) as u8;
+                let last = self.0.len() - 1;
+                self.0[last] |= bit << (7 - self.1 % 8);
+                self.1 += 1;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ sub_82B335A8
+
+    const OBJECT: u32 = BASE;
+    const VOICES: u32 = BASE + 0x1000;
+    const STREAM: u32 = BASE + 0x2000;
+    const SLOT: u32 = OBJECT + 0x300 + 48; // index 1
+    const VOICE: u32 = VOICES + 80;
+
+    fn header_guest() -> Guest {
+        let mut g = guest();
+        g.put(crate::routing::UNITY_GAIN, 1.0f32.to_bits().to_be_bytes().to_vec());
+        g.set_u32(OBJECT + HEADER_VOICE_ARRAY, VOICES).unwrap();
+        g.set_u16(OBJECT + HEADER_SLOT_TABLE, 0x300).unwrap();
+        g
+    }
+
+    fn header(tag: bool, mode: u64, has_cursor: bool, cursor: u64, field16: u64, delta: u64) -> Vec<u8> {
+        let mut b = Bits(if tag { vec![72, 0, 0, 0] } else { vec![] }, 0);
+        b.1 = 8 * b.0.len() as u32;
+        for (v, w) in [(3, 4), (5, 4), (9, 6), (1000, 18), (mode, 2), (u64::from(has_cursor), 1), (12_345, 29)] {
+            b.push(v, w);
+        }
+        if has_cursor {
+            b.push(cursor, 32);
+        }
+        if mode == 2 {
+            b.push(field16, 32);
+        }
+        if has_cursor && (mode == 1 || (mode == 2 && cursor >= field16)) {
+            b.push(delta, 32);
+        }
+        b.0
+    }
+
+    #[test]
+    fn no_stream_writes_the_defaults() {
+        let mut g = header_guest();
+        parse_voice_header(&mut g, OBJECT, 1, 0, SP).unwrap();
+        assert_eq!(g.u8(SLOT + SLOT_TYPE).unwrap(), 0);
+        assert_eq!(g.f32(SLOT + SLOT_FIELD_16).unwrap(), 1.0);
+        assert_eq!(g.u32(SLOT + SLOT_FIELD_20).unwrap(), 0x7FFF_FFFF);
+        assert_eq!(g.u32(SLOT + SLOT_CURSOR).unwrap(), u32::MAX);
+        assert_eq!(g.u8(VOICE + VOICE_FORMAT_INDEX).unwrap(), 255);
+        assert_eq!(g.u8(VOICE + VOICE_STATE).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_tagged_header_with_a_cursor_reads_every_field_and_the_delta() {
+        let mut g = header_guest();
+        let bytes = header(true, 1, true, 77, 0, 5);
+        let len = bytes.len() as u32;
+        fill(&mut g, STREAM, &bytes);
+        parse_voice_header(&mut g, OBJECT, 1, u64::from(STREAM), SP).unwrap();
+        assert_eq!(g.u8(VOICE + VOICE_STATE).unwrap(), 3);
+        assert_eq!(g.u8(VOICE + VOICE_FORMAT_INDEX).unwrap(), 5);
+        assert_eq!(g.u8(SLOT + SLOT_TYPE).unwrap(), 10, "six bits plus one");
+        assert_eq!(g.f32(SLOT + SLOT_FIELD_16).unwrap(), 1000.0);
+        assert_eq!(g.u8(VOICE + VOICE_MODE).unwrap(), 1);
+        assert_eq!(g.u32(SLOT + SLOT_FIELD_20).unwrap(), 12_345);
+        assert_eq!(g.u32(SLOT + SLOT_CURSOR).unwrap(), 77);
+        assert_eq!(g.u32(VOICE + VOICE_DELTA).unwrap(), 5);
+        assert_eq!(g.u32(VOICE + VOICE_DATA_BASE).unwrap(), STREAM + len, "past the tag and the 128 bits");
+    }
+
+    #[test]
+    fn mode_two_reads_its_field_and_a_delta_only_when_the_cursor_has_reached_it() {
+        let mut g = header_guest();
+        fill(&mut g, STREAM, &header(false, 2, true, 10, 20, 0));
+        parse_voice_header(&mut g, OBJECT, 1, u64::from(STREAM), SP).unwrap();
+        assert_eq!(g.u32(VOICE + VOICE_FIELD_16).unwrap(), 20);
+        assert_eq!(g.u32(VOICE + VOICE_DELTA).unwrap(), 0, "cursor 10 is below 20: no delta read");
+        let mut h = header_guest();
+        fill(&mut h, STREAM, &header(false, 2, true, 30, 20, 9));
+        parse_voice_header(&mut h, OBJECT, 1, u64::from(STREAM), SP).unwrap();
+        assert_eq!(h.u32(VOICE + VOICE_DELTA).unwrap(), 9);
+    }
+
+    // ------------------------------------------------------------------ sub_82B474B8
+
+    /// The one-byte signed code for `v`, found by asking the decoder rather than restating it.
+    fn signed_byte(v: i32) -> u8 {
+        let mut probe = Guest::single(0x5000_0000, 16);
+        (0..192u8)
+            .find(|b| {
+                probe.set_u8(0x5000_0000, *b).unwrap();
+                signed_code(&probe, 0x5000_0000).unwrap() == (v as u32, 1)
+            })
+            .expect("a one-byte code")
+    }
+
+    /// Each step of each stream is a repeat run of one: a count of 0, then the delta.
+    fn seek_stream(sets: &[[i32; 4]]) -> Vec<u8> {
+        sets.iter().flat_map(|set| set.iter().flat_map(|d| [signed_byte(0), signed_byte(*d)])).collect()
+    }
+
+    const RECORD: u32 = BASE + 0x100;
+
+    #[test]
+    fn the_record_containing_the_target_less_its_minimum_is_published() {
+        // Records of length 10 at 0, 10, 20, 30; target 25 less a minimum of 5 is 20, inside the third.
+        let mut g = guest();
+        fill(&mut g, STREAM, &seek_stream(&[[3, 2, 10, 0], [3, 2, 0, 0], [3, 2, 0, 0], [3, 2, 0, 0]]));
+        g.set_u32(RECORD + SEEK_MIN_LENGTH, 5).unwrap();
+        g.set_u32(RECORD + SEEK_PUBLISH_BASE, 100).unwrap();
+        assert_eq!(seek_record(&mut g, RECORD, u64::from(STREAM), 25, SP).unwrap(), 0, "walked past the target");
+        assert_eq!(g.u32(RECORD + SEEK_PUBLISH_POSITION).unwrap(), 20);
+        assert_eq!(g.u32(RECORD + SEEK_PUBLISH_LENGTH).unwrap(), 5, "min(25 - 20, 5)");
+        assert_eq!(g.u32(RECORD + SEEK_PUBLISH_SKIP).unwrap(), 0, "(25 - 5) - 20");
+        assert_eq!(g.u32(RECORD + SEEK_PUBLISH_OFFSET).unwrap(), 9, "stream 0 summed over two records: 3 + 6");
+        assert_eq!(g.u32(RECORD + SEEK_PUBLISH_BASE).unwrap(), 106, "the entry word plus 2 + 4");
+        assert_eq!(g.u8(RECORD + SEEK_PUBLISH_EXACT).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_negative_first_length_returns_one_and_publishes_nothing() {
+        let mut g = guest();
+        fill(&mut g, STREAM, &seek_stream(&[[3, 2, -1, 0]]));
+        g.set_u32(RECORD + SEEK_PUBLISH_POSITION, 0x7777).unwrap();
+        assert_eq!(seek_record(&mut g, RECORD, u64::from(STREAM), 25, SP).unwrap(), 1);
+        assert_eq!(g.u32(RECORD + SEEK_PUBLISH_POSITION).unwrap(), 0x7777);
+    }
+
+    #[test]
+    fn mode_one_publishes_every_record_and_marks_it_exact() {
+        let mut g = guest();
+        fill(&mut g, STREAM, &seek_stream(&[[3, 2, 10, 1], [3, 2, 0, 0], [3, 2, 0, 0]]));
+        g.set_u32(RECORD + SEEK_MIN_LENGTH, 5).unwrap();
+        seek_record(&mut g, RECORD, u64::from(STREAM), 25, SP).unwrap();
+        // Record 0 is published because its mode is 1; the later ones decode a mode of 1 too (a
+        // repeat run's sum stays 1), so the last published is the one at 20.
+        assert_eq!(g.u8(RECORD + SEEK_PUBLISH_EXACT).unwrap(), 1);
+        assert_eq!(g.u32(RECORD + SEEK_PUBLISH_POSITION).unwrap(), 20);
+    }
+
+    // ------------------------------------------------------------------ sub_82B50100
+
+    const CURSOR: u32 = BASE + 0x200;
+    const DESC: u32 = BASE + 0x300;
+    const TABLE: u32 = BASE + 0x400;
+    const CHUNK: u32 = BASE + 0x4000;
+
+    fn packet_guest(samples: u32, header: u32) -> Guest {
+        let mut g = guest();
+        g.set_u32(DESC + PACKET_DESC_SAMPLES, samples).unwrap();
+        g.set_u8(DESC + PACKET_DESC_FLAG, 1).unwrap();
+        g.set_u32(CHUNK, (0x3000 << 2) | 1).unwrap(); // 0x3000 bytes, one flag bit
+        g.set_u32(CHUNK + 4, header).unwrap();
+        g
+    }
+
+    #[test]
+    fn a_target_in_the_first_packet_publishes_its_header_position() {
+        // 100 samples is frame 0; the header word 0x00012800 carries bit position 37.
+        let mut g = packet_guest(100, 0x0001_2800);
+        assert_eq!(seek_packet(&mut g, CURSOR, 0, DESC, u64::from(CHUNK), SP).unwrap(), 0x3000);
+        assert_eq!(g.u32(CURSOR + PACKET_CURSOR_PACKET).unwrap(), CHUNK + 4);
+        assert_eq!(g.u32(CURSOR + PACKET_CURSOR_BITS).unwrap(), 37);
+        assert_eq!(g.u32(CURSOR + PACKET_CURSOR_REMAINING).unwrap(), 0x3000 - 4);
+    }
+
+    #[test]
+    fn a_position_past_the_page_is_poisoned() {
+        let mut g = packet_guest(100, 16_352 << 11);
+        seek_packet(&mut g, CURSOR, 0, DESC, u64::from(CHUNK), SP).unwrap();
+        assert_eq!(g.u32(CURSOR + PACKET_CURSOR_BITS).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn the_seek_table_walks_whole_packets_until_the_target_frame() {
+        // Frame 5 (2,560 samples); substream 1's packets hold 2, then 3, then 4 frames, so the walk
+        // passes two packets and lands on the third with no frames left to skip.
+        let mut g = packet_guest(5 * 512, 0);
+        g.set_u32(DESC + PACKET_DESC_TABLE, TABLE).unwrap();
+        g.set_u32(TABLE + 4, 0x40).unwrap();
+        fill(&mut g, TABLE + 0x40, &vec![2, 3, 4]);
+        g.set_u32(CHUNK + 4 + 4096, 0x0000_5000).unwrap(); // the third packet's header: position 10
+        seek_packet(&mut g, CURSOR, 1, DESC, u64::from(CHUNK), SP).unwrap();
+        assert_eq!(g.u32(CURSOR + PACKET_CURSOR_PACKET).unwrap(), CHUNK + 4 + 4096);
+        assert_eq!(g.u32(CURSOR + PACKET_CURSOR_BITS).unwrap(), 10);
+        assert_eq!(g.u32(CURSOR + PACKET_CURSOR_REMAINING).unwrap(), 0x3000 - 4096 - 4);
     }
 }
