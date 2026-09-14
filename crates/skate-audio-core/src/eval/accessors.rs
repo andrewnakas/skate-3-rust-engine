@@ -29,6 +29,21 @@ pub fn op_take_word_0(g: &mut Guest, object: u32) -> Result<u64> {
     Ok(value)
 }
 
+/// Slot 1 — `sub_82832BA8`. Return the word at `+20`; no store.
+///
+/// **Not shadow-verified**, unlike the rest of this table: the function is outside the audio corpus
+/// (identical code folding shares it with game code), so no `.inc` exists. It is one instruction,
+/// `lwz r3,20(r3); blr`, so the transcription is the whole of it. Zero-extended into `r3`.
+pub fn op_word_20(g: &mut Guest, object: u32) -> Result<u64> {
+    Ok(g.u32(object + 20)? as u64)
+}
+
+/// Slot 2 — `sub_82C8CDC8`. Return the word at `+24`; no store. The same standing as slot 1:
+/// `lwz r3,24(r3); blr`, not shadow-verified.
+pub fn op_word_24(g: &mut Guest, object: u32) -> Result<u64> {
+    Ok(g.u32(object + 24)? as u64)
+}
+
 /// Slot 37 — `sub_82B1D7D0`. Return the byte flag at `+25` and clear it.
 ///
 /// Writes: the one byte at `+25`. Zero-extended into `r3`.
@@ -157,6 +172,16 @@ pub fn op_stack_push(g: &mut Guest, object: u32) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::eval::testutil::*;
+
+    #[test]
+    fn the_folded_accessors_read_without_clearing() {
+        let mut g = block_guest();
+        g.set_u32(BLOCK + 20, 0x8000_0014).unwrap();
+        g.set_u32(BLOCK + 24, 0x0000_0018).unwrap();
+        assert_eq!(op_word_20(&mut g, BLOCK).unwrap(), 0x8000_0014, "zero-extended, not sign-extended");
+        assert_eq!(op_word_24(&mut g, BLOCK).unwrap(), 0x18);
+        assert_eq!(g.u32(BLOCK + 20).unwrap(), 0x8000_0014, "no store");
+    }
 
     #[test]
     fn the_take_and_clear_trio_return_the_old_value() {

@@ -33,7 +33,10 @@
 //!
 //! ## Coverage
 //!
-//! **All 31 slots that have a verified C++ body are ported.** Of the 9 that are not:
+//! **All 31 slots that have a verified C++ body are ported, plus slots 1 and 2** (2026-09-14): those
+//! two are single-instruction accessors outside the audio corpus (`lwz r3,20(r3); blr` and
+//! `lwz r3,24(r3); blr`), not shadow-verified, and needed by every player bank's program. Of the 9
+//! slots without a verified body:
 //!
 //! - **Three fail the port screen's gate 1** and have no verified reference in either language:
 //!   slots 4, 27 and 39 (`sub_82B1C150`, `sub_82B1D240`, `sub_82B1C450`), each because it makes an
@@ -42,7 +45,7 @@
 //! - **One is a pending path split**: slot 5 `sub_82B1C210` has a C++ body as of 2026-09-12, but
 //!   `STATUS: pending` — the harness can compare it only on the inputs that skip its
 //!   `sub_828E29C0` broadcast. Nothing unverified is translated here, so it waits.
-//! - **Five are outside the 216 audio-thread functions**: slots 1, 2, 19, 20 and 38 have no `.inc`
+//! - **Five are outside the 216 audio-thread functions** (1 and 2 now ported as above): slots 1, 2, 19, 20 and 38 have no `.inc`
 //!   at all, so nothing has been screened for them. Slots 1 and 2 are not even in the audio corpus.
 //!
 //! The C++ side moves: this coverage reflects `recomp/src/audio_ports/` as of 2026-09-12, and
@@ -174,8 +177,8 @@ const fn missing(guest: u32, name: &'static str, absent: &'static str) -> Slot {
 /// The table as the guest image holds it, slot for slot.
 pub static TABLE: [Slot; TABLE_SLOTS] = [
     ported(0x82B1_BF68, "sub_82B1BF68", accessors::op_take_word_16),
-    missing(0x8283_2BA8, "sub_82832BA8", "outside the audio corpus: `lwz r3,20(r3); blr`, i.e. return block[20], folded with game code"),
-    missing(0x82C8_CDC8, "sub_82C8CDC8", "outside the audio corpus: `lwz r3,24(r3); blr`, i.e. return block[24], folded with game code"),
+    ported(0x8283_2BA8, "sub_82832BA8", accessors::op_word_20),
+    ported(0x82C8_CDC8, "sub_82C8CDC8", accessors::op_word_24),
     ported(0x82B1_BF80, "sub_82B1BF80", accessors::op_take_word_0),
     missing(0x82B1_C150, "sub_82B1C150", "gate 1: sub_82B1BF98's closure leaves the audio corpus"),
     missing(0x82B1_C210, "sub_82B1C210", "pending path split: comparable only when the broadcast is skipped"),
@@ -313,8 +316,8 @@ mod tests {
     }
 
     #[test]
-    fn thirty_one_of_forty_slots_are_ported() {
-        assert_eq!(ported_slots(), 31);
+    fn thirty_three_of_forty_slots_are_ported() {
+        assert_eq!(ported_slots(), 33);
         assert_eq!(TABLE.len(), TABLE_SLOTS);
     }
 

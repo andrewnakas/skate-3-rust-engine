@@ -333,3 +333,7 @@ pub(crate) mod testutil {
 /// The `.csi` symbol tables at run time: install a project, resolve a symbol into a slot.
 /// Unverified new work; see the module note.
 pub mod symbols;
+
+/// Patch banks at run time: load an `.abk`, post to an object, spawn evaluator instances.
+/// Unverified new work; see the module note.
+pub mod patch;
