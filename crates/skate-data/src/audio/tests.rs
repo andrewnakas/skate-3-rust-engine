@@ -45,6 +45,7 @@ fn a_zero_sample_rate_does_not_divide_by_zero() {
         channels: 1,
         num_samples: 1000,
         contexts: 1,
+        header_bytes: 8,
     };
     assert_eq!(info.duration_secs(), 0.0);
 }
@@ -105,14 +106,24 @@ fn a_decoder_error_surfaces_as_decode_not_format() {
 
 #[test]
 fn the_stream_header_is_skipped_before_the_block_chain() {
-    use super::STREAM_HEADER;
     // The trap this guards: a 48 kHz header's first word is 0x0300bb80, whose low 24 bits are
     // 48000, so reading it as a block header yields a plausible 48,000-byte block. The walk then
     // lands mid-audio and fails far away from the real mistake.
     let header = header_bytes(1, 48_000, 710_784);
-    assert_eq!(STREAM_HEADER, 8);
+    assert_eq!(describe(&header, 0).unwrap().header_bytes, 8);
     let word = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     assert_eq!(word & 0x00FF_FFFF, 48_000, "the trap itself");
+}
+
+#[test]
+fn a_looping_stream_header_is_twelve_bytes() {
+    // GRINDS.abk, slot 0: the loop bit is set, so a loop start word follows and the chain begins
+    // at +12. Skipping 8 read that word, zero, as a block header of size 0.
+    let mut header = header_bytes(1, 48_000, 710_784);
+    header[4] |= 0x20;
+    header.extend_from_slice(&0u32.to_be_bytes());
+    let info = describe(&header, 0).unwrap();
+    assert_eq!((info.num_samples, info.header_bytes), (710_784, 12));
 }
 
 #[test]

@@ -68,11 +68,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // block chains whose channel count and rate live in the metadata table instead, so those
     // have to be supplied. Guessing them from the first block is not possible: the block header
     // carries a size and a sample count and nothing about the format.
-    let mut headered = true;
     let mut info = match audio::describe(&data, at) {
         Ok(info) => info,
         Err(e) if channels != 0 => {
-            headered = false;
             println!("no stream header here ({e}); using the channel count and rate given");
             audio::StreamInfo {
                 codec: eaac::Codec::Xma,
@@ -80,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 channels,
                 num_samples: 0,
                 contexts: audio::context_widths(channels).len(),
+                header_bytes: 0,
             }
         }
         Err(e) => return Err(format!("{e} -- pass --channels to read it as a bare block chain").into()),
@@ -107,10 +106,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The chain is bounded by the MEMBER, not by the file: walking off its end reads the next
     // member's bytes as a block header and reports a nonsense size from deep in the archive.
     let end = end.min(data.len());
-    // A headered stream's chain starts after the header. Reading the header as a block header is
-    // the quiet failure: its low 24 bits are the sample rate, so 48 kHz looks like a 48,000-byte
-    // block and the walk dies much later, somewhere that looks like a corrupt archive.
-    let chain = if headered { at + audio::STREAM_HEADER } else { at };
+    // A headered stream's chain starts after the header, whose size depends on whether it loops
+    // (zero for a bare chain). Reading the header as a block header is the quiet failure: its low
+    // 24 bits are the sample rate, so 48 kHz looks like a 48,000-byte block and the walk dies much
+    // later, somewhere that looks like a corrupt archive.
+    let chain = at + info.header_bytes;
     for block in eaac::blocks(&data[chain..end])? {
         if blocks_limit != 0 && blocks_seen >= blocks_limit {
             break;

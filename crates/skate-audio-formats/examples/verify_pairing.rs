@@ -4,6 +4,9 @@
 //! If the parsers are right, the blocks must sum to the header. This is the strongest
 //! available correctness check short of decoding audio.
 //!
+//! A looping streamed header also names the byte offset of the loop's block. That offset must be a
+//! block boundary of the `.sns` chain, and the block starting there must hold the loop start sample.
+//!
 //!     cargo run --example verify_pairing -- <resident.big> <payload.big>
 
 use skate_audio_formats::{eaac, eb};
@@ -35,6 +38,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ok = 0;
     let mut mismatched = 0;
     let mut unpaired = 0;
+    let mut loops_ok = 0;
+    let mut loops_bad = 0;
     for entry in &eb::Archive::parse(&payload)?.entries {
         let Some(name) = entry.name.as_deref() else { continue };
         if !name.ends_with(".sns") {
@@ -50,6 +55,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let blocks = eaac::blocks(bytes)?;
         let summed: u64 = blocks.iter().map(|b| u64::from(b.num_samples)).sum();
         let claimed = u64::from(rec.header.num_samples);
+        if let (Some(start), Some(offset)) = (rec.header.loop_start, rec.header.loop_offset) {
+            // Samples before the block at `offset`, if some block starts there.
+            let mut before = 0u64;
+            let mut found = None;
+            for b in &blocks {
+                if b.offset == offset as usize {
+                    found = Some((before, before + u64::from(b.num_samples)));
+                    break;
+                }
+                before += u64::from(b.num_samples);
+            }
+            match found {
+                Some((first, end)) if (first..end).contains(&u64::from(start)) => loops_ok += 1,
+                Some((first, end)) => {
+                    loops_bad += 1;
+                    println!("  {name:38.38} loop start {start} outside its block's samples {first}..{end}");
+                }
+                None => {
+                    loops_bad += 1;
+                    println!("  {name:38.38} loop offset {offset:#x} is not a block boundary");
+                }
+            }
+        }
         if summed == claimed {
             ok += 1;
         } else {
@@ -62,5 +90,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("\n  exact match: {ok}   mismatched: {mismatched}   unpaired: {unpaired}");
+    println!("  loop offsets on a block holding the loop start: {loops_ok}   wrong: {loops_bad}");
     Ok(())
 }

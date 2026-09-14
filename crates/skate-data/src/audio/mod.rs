@@ -26,6 +26,11 @@ pub struct StreamInfo {
     pub num_samples: u32,
     /// Decoder contexts the stream needs: XMA pairs channels, so this is not the channel count.
     pub contexts: usize,
+    /// Bytes of header before an inline block chain: 8, or 12 when the stream loops, because a
+    /// looping header carries its loop start as a third word (16 for a looping streamed sound,
+    /// which adds the loop's byte offset). Zero when the header does not sit in front of its chain:
+    /// a `.mus` SNR table, a `.sth` sub-sound, or a bare chain described from metadata.
+    pub header_bytes: usize,
 }
 
 impl StreamInfo {
@@ -98,15 +103,14 @@ impl From<skate_audio_formats::Error> for Error {
     }
 }
 
-/// Bytes of the EA Audio Core stream header that precede the block chain.
-///
-/// Skipping it is not optional and getting it wrong is quiet rather than loud: the header's first
-/// word carries the sample rate in its low 24 bits, so a 48 kHz stream read as a block header
-/// announces a block of exactly 48,000 bytes. The walk then advances into the middle of the audio
-/// and fails somewhere downstream, which reads like a corrupt archive rather than an off-by-eight.
-pub const STREAM_HEADER: usize = 8;
-
 /// Describe the stream beginning at `at` without decoding any of it.
+///
+/// Skip [`StreamInfo::header_bytes`] to reach the block chain, never a fixed 8. Getting it wrong is
+/// quiet rather than loud. Read from +0, the header's first word carries the sample rate in its low
+/// 24 bits, so a 48 kHz stream announces a block of exactly 48,000 bytes and the walk fails deep in
+/// the audio. Read from +8 on a looping stream, the loop start is taken for a block header, usually
+/// a block of size 0: 399 of the 5,168 bank samples in `audiofiles.big` loop, the grind sounds among
+/// them.
 pub fn describe(data: &[u8], at: usize) -> Result<StreamInfo, Error> {
     let header = eaac::Header::parse(data, at)?;
     let channels = header.channels();
@@ -116,6 +120,7 @@ pub fn describe(data: &[u8], at: usize) -> Result<StreamInfo, Error> {
         channels,
         num_samples: header.num_samples,
         contexts: eaac::context_count(channels),
+        header_bytes: header.size(),
     })
 }
 
@@ -167,6 +172,7 @@ pub fn describe_any(data: &[u8]) -> Result<Container, Error> {
                     channels,
                     num_samples: h.num_samples,
                     contexts: eaac::context_count(channels),
+                    header_bytes: 0,
                 });
             }
         }
@@ -252,6 +258,7 @@ fn sub_sound_entries(data: &[u8], archive: &eb::Archive) -> Vec<(String, Vec<Str
                     channels,
                     num_samples: sub.header.num_samples,
                     contexts: eaac::context_count(channels),
+                    header_bytes: 0,
                 }
             })
             .collect();
@@ -325,7 +332,7 @@ pub fn decode_stream(
     let widths = context_widths(info.channels);
     let mut per_context: Vec<Vec<i16>> = vec![Vec::new(); info.contexts];
     // The chain follows the header this call just parsed.
-    let chain = at + STREAM_HEADER;
+    let chain = at + info.header_bytes;
     for block in eaac::blocks(&data[chain..])? {
         let range = block.data_range();
         let payload = &data[chain + range.start..chain + range.end];

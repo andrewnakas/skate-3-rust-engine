@@ -10,7 +10,21 @@
 //! ```text
 //! header1  [4b version][4b codec][6b channel_config][18b sample_rate]
 //! header2  [2b stream_type][1b loop][29b num_samples]
+//! loop     u32 loop start sample -- present ONLY when the loop bit is set
+//! loopoff  u32 byte offset of the loop's block -- present ONLY when looping AND stream_type is 1
 //! ```
+//!
+//! The third word is easy to miss because most streams do not loop. Measured 2026-09-14 over every
+//! bank sample in `audiofiles.big`: 399 of 5,168 set the loop bit, and every one of those has its
+//! block chain at +12, with a loop start inside the stream. Walking them from +8 reads the loop start
+//! as a block header -- usually a block of size 0, "does not advance".
+//!
+//! The fourth word belongs to streamed sounds (stream_type 1), whose block chain lives in a separate
+//! `.sns` member, so a loop has to say which byte of that chain to seek back to as well as which
+//! sample. Measured 2026-09-14 over the `.snr` sidecars in every archive: all 23 16-byte records
+//! loop with stream_type 1, the one 8-byte record does not loop, and the offsets land on a block
+//! boundary of the paired `.sns` whose block holds the loop start (`examples/verify_pairing.rs`).
+//! Those 16 bytes were read as "8 unknown trailing bytes" until then.
 
 use crate::{be32, Error, Result};
 
@@ -41,22 +55,44 @@ pub struct Header {
     pub stream_type: u8,
     pub looping: bool,
     pub num_samples: u32,
+    /// The loop start sample, the third header word, present exactly when [`Header::looping`].
+    pub loop_start: Option<u32>,
+    /// Byte offset of the block holding the loop start within the stream's block chain, the fourth
+    /// header word, present exactly when the stream loops and is [`Header::STREAMED`].
+    pub loop_offset: Option<u32>,
 }
 
 impl Header {
+    /// Bytes of a header without a loop start. Use [`Header::size`] for where the block chain begins.
     pub const SIZE: usize = 8;
+    /// Bytes of a header with a loop start.
+    pub const LOOPING_SIZE: usize = 12;
+    /// Bytes of a looping streamed header, which also carries the loop's byte offset.
+    pub const STREAMED_LOOPING_SIZE: usize = 16;
+    /// The `stream_type` of a sound whose blocks are streamed from a separate member.
+    pub const STREAMED: u8 = 1;
 
     pub fn parse(data: &[u8], at: usize) -> Result<Self> {
         let h1 = be32(data, at)?;
         let h2 = be32(data, at + 4)?;
+        let stream_type = (h2 >> 30) as u8 & 0x3;
+        let looping = (h2 >> 29) & 1 != 0;
+        let loop_start = if looping { Some(be32(data, at + 8)?) } else { None };
+        let loop_offset = if looping && stream_type == Self::STREAMED {
+            Some(be32(data, at + 12)?)
+        } else {
+            None
+        };
         let header = Self {
             version: (h1 >> 28) as u8 & 0xF,
             codec: Codec::from_id((h1 >> 24) as u8 & 0xF),
             channel_config: (h1 >> 18) as u8 & 0x3F,
             sample_rate: h1 & 0x3_FFFF,
-            stream_type: (h2 >> 30) as u8 & 0x3,
-            looping: (h2 >> 29) & 1 != 0,
+            stream_type,
+            looping,
             num_samples: h2 & 0x1FFF_FFFF,
+            loop_start,
+            loop_offset,
         };
         header.check_plausible(at)?;
         Ok(header)
@@ -80,7 +116,22 @@ impl Header {
         if self.num_samples == 0 {
             return Err(Error::new(at, "zero samples"));
         }
+        if let Some(start) = self.loop_start {
+            if start >= self.num_samples {
+                return Err(Error::new(at + 8, format!("loop start {start} is past {} samples", self.num_samples)));
+            }
+        }
         Ok(())
+    }
+
+    /// Bytes this header occupies, and so where an inline block chain begins: 16 for a looping
+    /// streamed sound, 12 for any other looping one, 8 otherwise.
+    pub fn size(&self) -> usize {
+        match (self.loop_start, self.loop_offset) {
+            (Some(_), Some(_)) => Self::STREAMED_LOOPING_SIZE,
+            (Some(_), None) => Self::LOOPING_SIZE,
+            _ => Self::SIZE,
+        }
     }
 
     /// Channel count. The header stores one less than the true count.
@@ -236,28 +287,22 @@ pub fn context_count(channels: u8) -> usize {
 /// Verified against `ambienceresident.big` / `ambience.big`: 24 stems each, all 24 paired,
 /// none left over.
 ///
-/// The record is **variable length**: either the 8-byte header alone, or the header plus
-/// 8 further bytes. In `ambienceresident.big` every looping stream carries the extended
-/// form and the one non-looping stream (`23_Press_start_screen`) carries the short form,
-/// so the trailing bytes are most likely loop metadata. They were zero in every entry
-/// sampled, so their meaning is not established and they are exposed raw rather than
-/// interpreted.
+/// The record is **variable length**, 8 or 16 bytes. In `ambienceresident.big` every looping
+/// stream carries the long form and the one non-looping stream (`23_Press_start_screen`) the
+/// short form.
 ///
 /// An earlier version of this type required 16 bytes, having generalised from three
 /// sampled entries that all happened to be extended. That silently dropped the short
-/// record.
+/// record. The 16-byte form turned out not to be a header plus trailing data at all: it is
+/// the header of a looping streamed sound, whose two loop words [`Header::parse`] reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnrRecord {
     pub header: Header,
-    /// The 8 trailing bytes, when present.
-    pub extended: Option<[u8; 8]>,
 }
 
 impl SnrRecord {
-    /// Smallest valid record: the header alone.
+    /// Smallest valid record: a header with no loop words.
     pub const MIN_SIZE: usize = Header::SIZE;
-    /// Record size when the trailing bytes are present.
-    pub const EXTENDED_SIZE: usize = 16;
 
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < Self::MIN_SIZE {
@@ -266,10 +311,7 @@ impl SnrRecord {
                 format!("`.snr` record is {} bytes, want at least {}", data.len(), Self::MIN_SIZE),
             ));
         }
-        let extended = data
-            .get(Header::SIZE..Self::EXTENDED_SIZE)
-            .map(|b| [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-        Ok(Self { header: Header::parse(data, 0)?, extended })
+        Ok(Self { header: Header::parse(data, 0)? })
     }
 }
 
@@ -398,7 +440,9 @@ mod tests {
         assert!(r.header.looping);
         assert_eq!(r.header.num_samples, 7_083_007);
         assert!((r.header.duration_secs() - 147.56).abs() < 0.01);
-        assert_eq!(r.extended, Some([0u8; 8]));
+        assert_eq!(r.header.stream_type, Header::STREAMED);
+        assert_eq!((r.header.loop_start, r.header.loop_offset), (Some(0), Some(0)));
+        assert_eq!(r.header.size(), 16);
     }
 
     #[test]
@@ -409,7 +453,29 @@ mod tests {
         let r = SnrRecord::parse(&raw).unwrap();
         assert_eq!(r.header.num_samples, 1_511_036);
         assert!(!r.header.looping);
-        assert_eq!(r.extended, None);
+        assert_eq!((r.header.loop_start, r.header.loop_offset), (None, None));
+        assert_eq!(r.header.size(), 8);
+    }
+
+    #[test]
+    fn parses_a_streamed_loop_offset() {
+        // ambienceresident.big / 19_reclaimed_b_fix.snr, verbatim: the one record whose loop
+        // words are not both zero. Loop start sample 321, in the block at byte 0x280 of its .sns.
+        let raw = [
+            0x03, 0x10, 0xBB, 0x80, 0x60, 0x55, 0x86, 0xD5,
+            0x00, 0x00, 0x01, 0x41, 0x00, 0x00, 0x02, 0x80,
+        ];
+        let h = SnrRecord::parse(&raw).unwrap().header;
+        assert_eq!(h.stream_type, Header::STREAMED);
+        assert_eq!(h.num_samples, 5_605_077);
+        assert_eq!((h.loop_start, h.loop_offset), (Some(321), Some(0x280)));
+        assert_eq!(h.size(), Header::STREAMED_LOOPING_SIZE);
+    }
+
+    #[test]
+    fn a_looping_streamed_header_needs_its_fourth_word() {
+        let raw = [0x03, 0x10, 0xBB, 0x80, 0x60, 0x55, 0x86, 0xD5, 0x00, 0x00, 0x01, 0x41];
+        assert!(Header::parse(&raw, 0).is_err());
     }
 
     #[test]
@@ -506,5 +572,35 @@ mod tests {
         assert_eq!(b[0].num_samples, 1280);
         assert_eq!(b[0].data_range(), 8..16);
         assert_eq!(b[1].offset, 16);
+    }
+
+    // ----------------------------------------------------------------- the loop-start word
+
+    fn words(ws: &[u32]) -> Vec<u8> {
+        ws.iter().flat_map(|w| w.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn a_looping_header_is_twelve_bytes_and_carries_its_loop_start() {
+        // XMA, mono, 48 kHz; loop bit set, 101,701 samples; loop start 5.
+        let data = words(&[0x0300_BB80, 0x2001_8D45, 5]);
+        let h = Header::parse(&data, 0).unwrap();
+        assert!(h.looping);
+        assert_eq!(h.loop_start, Some(5));
+        assert_eq!(h.size(), 12);
+    }
+
+    #[test]
+    fn a_plain_header_is_eight_bytes_and_reads_no_third_word() {
+        let data = words(&[0x0300_BB80, 0x0001_8D45]);
+        let h = Header::parse(&data, 0).unwrap();
+        assert_eq!(h.loop_start, None);
+        assert_eq!(h.size(), 8);
+    }
+
+    #[test]
+    fn a_loop_start_past_the_stream_is_rejected() {
+        let data = words(&[0x0300_BB80, 0x2000_0010, 0x10]);
+        assert!(Header::parse(&data, 0).is_err());
     }
 }

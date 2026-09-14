@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(outdir) = outdir else { return Ok(()) };
     std::fs::create_dir_all(&outdir)?;
     let widths = audio::context_widths(info.channels);
-    let chain_start = range.start + audio::STREAM_HEADER;
+    let chain_start = range.start + info.header_bytes;
     let mut chains: Vec<Vec<Vec<u8>>> = vec![Vec::new(); info.contexts];
     for block in skate_audio_formats::eaac::blocks(&bytes[chain_start..range.end])? {
         let r = block.data_range();

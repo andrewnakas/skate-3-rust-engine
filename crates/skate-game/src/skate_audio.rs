@@ -343,7 +343,7 @@ fn decode(request: &StreamRequest) -> Result<StreamPcm, String> {
     // header when there is one, and skip it: its low 24 bits are the sample rate, so reading it
     // as a block header looks like a 48,000-byte block and fails far from the real mistake.
     let (chain, channels, rate) = match audio::describe(&data, at) {
-        Ok(info) => (at + audio::STREAM_HEADER, info.channels, info.sample_rate),
+        Ok(info) => (at + info.header_bytes, info.channels, info.sample_rate),
         Err(_) => (at, request.channels, request.sample_rate),
     };
     let widths = audio::context_widths(channels);
