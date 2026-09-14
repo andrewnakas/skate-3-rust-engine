@@ -9,6 +9,7 @@
 //!     cargo run --release --example grind_instance -- <audiofiles.big> <image dir> [bank] [object]
 
 use skate_audio_core::eval::interp;
+use skate_audio_core::{classes, device, mathlib, modules};
 use skate_audio_core::patch::{self, BumpHeap};
 use skate_audio_core::voice::{OpenRequest, VoiceDevice};
 use skate_audio_core::{Guest, Result as CoreResult, Segment, symbols};
@@ -16,10 +17,31 @@ use skate_audio_formats::eaac;
 
 /// Logs every call a patch makes on its voices, and keeps each voice alive.
 struct LoggingDevice {
+    /// GRAPH=1: open each voice for real with `device::open_voice_graph` and log what it built.
+    graph: Option<Graph>,
     voices: u32,
     frame: usize,
     lines: Vec<String>,
     last: std::collections::HashMap<(u32, u32), u32>,
+}
+
+/// What a real open needs besides guest memory: its own heap, the audio system, a device object,
+/// scratch for the request's blocks, and a stack.
+struct Graph {
+    heap: BumpHeap,
+    system: u32,
+    device: u32,
+    scratch: u32,
+    sp: u32,
+}
+
+/// A module class's name, by descriptor.
+fn class_name(class: u32) -> &'static str {
+    match class {
+        0x82FD_28C0 => "Send",
+        0x82FC_E4CC => "GainFader",
+        _ => classes::CLASSES.iter().find(|c| c.1 == class).map(|c| c.2).unwrap_or("?"),
+    }
 }
 
 impl LoggingDevice {
@@ -42,6 +64,48 @@ impl VoiceDevice for LoggingDevice {
             "open voice {voice:#x}: sample index {} at {:#x} [{header}], byte2 {}, descriptor {:x?}, bank+72 {:#x}, arg8 {:#x}, {} records",
             r.index, r.sample, r.byte2, r.shifted, r.bank_72, r.arg8, r.record_count
         ));
+        let Some(graph) = self.graph.as_mut() else { return Ok(voice) };
+        for (i, w) in r.shifted.iter().enumerate() {
+            g.set_u32(graph.scratch + 4 * i as u32, *w)?;
+        }
+        g.set_u32(graph.scratch + 24, r.record_count)?;
+        g.set_u32(graph.scratch + 28, r.records)?;
+        let ring_start = g.u32(graph.system + 204)?;
+        let voice = device::open_voice_graph(
+            g, &mut graph.heap, &mut mathlib::Image, &mut device::NoBuses, graph.device, r.sample as u32, r.byte2 as u32,
+            graph.scratch, r.bank_72, r.arg8 as u32, graph.scratch + 24, graph.sp,
+        )?;
+        let player = g.u32(voice + 4)?;
+        let modules: Vec<String> = (0..g.u8(player + 68)? as u32)
+            .map(|i| {
+                let instance = g.u32(player + 80 + 4 * i).unwrap();
+                let class = g.u32(instance + 20).unwrap();
+                format!("{}x{}", class_name(class), g.u8(instance + 42).unwrap())
+            })
+            .collect();
+        let line = format!("  graph for voice {voice:#x}: player {player:#x}, {} modules [{}], duration {:.3} s", modules.len(), modules.join(" "), f64::from_bits(g.u64(voice + 56)?));
+        self.lines.push(line);
+        let (ring, end) = (g.u32(graph.system + 48)?, g.u32(graph.system + 204)?);
+        let mut at = ring_start;
+        let mut commands = Vec::new();
+        while at < end {
+            let record = ring + at;
+            let (handler, target) = (g.u32(record)?, g.u32(record + 4)?);
+            let (size, what) = match handler {
+                modules::INSTALL_COMMAND => (8, "install".to_string()),
+                device::COMMAND_PLAYER_FLOAT => (12, format!("player+56={}", g.f32(record + 8)?)),
+                device::COMMAND_STAMP => {
+                    let name = g.u32(target + 20).map(class_name).unwrap_or("?");
+                    (16, format!("{name} id {} = {}", g.u32(record + 8)?, g.f32(record + 12)?))
+                }
+                device::COMMAND_SEND_BUS => (16, format!("send bus {:#x}", g.u32(record + 12)?)),
+                device::COMMAND_PLAY => (g.u16(record + 44)? as u32, format!("play sample {:#x} counter {}", g.u32(record + 32)?, g.f32(record + 48)?)),
+                _ => break,
+            };
+            commands.push(what);
+            at += size;
+        }
+        self.lines.push(format!("  commands: {}", commands.join("; ")));
         Ok(voice)
     }
     fn release(&mut self, _g: &mut Guest, v: u32) -> CoreResult<()> {
@@ -211,7 +275,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 256 samples at 48 kHz per audio frame.
     let delta = (256.0f32 / 48_000.0) as f64;
     let mut ops = 0usize;
-    let mut device = LoggingDevice { voices: 0, frame: 0, lines: Vec::new(), last: Default::default() };
+    // GRAPH=1 sets up what a real open reads: an audio system with a command ring, the Send class
+    // registered (the game registers it on another path), and a bus manager whose buses 0-17 exist.
+    let graph = if std::env::var_os("GRAPH").is_some() {
+        const SPACE: u32 = 0x4100_0000;
+        const GRAPH_HEAP: u32 = 0x6800_0000;
+        g.put(SPACE, vec![0; 0x2_0000]);
+        g.put(GRAPH_HEAP, vec![0; 0x40_0000]);
+        let mut heap = BumpHeap { next: GRAPH_HEAP, end: GRAPH_HEAP + 0x40_0000 };
+        let (system, ring, manager, root, device_object) = (SPACE, SPACE + 0x1000, SPACE + 0x8000, SPACE + 0x9000, SPACE + 0x9100);
+        g.set_u32(modules::SYSTEM, system)?;
+        g.set_u32(system + 48, ring)?;
+        let registry = classes::class_registry(&mut g, &mut heap, system)?;
+        classes::register_class(&mut g, registry, 0x82FD_28C0)?;
+        g.set_u32(device::BUS_MANAGER, manager)?;
+        g.set_u32(manager + 52, SPACE + 0x9200)?;
+        g.set_u32(SPACE + 0x9200, 0xB0B0_0FFF)?;
+        for i in 0..18u32 {
+            g.set_u32(manager + (271 + i) * 4, SPACE + 0x9300 + 4 * i)?;
+            g.set_u32(SPACE + 0x9300 + 4 * i, 0xB0B0_0000 + i)?;
+            g.set_u8(manager + 1148 + i, 1)?;
+        }
+        g.set_u32(classes::BUS_ROOT, root)?;
+        g.set_u32(root + 44, SPACE + 0x9400)?;
+        g.set_u32(SPACE + 0x9400, 0xB0B0_0DEF)?;
+        g.set_u32(classes::DEFAULT_BUS, 0)?;
+        g.set_u32(classes::REGISTERED, 0)?;
+        Some(Graph { heap, system, device: device_object, scratch: SPACE + 0xA000, sp: SPACE + 0x1_F000 })
+    } else {
+        None
+    };
+    let mut device = LoggingDevice { graph, voices: 0, frame: 0, lines: Vec::new(), last: Default::default() };
     let frames: usize = std::env::var("FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(375);
     // UPDATES re-delivers the payload every frame the way the grind updater sub_824C39E0 does:
     // word 0 becomes 32767, and volume, two cutoffs and speed are refreshed (values chosen here).
