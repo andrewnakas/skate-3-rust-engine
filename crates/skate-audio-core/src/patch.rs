@@ -16,7 +16,7 @@
 //! | `sub_82B1C150` (evaluator slot 4), `sub_82B1BF98` | [`end_instance`]: unlink and free |
 //! | `sub_828E2C78` | [`release_message`] |
 //! | `sub_828E2D18` | [`redeliver`]: hand a held message's rewritten payload to its instances again |
-//! | `sub_828E2E08`, `sub_828E2EA0`, `sub_828E30B8`, `sub_828E2D78` | the unregister helpers |
+//! | `sub_828E2E08`, `sub_828E2EA0` | the unregister helpers (`sub_828E30B8` and `sub_828E2D78` are the verified ports in `voices.rs`) |
 //!
 //! Evaluator slot 27, the voice op, is in [`crate::voice`]; [`PatchHost`] runs it and slot 4.
 //!
@@ -39,6 +39,7 @@ use crate::eval::interp::LIST_HEAD;
 use crate::mem::memcpy;
 use crate::symbols::{lookup_table0, lookup_table1, lookup_table2};
 use crate::voice::{VoiceDevice, voice_op};
+use crate::voices::{unlink_checked, unlink_checked_gen8};
 use crate::{Error, Guest, Result};
 
 /// `lis -31997` + 28500: the list of installed banks, linked through each bank's `+80`.
@@ -163,7 +164,7 @@ fn free_instance(g: &mut Guest, heap: &mut dyn Heap, device: &mut dyn VoiceDevic
     if g.u16(record + 32)? != 0 {
         let mut i = 0i32;
         loop {
-            unsubscribe(g, entry, entry + 8, 12)?; // sub_828E30B8
+            unlink_checked(g, entry, entry + 8)?; // sub_828E30B8, verified in voices.rs
             record = g.u32(triple)?;
             i += 1;
             entry = entry.wrapping_add(28);
@@ -182,7 +183,7 @@ fn free_instance(g: &mut Guest, heap: &mut dyn Heap, device: &mut dyn VoiceDevic
     if g.u16(record + 34)? != 0 {
         let mut i = 0i32;
         loop {
-            unsubscribe(g, next, next + 8, 8)?; // sub_828E2D78
+            unlink_checked_gen8(g, next, next + 8)?; // sub_828E2D78, verified in voices.rs
             let words = g.u8(next + 24)? as u32;
             record = g.u32(triple)?;
             i += 1;
@@ -250,31 +251,6 @@ fn unregister_node_callback(g: &mut Guest, heap: &mut dyn Heap, node: u32, item:
         heap.free(g, node)?;
     }
     Ok(())
-}
-
-/// `sub_828E30B8` (`word_at` 12, a table-2 binding) and `sub_828E2D78` (`word_at` 8): take `node`
-/// off the bound symbol's listener list. Returns 0, the binding's negative id, -6 or -3.
-fn unsubscribe(g: &mut Guest, binding: u32, node: u32, word_at: u32) -> Result<i32> {
-    let id = g.u32(binding + 4)?;
-    if (id as i32) < 0 {
-        return Ok(id as i32);
-    }
-    let symbol = g.u32(binding)?;
-    if symbol == 0 {
-        return Ok(-6);
-    }
-    if id as i32 != g.u32(symbol + word_at)? as i32 {
-        g.set_u32(binding + 4, (-3i32) as u32)?;
-        g.set_u32(binding, 0)?;
-        return Ok(-3);
-    }
-    let head = g.u32(symbol)?;
-    if node == head {
-        let next = g.u32(head)?;
-        g.set_u32(symbol, next)?;
-    }
-    unlink(g, node)?;
-    Ok(0)
 }
 
 /// `sub_828E2C78`: release a post node. Run its release callbacks, drop its reference, and free it
