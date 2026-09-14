@@ -982,6 +982,277 @@ pub fn scale_gains(
     fp::store_single(g, gains + 24, s6) // stfs f10,24(r6)
 }
 
+// ====================================================== sub_82B45C50: laying out the panners
+
+const LAYOUT_POOL: u32 = (((-32208i32 as u32) & 0xFFFF) << 16).wrapping_sub(31232);
+/// `lfs f0,2120(r27)` — scales the centre angle and the turn.
+pub const LAYOUT_ANGLE_SCALE: u32 = LAYOUT_POOL + 2120;
+/// `lfs f26,2124(r27)` — scales the three spreads.
+pub const LAYOUT_SPREAD_SCALE: u32 = LAYOUT_POOL + 2124;
+/// `lis -32219 ; lfs 28632` — a first spread equal to this selects the mirrored pair.
+pub const LAYOUT_MIRROR_MARKER: u32 = (((-32219i32 as u32) & 0xFFFF) << 16) + 28632;
+/// `lis -32219 ; lfs 14524` — added to the angle on the mirrored path.
+pub const LAYOUT_MIRROR_BIAS: u32 = (((-32219i32 as u32) & 0xFFFF) << 16) + 14524;
+const _: () = assert!(LAYOUT_ANGLE_SCALE == 0x822F_8E48 && LAYOUT_SPREAD_SCALE == 0x822F_8E4C);
+const _: () = assert!(LAYOUT_MIRROR_MARKER == 0x8225_6FD8 && LAYOUT_MIRROR_BIAS == 0x8225_38BC);
+/// `stwu r1,-224(r1)`. Real: [`crate::mathlib::atan2`] spills its two arguments at `r1+16`/`+24`.
+pub const LAYOUT_FRAME: u32 = 224;
+/// 16 bytes an entry: `{x, y, lengthsq, angle}`.
+pub const PANNER_ENTRY_BYTES: u32 = 16;
+/// `stfs fN,12(rN)` — the angle this function stores.
+pub const PANNER_ENTRY_ANGLE: u32 = 12;
+
+/// `sub_82B45C50`'s float arguments, `f1` to `f7`.
+#[derive(Clone, Copy, Debug)]
+pub struct PannerLayout {
+    /// `f1` — the centre's angle.
+    pub angle: f64,
+    /// `f2` — the centre's distance.
+    pub distance: f64,
+    /// `f3` — each entry's radius about the centre.
+    pub radius: f64,
+    /// `f4` — added to the centre angle before every spread.
+    pub turn: f64,
+    /// `f5`, `f6`, `f7` — the three spreads.
+    pub spreads: [f64; 3],
+}
+
+/// Read the clamped position back out of the entry and store the angle of that direction.
+fn store_panner_angle(g: &mut Guest, entry: u32, sp: u32) -> Result<()> {
+    let x = fp::load_single(g, entry)?; // lfs f2,0(rN)
+    let y = fp::load_single(g, entry.wrapping_add(4))?; // lfs f1,4(rN)
+    let angle = crate::mathlib::atan2(g, y, x, sp)?; // bl 0x82f52318
+    fp::store_single(g, entry.wrapping_add(PANNER_ENTRY_ANGLE), fp::frsp(angle)) // frsp ; stfs
+}
+
+/// One placement: `(cos, sin)` of `angle` times `radius`, about the centre, clamped, then its angle.
+/// The two scaled components come back because the mirrored pair reuses them negated.
+#[allow(clippy::too_many_arguments)]
+fn place_entry<T: Trig>(
+    g: &mut Guest,
+    trig: &mut T,
+    entry: u32,
+    angle: f64,
+    radius: f64,
+    centre: (f64, f64),
+    sp: u32,
+) -> Result<(f64, f64)> {
+    let cosine = fp::frsp(trig.cosine(g, angle)?); // bl 0x82f4dfb0 ; frsp f0,f1
+    let dx = fp::mul_single(cosine, radius); // fmuls fN,f0,f31
+    let sine = fp::frsp(trig.sine(g, angle)?); // bl 0x82f4ded0 ; frsp f13,f1
+    let x = fp::add_single(dx, centre.0); // fadds f1,fN,f30
+    let dy = fp::mul_single(sine, radius); // fmuls f12,f13,f31
+    let y = fp::add_single(dy, centre.1); // fadds f2,f12,f29
+    clamp_to_unit_disc(g, entry, x, y)?; // bl 0x82b453d8
+    store_panner_angle(g, entry, sp)?;
+    Ok((dx, dy))
+}
+
+/// Lay a source's panner entries out around a centre point (`sub_82B45C50`).
+///
+/// `entries` is `r3`, `count` the low word of `r4`, `sp` is `r1`. The centre is `(cos, sin)` of the
+/// scaled angle times the distance. Each entry sits at the centre plus `(cos, sin)` of the centre
+/// angle plus the scaled turn, offset by one of three scaled spreads, times the radius; it is clamped
+/// into the unit disc by [`clamp_to_unit_disc`], and the angle of the clamped direction is stored at
+/// `+12` through [`crate::mathlib::atan2`].
+///
+/// Which entries are written depends only on the count: 1 hands the whole job to [`place_panner`];
+/// 2 writes entries 0 and 1 — a mirrored pair when the first spread equals the pool marker, which
+/// reuses the first placement's offsets negated instead of asking for a second sine; 4 writes 0..3,
+/// 6 writes 0..4 and 8 writes 0..6. Counts 3, 5 and 7 fall through the branch table, and the unsigned
+/// `count - 2 > 6` test drops 0 and every negative count: none of those write anything.
+pub fn lay_out_panners<T: Trig>(
+    g: &mut Guest,
+    trig: &mut T,
+    entries: u32,
+    count: i32,
+    args: PannerLayout,
+    sp: u32,
+) -> Result<()> {
+    let frame = sp.wrapping_sub(LAYOUT_FRAME);
+    g.set_u32(frame, sp)?; // stwu r1,-224(r1)
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    if count == 1 {
+        return place_panner(g, trig, entries, args.angle, args.distance); // bl 0x82b269c0
+    }
+    let scale = fp::load_single(g, LAYOUT_ANGLE_SCALE)?; // lfs f0,2120(r27)
+    let angle_a = fp::mul_single(args.angle, scale); // fmuls f28,f1,f0
+    let angle_b = fp::mul_single(args.turn, scale); // fmuls f27,f4,f0
+    let centre_cos = fp::frsp(trig.cosine(g, angle_a)?);
+    let centre_x = fp::mul_single(centre_cos, args.distance); // fmuls f30,f0,f29
+    let centre_sin = fp::frsp(trig.sine(g, angle_a)?);
+    let centre_y = fp::mul_single(centre_sin, args.distance); // fmuls f29,f13,f29
+    let centre = (centre_x, centre_y);
+    let at = |index: u32| entries.wrapping_add(index << 4);
+
+    let selector = (count as u32).wrapping_sub(2); // addi r11,r26,-2 ; cmplwi cr6,r11,6
+    if selector > 6 {
+        return Ok(());
+    }
+    let spread_scale = fp::load_single(g, LAYOUT_SPREAD_SCALE)?; // lfs f26,2124(r27)
+    let [spread5, spread6, spread7] = args.spreads;
+    if selector == 0 {
+        let marker = fp::load_single(g, LAYOUT_MIRROR_MARKER)?;
+        if spread5 == marker {
+            let sum = fp::add_single(angle_a, angle_b); // fadds f13,f28,f27
+            let bias = fp::load_single(g, LAYOUT_MIRROR_BIAS)?;
+            let angle = fp::add_single(sum, bias); // fadds f28,f13,f0
+            let (dx, dy) = place_entry(g, trig, at(0), angle, args.radius, centre, frame)?;
+            let second = at(1); // addi r31,r31,16
+            let y = fp::sub_single(centre_y, dy); // fsubs f2,f29,f31
+            let x = fp::sub_single(centre_x, dx); // fsubs f1,f30,f28
+            clamp_to_unit_disc(g, second, x, y)?;
+            store_panner_angle(g, second, frame)?;
+        } else {
+            let reload = fp::load_single(g, LAYOUT_SPREAD_SCALE)?; // lfs f0,2124(r27)
+            let sum = fp::add_single(angle_a, angle_b);
+            let offset = fp::mul_single(spread5, reload); // fmuls f27,f24,f0
+            place_entry(g, trig, at(0), fp::add_single(sum, offset), args.radius, centre, frame)?;
+            place_entry(g, trig, at(1), fp::sub_single(sum, offset), args.radius, centre, frame)?;
+        }
+    } else if selector % 2 == 0 {
+        // 8 falls into 6 falls into 4.
+        let (mut b, mut c, mut d) = (1, 2, 3); // li r30,1 ; li r29,2 ; li r28,3
+        if selector == 6 {
+            let offset7 = fp::mul_single(spread7, spread_scale); // fmuls f25,f25,f26
+            let sum = fp::add_single(angle_a, angle_b); // fadds f22,f28,f27
+            place_entry(g, trig, at(5), fp::add_single(sum, offset7), args.radius, centre, frame)?;
+            place_entry(g, trig, at(6), fp::sub_single(sum, offset7), args.radius, centre, frame)?;
+        }
+        if selector >= 4 {
+            let sum = fp::add_single(angle_a, angle_b); // fadds f25,f28,f27
+            place_entry(g, trig, at(1), sum, args.radius, centre, frame)?;
+            (b, c, d) = (2, 3, 4);
+        }
+        let sum = fp::add_single(angle_a, angle_b); // fadds f28,f28,f27
+        let offset5 = fp::mul_single(spread5, spread_scale); // fmuls f25,f24,f26
+        let offset6 = fp::mul_single(spread6, spread_scale); // fmuls f27,f23,f26
+        place_entry(g, trig, at(0), fp::add_single(sum, offset5), args.radius, centre, frame)?;
+        place_entry(g, trig, at(b), fp::sub_single(sum, offset5), args.radius, centre, frame)?;
+        place_entry(g, trig, at(c), fp::add_single(sum, offset6), args.radius, centre, frame)?;
+        place_entry(g, trig, at(d), fp::sub_single(sum, offset6), args.radius, centre, frame)?;
+    }
+    Ok(())
+}
+
+// ============================================================ sub_82B460A0: the mix matrix
+
+/// `lwz r11,56(r3)` — the destination channel count, reloaded after the panning loop.
+pub const MATRIX_DEST_COUNT: u32 = 56;
+/// A matrix row: eight singles, one per destination.
+pub const MATRIX_ROW_BYTES: u32 = 32;
+/// Eight rows, one per source.
+pub const MATRIX_ROWS: u32 = 8;
+/// `lfs f3,8(r30)` — the entry field handed to [`scale_gains`].
+pub const PANNER_ENTRY_LENGTH_SQ: u32 = 8;
+
+/// `sub_82B460A0`'s float arguments, `f1` to `f4`.
+#[derive(Clone, Copy, Debug)]
+pub struct MatrixGains {
+    /// `f1`.
+    pub weight: f64,
+    /// `f2` — handed to [`pan_distance`] and [`add_angular`].
+    pub focus: f64,
+    /// `f3` — stored into the column (or crossing cell) the tail fills.
+    pub fill: f64,
+    /// `f4`.
+    pub gain: f64,
+}
+
+/// Fill one 8x8 mix matrix from a source's panner entries (`sub_82B460A0`).
+///
+/// `object` is `r3` (the configuration [`pan_distance`], [`add_angular`] and [`scale_gains`] take),
+/// `entries` `r4`, `sources` `r5`, and `matrix` is `r10` — not a positional argument, the original
+/// moves it at entry. A stereo destination gets two gains per source from the entry's `y` alone:
+/// `right = (y + 1) / 2`, `left = 1 - right`, normalised by one fused `fmadds` and a single-rounded
+/// square root. Any other destination pans each source through the three callees into its own row —
+/// one row fewer from six sources up — then, for six or more destinations (the count **reloaded**),
+/// zeroes one column of every row and one whole row and writes their crossing cell, or fills the
+/// column when the source count is neither 6 nor 8.
+///
+/// The original's 176-byte frame is not reproduced: no Rust callee writes below the stack pointer.
+pub fn fill_mix_matrix<T: Trig>(
+    g: &mut Guest,
+    trig: &mut T,
+    object: u32,
+    entries: u32,
+    sources: i32,
+    matrix: u32,
+    args: MatrixGains,
+) -> Result<()> {
+    let dest = g.u32(object.wrapping_add(MATRIX_DEST_COUNT))? as i32; // lwz r11,56(r3)
+    let mut fpscr = Fpscr::capture();
+    fpscr.disable_flush_mode_unconditional();
+    if dest == 2 {
+        if sources > 0 {
+            let half = fp::load_single(g, HALF_SINGLE)?; // lfs f12,-26788(r9)
+            let one = fp::load_single(g, ONE_SINGLE)?; // lfs f0,-22460(r8)
+            let mut row = matrix.wrapping_sub(28); // addi r11,r10,-28
+            let mut entry = entries.wrapping_sub(12); // addi r10,r4,-12
+            for _ in 0..sources as u32 {
+                entry = entry.wrapping_add(PANNER_ENTRY_BYTES); // lfsu f13,16(r10)
+                let y = fp::load_single(g, entry)?;
+                let biased = fp::add_single(y, one); // fadds f13,f13,f0
+                let right = fp::mul_single(biased, half); // fmuls f11,f13,f12
+                let left = fp::sub_single(one, right); // fsubs f10,f0,f11
+                let norm = fp::fmadd_single(left, left, fp::mul_single(right, right)); // fmadds
+                let length = fp::sqrt_single(norm); // fsqrts f7,f8
+                let scale = fp::div_single(one, length); // fdivs f6,f0,f7
+                let total = fp::mul_single(fp::mul_single(scale, args.weight), args.gain);
+                fp::store_single(g, row.wrapping_add(28), fp::mul_single(total, right))?; // stfs f3,28(r11)
+                let second = fp::mul_single(left, total); // fmuls f2,f10,f4
+                row = row.wrapping_add(MATRIX_ROW_BYTES); // stfsu f2,32(r11)
+                fp::store_single(g, row, second)?;
+            }
+        }
+        return Ok(());
+    }
+
+    // loc_82B4614C
+    let rows = if sources < 6 { sources } else { sources - 1 }; // addi r29,r26,-1 ; bge ; mr
+    if rows > 0 {
+        let (mut entry, mut row) = (entries, matrix);
+        for _ in 0..rows {
+            pan_distance(g, object, entry, row, args.focus)?; // bl 0x82b454b8
+            add_angular(g, trig, object, entry, row, args.focus)?; // bl 0x82b45788
+            let lensq = fp::load_single(g, entry.wrapping_add(PANNER_ENTRY_LENGTH_SQ))?; // lfs f3,8(r30)
+            scale_gains(g, object, row, args.weight, args.gain, lensq)?; // bl 0x82b45b60
+            row = row.wrapping_add(MATRIX_ROW_BYTES);
+            entry = entry.wrapping_add(PANNER_ENTRY_BYTES);
+        }
+    }
+    // loc_82B461B4: reloaded, after every store above.
+    fpscr.disable_flush_mode_unconditional();
+    let dest_now = g.u32(object.wrapping_add(MATRIX_DEST_COUNT))? as i32;
+    if dest_now >= 6 {
+        let column: u32 = if dest_now == 6 { 5 } else { 7 };
+        if sources == 6 || sources == 8 {
+            let which_row: u32 = if sources == 6 { 5 } else { 7 };
+            let row_base = matrix.wrapping_add(which_row * MATRIX_ROW_BYTES); // add r7,r10,r27
+            let col_base = matrix.wrapping_add(column << 2); // add r10,r8,r27
+            let zero = fp::load_single(g, ZERO_SINGLE)?; // lfs f0,23056(r11)
+            let mut col = col_base.wrapping_sub(MATRIX_ROW_BYTES);
+            let mut cell = row_base.wrapping_sub(4);
+            for _ in 0..MATRIX_ROWS {
+                col = col.wrapping_add(MATRIX_ROW_BYTES); // stfsu f0,32(r10)
+                fp::store_single(g, col, zero)?;
+                cell = cell.wrapping_add(4); // stfsu f0,4(r9)
+                fp::store_single(g, cell, zero)?;
+            }
+            fp::store_single(g, row_base.wrapping_add(column << 2), args.fill)?; // stfsx f28,r8,r7
+        } else {
+            // loc_82B46230: matrix + 4*(column - 8), then eight rows down, all 32-bit.
+            let mut col = matrix.wrapping_add(column.wrapping_sub(8) << 2);
+            for _ in 0..MATRIX_ROWS {
+                col = col.wrapping_add(MATRIX_ROW_BYTES); // stfsu f28,32(r10)
+                fp::store_single(g, col, args.fill)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1705,5 +1976,178 @@ mod tests {
         assert_eq!(crate::vmx::get_mxcsr(), before, "add_angular");
         scale_gains(&mut g, OBJECT, GAINS, 0.5, 0.5, 0.5).unwrap();
         assert_eq!(crate::vmx::get_mxcsr(), before, "scale_gains");
+    }
+
+    // ------------------------------------------------------------------ sub_82B45C50
+
+    const ENTRIES: u32 = 0x4000_2000;
+    const MATRIX: u32 = 0x4000_3000;
+    const STACK_TOP: u32 = 0x4001_0000;
+    const POISON: u32 = 0xDEAD_BEEF;
+
+    /// Set a cell whether or not a segment already covers it.
+    fn cell(g: &mut Guest, at: u32, v: f32) {
+        if g.set_u32(at, v.to_bits()).is_err() {
+            g.put(at, v.to_bits().to_be_bytes().to_vec());
+        }
+    }
+
+    /// The panner area poisoned, a stack, the atan2 pool, and the layout constants: both scales
+    /// 1, the mirror marker 7 and its bias 0.5.
+    fn layout_guest() -> Guest {
+        let mut g = guest();
+        g.put(ENTRIES, POISON.to_be_bytes().repeat(32));
+        g.put(MATRIX, POISON.to_be_bytes().repeat(64));
+        g.put(STACK_TOP - 0x1000, vec![0u8; 0x1000]);
+        crate::mathlib::tests::with_atan_pool(&mut g);
+        cell(&mut g, LAYOUT_ANGLE_SCALE, 1.0);
+        cell(&mut g, LAYOUT_SPREAD_SCALE, 1.0);
+        cell(&mut g, LAYOUT_MIRROR_MARKER, 7.0);
+        cell(&mut g, LAYOUT_MIRROR_BIAS, 0.5);
+        g
+    }
+
+    fn trig() -> Scripted {
+        Scripted { sine: 0.25, cosine: 0.5, asked: vec![] }
+    }
+
+    fn args(spread5: f64) -> PannerLayout {
+        PannerLayout { angle: 0.1, distance: 0.5, radius: 0.25, turn: 0.2, spreads: [spread5, 0.3, 0.4] }
+    }
+
+    fn written(g: &Guest) -> Vec<bool> {
+        (0..8).map(|k| g.u32(ENTRIES + 16 * k + PANNER_ENTRY_ANGLE).unwrap() != POISON).collect()
+    }
+
+    #[test]
+    fn counts_three_five_seven_and_below_two_write_nothing() {
+        for count in [3, 5, 7, 0, -1, 9] {
+            let mut g = layout_guest();
+            lay_out_panners(&mut g, &mut trig(), ENTRIES, count, args(0.1), STACK_TOP).unwrap();
+            assert_eq!(written(&g), [false; 8], "count {count}");
+        }
+    }
+
+    #[test]
+    fn each_even_count_writes_its_prefix_and_never_entry_seven() {
+        for (count, n) in [(2, 2), (4, 4), (6, 5), (8, 7)] {
+            let mut g = layout_guest();
+            lay_out_panners(&mut g, &mut trig(), ENTRIES, count, args(0.1), STACK_TOP).unwrap();
+            let want: Vec<bool> = (0..8).map(|k| k < n).collect();
+            assert_eq!(written(&g), want, "count {count}");
+        }
+    }
+
+    #[test]
+    fn one_entry_hands_the_job_to_place_panner() {
+        let mut g = layout_guest();
+        let mut h = g.clone();
+        lay_out_panners(&mut g, &mut trig(), ENTRIES, 1, args(0.1), STACK_TOP).unwrap();
+        place_panner(&mut h, &mut trig(), ENTRIES, 0.1, 0.5).unwrap();
+        for k in 0..8 {
+            assert_eq!(g.u32(ENTRIES + 4 * k).unwrap(), h.u32(ENTRIES + 4 * k).unwrap(), "word {k}");
+        }
+    }
+
+    #[test]
+    fn the_mirrored_pair_reuses_the_first_offsets_negated() {
+        // Centre (0.5 * 0.5, 0.25 * 0.5) = (0.25, 0.125); offsets (0.125, 0.0625). All exact.
+        let mut g = layout_guest();
+        let mut t = trig();
+        lay_out_panners(&mut g, &mut t, ENTRIES, 2, args(7.0), STACK_TOP).unwrap();
+        assert_eq!((get_f32(&g, ENTRIES), get_f32(&g, ENTRIES + 4)), (0.375, 0.1875));
+        assert_eq!((get_f32(&g, ENTRIES + 16), get_f32(&g, ENTRIES + 20)), (0.125, 0.0625));
+        assert_eq!(t.asked.len(), 4, "the centre and one placement: no second pair of calls");
+        let mut spread = trig();
+        lay_out_panners(&mut layout_guest(), &mut spread, ENTRIES, 2, args(0.1), STACK_TOP).unwrap();
+        assert_eq!(spread.asked.len(), 6, "a spread pair asks for both placements");
+    }
+
+    #[test]
+    fn the_stored_angle_is_that_of_the_clamped_position() {
+        let mut g = layout_guest();
+        lay_out_panners(&mut g, &mut trig(), ENTRIES, 2, args(7.0), STACK_TOP).unwrap();
+        let (x, y) = (f64::from(get_f32(&g, ENTRIES)), f64::from(get_f32(&g, ENTRIES + 4)));
+        let mut h = layout_guest();
+        let angle = crate::mathlib::atan2(&mut h, y, x, STACK_TOP - 0x100).unwrap();
+        assert_eq!(get_f32(&g, ENTRIES + PANNER_ENTRY_ANGLE), angle as f32);
+    }
+
+    // ------------------------------------------------------------------ sub_82B460A0
+
+    fn gains() -> MatrixGains {
+        MatrixGains { weight: 2.0, focus: 0.5, fill: 0.75, gain: 0.5 }
+    }
+
+    fn matrix(g: &Guest) -> Vec<u32> {
+        (0..64).map(|k| g.u32(MATRIX + 4 * k).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_stereo_destination_pans_each_source_from_its_y_alone() {
+        let mut g = layout_guest();
+        g.set_u32(OBJECT + MATRIX_DEST_COUNT, 2).unwrap();
+        g.set_u32(ENTRIES + 4, 0.0f32.to_bits()).unwrap(); // source 0 straight ahead
+        g.set_u32(ENTRIES + 16 + 4, 1.0f32.to_bits()).unwrap(); // source 1 hard over
+        fill_mix_matrix(&mut g, &mut trig(), OBJECT, ENTRIES, 2, MATRIX, gains()).unwrap();
+        // y = 0: right = left = 0.5, normalised by sqrt(0.5); weight * gain is 1.
+        let total = 1.0f32 / (0.5f64.sqrt() as f32);
+        assert_eq!(get_f32(&g, MATRIX), total * 0.5);
+        assert_eq!(get_f32(&g, MATRIX + 4), 0.5 * total);
+        // y = 1: right = 1, left = 0, length 1.
+        assert_eq!(get_f32(&g, MATRIX + 32), 1.0);
+        assert_eq!(get_f32(&g, MATRIX + 36), 0.0);
+        assert_eq!(g.u32(MATRIX + 8).unwrap(), POISON, "two columns only");
+        assert_eq!(g.u32(MATRIX + 64).unwrap(), POISON, "two rows only");
+    }
+
+    /// The panning rows made directly, for comparison.
+    fn panned(h: &mut Guest, rows: u32) {
+        for r in 0..rows {
+            let (entry, row) = (ENTRIES + 16 * r, MATRIX + 32 * r);
+            pan_distance(h, OBJECT, entry, row, 0.5).unwrap();
+            add_angular(h, &mut trig(), OBJECT, entry, row, 0.5).unwrap();
+            let lensq = fp::load_single(h, entry + PANNER_ENTRY_LENGTH_SQ).unwrap();
+            scale_gains(h, OBJECT, row, 2.0, 0.5, lensq).unwrap();
+        }
+    }
+
+    fn panning_guest(dest: i32) -> Guest {
+        let mut g = layout_guest();
+        let speakers = [(0.0, 1.0), (0.7, 0.7), (1.0, 0.0), (0.7, -0.7), (0.0, -1.0), (-0.7, -0.7), (-1.0, 0.0)];
+        layout(&mut g, dest, [0, 2, 3, 4], speakers);
+        for k in 0..8u32 {
+            let angle = 0.3 * k as f32;
+            for (off, v) in [(0, angle.cos() * 0.5), (4, angle.sin() * 0.5), (8, 0.25), (12, angle)] {
+                g.set_u32(ENTRIES + 16 * k + off, v.to_bits()).unwrap();
+            }
+        }
+        g
+    }
+
+    #[test]
+    fn six_sources_into_six_channels_pan_five_rows_then_clear_a_row_and_a_column() {
+        let mut g = panning_guest(6);
+        let mut h = g.clone();
+        fill_mix_matrix(&mut g, &mut trig(), OBJECT, ENTRIES, 6, MATRIX, gains()).unwrap();
+        panned(&mut h, 5);
+        for k in 0..8 {
+            h.set_u32(MATRIX + 32 * k + 4 * 5, 0).unwrap(); // column 5 of every row
+            h.set_u32(MATRIX + 32 * 5 + 4 * k, 0).unwrap(); // the whole of row 5
+        }
+        h.set_u32(MATRIX + 32 * 5 + 4 * 5, 0.75f32.to_bits()).unwrap(); // their crossing
+        assert_eq!(matrix(&g), matrix(&h));
+    }
+
+    #[test]
+    fn two_sources_into_eight_channels_fill_column_seven() {
+        let mut g = panning_guest(8);
+        let mut h = g.clone();
+        fill_mix_matrix(&mut g, &mut trig(), OBJECT, ENTRIES, 2, MATRIX, gains()).unwrap();
+        panned(&mut h, 2);
+        for k in 0..8 {
+            h.set_u32(MATRIX + 32 * k + 4 * 7, 0.75f32.to_bits()).unwrap();
+        }
+        assert_eq!(matrix(&g), matrix(&h));
     }
 }

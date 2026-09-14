@@ -973,6 +973,41 @@ fn main() {
                     .map(|r| Some(r as u32))
                     .map_err(|e| e.to_string())
             }
+            // The panner layout keeps a 224-byte frame, into which atan2 spills its two arguments.
+            "sub_82B45C50" if v.r1.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r1, where atan2 spills", v.run));
+                }
+                continue;
+            }
+            "sub_82B45C50" => {
+                let sp = v.r1.unwrap_or(0) as u32;
+                g.put(sp.wrapping_sub(spatial::LAYOUT_FRAME), vec![0u8; spatial::LAYOUT_FRAME as usize]);
+                let f = |k: usize| f64::from_bits(v.f[k]);
+                let args = spatial::PannerLayout {
+                    angle: f(0), distance: f(1), radius: f(2), turn: f(3), spreads: [f(4), f(5), f(6)],
+                };
+                spatial::lay_out_panners(&mut g, &mut mathlib::Image, v.r3, v.r4 as i32, args, sp)
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
+            // The matrix base arrives in r10, which only the wide recording carries.
+            "sub_82B460A0" if v.r10.is_none() => {
+                t.unreplayable += 1;
+                if t.first_gap.is_none() {
+                    t.first_gap = Some(format!("run {}: needs r10, the matrix", v.run));
+                }
+                continue;
+            }
+            "sub_82B460A0" => {
+                let f = |k: usize| f64::from_bits(v.f[k]);
+                let args = spatial::MatrixGains { weight: f(0), focus: f(1), fill: f(2), gain: f(3) };
+                let matrix = v.r10.unwrap_or(0) as u32;
+                spatial::fill_mix_matrix(&mut g, &mut mathlib::Image, v.r3, v.r4, v.r5 as i32, matrix, args)
+                    .map(|_| None)
+                    .map_err(|e| e.to_string())
+            }
             // The evaluator's opcode table: every ported slot is `fn(&mut Guest, u32) -> u64` with the
             // operand block in r3, so one arm covers all of them by looking the name up.
             name if eval::TABLE.iter().any(|slot| slot.name == name && slot.port.is_some()) => {
