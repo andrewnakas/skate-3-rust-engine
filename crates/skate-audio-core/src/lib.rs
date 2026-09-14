@@ -341,3 +341,6 @@ pub mod patch;
 /// The evaluator voice op and the voice-object helpers, against a host voice device.
 /// Unverified; see the module note.
 pub mod voice;
+
+/// A stream object's frame delivery with a host fill function. Unverified; see the module note.
+pub mod stream;
