@@ -63,6 +63,17 @@ The "sound" column is a reading of the names, not verified.
 | foley utility | `c_foley_utility` | `Foley_Cloth.abk` | `sub_82488120` | `sub_82487A60` (77) | 1 |
 | Hall of Meat slow motion (bails) | `hall_of_meat_slo_mo` | `hom_slo_mo.abk` (14) | `sub_824AF368` | `sub_824DD408` | 0 |
 
+**More traces, 2026-09-15.** Four more sessions (`tour1`, `flips2`, `ollies2`, `bails2`) posted,
+summed across the four:
+- `Class_Flips` 13, `cloth_trick` 11, `Class_wheels_skid` 134;
+- `Class_grind` 13 (by chance), `c_body_slide` 22, `c_cloth_falls` 1, `Class_foot_drag` 6;
+- `Class_Squeaks` 6, `Rolling_Rattle_Class` 35, `playercharacter_footstep` 34.
+
+`c_board_slide` and `hall_of_meat_slo_mo` never fired. Every ollie or flip that popped posted
+`Class_Flips`, `cloth_trick` and a wheel skid, and opened a `Foley_Cloth`, a flip-bank and a
+`Treatments` voice. The details are in sk8Audio `docs/audio-banks.md`, "Trick and landing traces,
+2026-09-15".
+
 **Not needed:** `Class_wheels_flip`, `Class_pre_lands_whsh`, `c_board_tumble`, `SenseOfSpeed_tone` and
 `Ollie_Rattles` are named in the `.csi` tables. No bank in `audiofiles.big` exports them, and no
 constructor for them was found, so they look unused in retail. Treat them as unused unless a trace
@@ -85,17 +96,23 @@ shows a post. `wheels.big` and `grains.big` have no known poster yet.
   a reproducible scene. Two recomp runs do not produce the same capture.
 
 **Traces are recorded on Linux only.** The recomp harness, gdb and the message probe live there.
-The one session so far (`msgs1`) ran `probe/trace/scripts/bail_replay_v2.txt`. It caught no grinds,
-slides or bail foley, and only three flips. Record more on Linux: flips, landings, grinds, slides,
-powerslides, bails. The existing input scripts are `ollie_check_v4.txt`, `late_flip_v5.txt`,
+Five sessions exist so far: `msgs1` (2026-09-14), and the four from 2026-09-15 above. They are
+untracked, in sk8Audio `probe/harness/out/`, and hold game-derived data. Still missing: board slides
+(`c_board_slide`), Hall of Meat, and powerslides, manuals and grabs that the game actually took. The
+input scripts are `sound_tour_v1.txt`, `ollie_check_v4.txt`, `late_flip_v5.txt`,
 `bail_replay_v2.txt` and `bail_attribution_v3.txt`. The recording command, from sk8Audio's root:
 
 ```sh
 OUT=$PWD/probe/harness/out SHADOW=false DURATION=150 AUDIO_DUMP_FRAMES=0 PLAY_MOVIES=true \
   INPUT_SCRIPT=probe/trace/scripts/late_flip_v5.txt \
-  EXTRA_ARGS="--skate3_audio_probe_messages=true --skate3_audio_probe_messages_count=20000" \
+  EXTRA_ARGS="--skate3_audio_probe_messages=true --skate3_audio_probe_messages_count=200000 --skate3_audio_probe_opens_count=20000 --skate3_audio_probe_updates_count=200000" \
   probe/harness/run_session.sh flips1
+probe/trace/sound_report.py probe/harness/out/flips1.log   # posts and opens per script marker
 ```
+
+With those caps the logger rotates at 5 MB into `LABEL.N.log` and keeps ten pieces, about 140 s of
+play. Keep sessions shorter than that, or the start is lost. `sound_report.py` reads the pieces in
+order.
 
 It needs a free, unlocked desktop and no running `skate3`. Each session logs every post
 (`skate3-audio-msg`), re-delivery (`skate3-audio-update`), voice open (`skate3-audio-open`) and
