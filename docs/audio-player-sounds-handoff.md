@@ -71,8 +71,13 @@ summed across the four:
 
 A fifth session the same day, `play1`, was played by hand for 166 s. It added `c_board_slide` 4
 (with `board_scrapes.abk` voices), and much denser flips (21), trick cloth (35), squeaks (42), grinds
-(6) and bail cloth (2). **Only `hall_of_meat_slo_mo` has never fired**; it is a separate bail-replay
-mode. Every ollie or flip that popped posted
+(6) and bail cloth (2). A sixth, `play2` (220 s by hand, big falls and powerslides), added grinds
+(12), board slides (7), squeaks (20) and bail cloth (6).
+
+**Only `hall_of_meat_slo_mo` has never fired.** Its poster `sub_824DD408` creates it only when the
+mode word `[[0x830CFDC4]+1060]` is not 7, or during a flagged slow-motion window (details in sk8Audio
+`docs/audio-banks.md`). A fall in free skate, which looks like mode 7, does not start it. It needs
+the game's Hall of Meat mode. Every ollie or flip that popped posted
 `Class_Flips`, `cloth_trick` and a wheel skid, and opened a `Foley_Cloth`, a flip-bank and a
 `Treatments` voice. The details are in sk8Audio `docs/audio-banks.md`, "Trick and landing traces,
 2026-09-15".
@@ -99,7 +104,7 @@ shows a post. `wheels.big` and `grains.big` have no known poster yet.
   a reproducible scene. Two recomp runs do not produce the same capture.
 
 **Traces are recorded on Linux only.** The recomp harness, gdb and the message probe live there.
-Six sessions exist so far: `msgs1` (2026-09-14), and five from 2026-09-15 (four scripted, one
+Seven sessions exist so far: `msgs1` (2026-09-14), and six from 2026-09-15 (four scripted, two
 played by hand). They are untracked, in sk8Audio `probe/harness/out/`, and hold game-derived data.
 Still missing:
 - Hall of Meat;
