@@ -69,7 +69,10 @@ summed across the four:
 - `Class_grind` 13 (by chance), `c_body_slide` 22, `c_cloth_falls` 1, `Class_foot_drag` 6;
 - `Class_Squeaks` 6, `Rolling_Rattle_Class` 35, `playercharacter_footstep` 34.
 
-`c_board_slide` and `hall_of_meat_slo_mo` never fired. Every ollie or flip that popped posted
+A fifth session the same day, `play1`, was played by hand for 166 s. It added `c_board_slide` 4
+(with `board_scrapes.abk` voices), and much denser flips (21), trick cloth (35), squeaks (42), grinds
+(6) and bail cloth (2). **Only `hall_of_meat_slo_mo` has never fired**; it is a separate bail-replay
+mode. Every ollie or flip that popped posted
 `Class_Flips`, `cloth_trick` and a wheel skid, and opened a `Foley_Cloth`, a flip-bank and a
 `Treatments` voice. The details are in sk8Audio `docs/audio-banks.md`, "Trick and landing traces,
 2026-09-15".
@@ -96,9 +99,11 @@ shows a post. `wheels.big` and `grains.big` have no known poster yet.
   a reproducible scene. Two recomp runs do not produce the same capture.
 
 **Traces are recorded on Linux only.** The recomp harness, gdb and the message probe live there.
-Five sessions exist so far: `msgs1` (2026-09-14), and the four from 2026-09-15 above. They are
-untracked, in sk8Audio `probe/harness/out/`, and hold game-derived data. Still missing: board slides
-(`c_board_slide`), Hall of Meat, and powerslides, manuals and grabs that the game actually took. The
+Six sessions exist so far: `msgs1` (2026-09-14), and five from 2026-09-15 (four scripted, one
+played by hand). They are untracked, in sk8Audio `probe/harness/out/`, and hold game-derived data.
+Still missing:
+- Hall of Meat;
+- powerslides, manuals and grabs **tied to their posts**, which needs a session with markers. The
 input scripts are `sound_tour_v1.txt`, `ollie_check_v4.txt`, `late_flip_v5.txt`,
 `bail_replay_v2.txt` and `bail_attribution_v3.txt`. The recording command, from sk8Audio's root:
 
@@ -111,8 +116,10 @@ probe/trace/sound_report.py probe/harness/out/flips1.log   # posts and opens per
 ```
 
 With those caps the logger rotates at 5 MB into `LABEL.N.log` and keeps ten pieces, about 140 s of
-play. Keep sessions shorter than that, or the start is lost. `sound_report.py` reads the pieces in
-order.
+play. For anything longer, run `probe/trace/keep_log_pieces.sh LABEL` alongside the session. It
+hard-links every piece into `LABEL.pieces/` as it appears, and `sound_report.py` reads that directory.
+To play by hand, leave `INPUT_SCRIPT` unset and `DURATION` unset: the game runs in the foreground
+until its window is closed. Then report with `--every 5`, which groups by time instead of by marker.
 
 It needs a free, unlocked desktop and no running `skate3`. Each session logs every post
 (`skate3-audio-msg`), re-delivery (`skate3-audio-update`), voice open (`skate3-audio-open`) and
