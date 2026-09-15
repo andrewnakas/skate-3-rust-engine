@@ -49,7 +49,7 @@ The "sound" column is a reading of the names, not verified.
 | trick cloth foley: ollie, kickflip, pop shuv, spins | `cloth_trick` | `Foley_Cloth.abk` (28) | `sub_824B71C0` | `sub_824CC590` (59), `sub_824CC680` (86) | 3 |
 | bail cloth | `c_cloth_falls` | `Foley_Cloth.abk` | `sub_824B72D8` | `sub_824DBF10` (118) | 0 |
 | impacts ("treatments") | `Class_Treatment` | `Treatments.abk` (18) | `sub_824B0080` | `sub_824DD408` (185), which also posts `hall_of_meat_slo_mo` | 1 |
-| board squeaks | `Class_Squeaks` | `Brd_Squeaks.abk` (18) | `sub_824AFF48` | `sub_824C7738` (185) | 6 |
+| board squeaks, **which are the powerslides** (the user played and heard them) | `Class_Squeaks` | `Brd_Squeaks.abk` (18) | `sub_824AFF48` | `sub_824C7738` (185) | 6 |
 | seams under the wheels | `Class_Seams` | `Seams_Bank.abk` (234) | `sub_824AFDD0` | `sub_824C13D0` (62) | 32 |
 | rolling surface | `Class_rolling` | `PatchBank_Rolling_Surfaces`, `_Objects`, `_SpiderCracks`, `_RocksBounce` | `sub_824C4C18` | `sub_824C5CA8` (315), `sub_824C9830` (70), `sub_824C9F68` (51) | 2 |
 | truck rattle | `Rolling_Rattle_Class` | `Rolling_Rattles.abk` (18) | `sub_824B0248` | `sub_824C6198` (568) | 14 |
