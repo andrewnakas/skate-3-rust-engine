@@ -22,12 +22,23 @@ impl Motion {
         Some(Self {
             body: Transform::from_translation(Vec3::from_array(p))
                 .with_rotation(Quat::from_array(q)),
-            wheels: car.controller.wheels().iter().map(|wheel| {
-                Transform::from_xyz(0., (car.definition.suspension_length
-                    - wheel.raycast_info().suspension_length) / car.definition.model_scale, 0.)
-                    .with_rotation(Quat::from_rotation_y(wheel.steering)
-                        * Quat::from_rotation_x(-wheel.rotation))
-            }).collect(),
+            wheels: car
+                .controller
+                .wheels()
+                .iter()
+                .map(|wheel| {
+                    Transform::from_xyz(
+                        0.,
+                        (car.definition.suspension_length - wheel.raycast_info().suspension_length)
+                            / car.definition.model_scale,
+                        0.,
+                    )
+                    .with_rotation(
+                        Quat::from_rotation_y(wheel.steering)
+                            * Quat::from_rotation_x(-wheel.rotation),
+                    )
+                })
+                .collect(),
         })
     }
 
@@ -35,9 +46,16 @@ impl Motion {
         let alpha = alpha.clamp(0., 1.);
         Self {
             body: blend(self.body, current.body, alpha),
-            wheels: current.wheels.iter().enumerate().map(|(i, &now)| {
-                self.wheels.get(i).map_or(now, |&before| blend(before, now, alpha))
-            }).collect(),
+            wheels: current
+                .wheels
+                .iter()
+                .enumerate()
+                .map(|(i, &now)| {
+                    self.wheels
+                        .get(i)
+                        .map_or(now, |&before| blend(before, now, alpha))
+                })
+                .collect(),
         }
     }
 }
@@ -47,7 +65,10 @@ mod tests {
     use super::*;
     #[test]
     fn subframes_move_continuously_and_keep_seat_attached() {
-        let before = Motion { body: Transform::IDENTITY, wheels: vec![Transform::IDENTITY] };
+        let before = Motion {
+            body: Transform::IDENTITY,
+            wheels: vec![Transform::IDENTITY],
+        };
         let after = Motion {
             body: Transform::from_xyz(1., 0., 0.).with_rotation(Quat::from_rotation_y(0.2)),
             wheels: vec![Transform::from_xyz(0., 0.1, 0.)],

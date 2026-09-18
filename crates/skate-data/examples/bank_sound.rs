@@ -15,7 +15,9 @@ use skate_data::audio;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let path = args.next().ok_or("usage: bank_sound ARCHIVE [NAME] [OUTDIR]")?;
+    let path = args
+        .next()
+        .ok_or("usage: bank_sound ARCHIVE [NAME] [OUTDIR]")?;
     let wanted = args.next();
     let outdir = args.next();
     let data = std::fs::read(&path)?;
@@ -28,17 +30,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut chosen: Option<(String, banks::Abk, usize)> = None;
 
     for entry in &archive.entries {
-        let Some(name) = entry.name.as_deref() else { continue };
+        let Some(name) = entry.name.as_deref() else {
+            continue;
+        };
         if !name.to_ascii_lowercase().ends_with(".abk") {
             continue;
         }
-        let Some(bytes) = data.get(entry.range()) else { continue };
-        let Ok(abk) = banks::Abk::parse(bytes) else { continue };
+        let Some(bytes) = data.get(entry.range()) else {
+            continue;
+        };
+        let Ok(abk) = banks::Abk::parse(bytes) else {
+            continue;
+        };
         banks_seen += 1;
         // Only the used prefix of the slot table. The rest hold 0xFFFFFFFF, and counting those
         // as samples is what made 89,431 slots look like 89,431 sounds of which 94% failed.
         for i in 0..abk.present() {
-            let Some(range) = abk.sample_range(i) else { continue };
+            let Some(range) = abk.sample_range(i) else {
+                continue;
+            };
             samples_total += 1;
             // A sample is a stream only if its header parses. Anything else is reported, not
             // assumed to be audio.
@@ -82,7 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let info = audio::describe(bytes, range.start)?;
     println!(
         "\n{name} sample {index}: {:?} {} Hz, {} channels, {} samples ({:.2} s)",
-        info.codec, info.sample_rate, info.channels, info.num_samples, info.duration_secs()
+        info.codec,
+        info.sample_rate,
+        info.channels,
+        info.num_samples,
+        info.duration_secs()
     );
 
     let Some(outdir) = outdir else { return Ok(()) };
@@ -102,10 +116,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut per_context = Vec::new();
     for (c, chain) in chains.iter().enumerate() {
-        per_context.push(audio::ffmpeg::decode_chain(chain, widths[c], info.sample_rate)?);
+        per_context.push(audio::ffmpeg::decode_chain(
+            chain,
+            widths[c],
+            info.sample_rate,
+        )?);
     }
     let pcm = audio::interleave_contexts(&per_context, &widths);
     let frames = pcm.len() / usize::from(info.channels).max(1);
-    println!("decoded {frames} frames ({:.2} s)", frames as f64 / f64::from(info.sample_rate));
+    println!(
+        "decoded {frames} frames ({:.2} s)",
+        frames as f64 / f64::from(info.sample_rate)
+    );
     Ok(())
 }

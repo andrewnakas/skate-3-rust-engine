@@ -7,7 +7,13 @@ fn wheel_angular_drag_tracks_physical_contact_and_wipeout() {
     let mut ground = BoardGroundState::default();
     let mut lines = WheelLineState::default();
     // A successful line query is not physical wheel contact for drag selection.
-    lines.publish([Some(WheelLineHit { fraction: 0.1, normal: UP, surface_tag: 0 }); 4]);
+    lines.publish(
+        [Some(WheelLineHit {
+            fraction: 0.1,
+            normal: UP,
+            surface_tag: 0,
+        }); 4],
+    );
     let frequency = f32::from_bits(0x426F_FFFF);
     let free = f32::from_bits(0x3BC4_9BA6) * frequency;
     let wiping_out = f32::from_bits(0x3D23_D70A) * frequency;
@@ -18,7 +24,10 @@ fn wheel_angular_drag_tracks_physical_contact_and_wipeout() {
     ground.update(&contacts, &lines, UP, 80.0, false);
     assert_eq!(ground.wheel_angular_drag, [0.0, free, free, 0.0]);
     ground.update(&contacts, &lines, UP, 80.0, true);
-    assert_eq!(ground.wheel_angular_drag, [wiping_out, free, free, wiping_out]);
+    assert_eq!(
+        ground.wheel_angular_drag,
+        [wiping_out, free, free, wiping_out]
+    );
     ground.update(&[], &lines, UP, 80.0, true);
     assert_eq!(ground.wheel_angular_drag, [free; 4]);
     ground.update(&contacts, &lines, UP, 80.0, false);
@@ -27,9 +36,15 @@ fn wheel_angular_drag_tracks_physical_contact_and_wipeout() {
 
 fn report(part: BodyId, normal: Vector3) -> BoardContactReport {
     BoardContactReport {
-        part, other: CollisionBody::StaticWorld, is_body_a: true,
-        normal, position: Vector3::ZERO, relative_linear_velocity: Vector3::ZERO,
-        other_surface: 0, normal_force_on_a: UP, friction_force_on_a: Vector3::ZERO,
+        part,
+        other: CollisionBody::StaticWorld,
+        is_body_a: true,
+        normal,
+        position: Vector3::ZERO,
+        relative_linear_velocity: Vector3::ZERO,
+        other_surface: 0,
+        normal_force_on_a: UP,
+        friction_force_on_a: Vector3::ZERO,
         tangents: [Vector3::ZERO; 2],
     }
 }
@@ -38,11 +53,29 @@ fn report(part: BodyId, normal: Vector3) -> BoardContactReport {
 fn lost_wheel_support_keeps_wheel_normal_but_rebuilds_overall_normal() {
     let mut ground = BoardGroundState::default();
     let mut lines = WheelLineState::default();
-    lines.publish([Some(WheelLineHit { fraction: 0.1, normal: UP, surface_tag: 0 }); 4]);
-    ground.update(&[report(BodyId::RightFrontWheel, UP)], &lines, UP, 80.0, false);
+    lines.publish(
+        [Some(WheelLineHit {
+            fraction: 0.1,
+            normal: UP,
+            surface_tag: 0,
+        }); 4],
+    );
+    ground.update(
+        &[report(BodyId::RightFrontWheel, UP)],
+        &lines,
+        UP,
+        80.0,
+        false,
+    );
     assert_eq!(ground.wheel_contact_count, 1);
     let retained = ground.wheel_normal;
-    ground.update(&[report(BodyId::Deck, Vector3::new(1.0, 0.0, 0.0))], &lines, UP, 80.0, false);
+    ground.update(
+        &[report(BodyId::Deck, Vector3::new(1.0, 0.0, 0.0))],
+        &lines,
+        UP,
+        80.0,
+        false,
+    );
     assert_eq!(ground.wheel_contact_count, 0);
     assert_eq!(ground.part_contact_count, 1);
     assert_eq!(ground.wheel_normal, retained);
@@ -54,11 +87,20 @@ fn lost_wheel_support_keeps_wheel_normal_but_rebuilds_overall_normal() {
 fn no_hit_preserves_line_geometry_and_contact_status_does_not_come_from_lines() {
     let mut lines = WheelLineState::default();
     let normal = Vector3::new(0.6, 0.8, 0.0);
-    lines.publish([Some(WheelLineHit { fraction: 0.2, normal, surface_tag: 3 << 7 }); 4]);
+    lines.publish(
+        [Some(WheelLineHit {
+            fraction: 0.2,
+            normal,
+            surface_tag: 42 | (3 << 7),
+        }); 4],
+    );
+    assert_eq!(lines.audio_surfaces, [42; 4]);
+    assert_eq!(lines.physics_surfaces, [3; 4]);
     let distances = lines.distances;
     lines.publish([None; 4]);
     assert_eq!(lines.normals, [normal; 4]);
     assert_eq!(lines.distances, distances);
+    assert_eq!(lines.audio_surfaces, [0; 4]);
     assert_eq!(lines.physics_surfaces, [0; 4]);
     assert_eq!(lines.minimum_distance, WHEEL_LINE_LENGTH);
     let mut ground = BoardGroundState::default();
@@ -75,7 +117,13 @@ fn per_part_selection_uses_highest_y_and_keeps_first_on_ties() {
     let tied = report(BodyId::Deck, Vector3::new(-0.6, 0.8, 0.0));
     let lower = report(BodyId::Deck, Vector3::new(0.0, 0.4, 0.9));
     let mut ground = BoardGroundState::default();
-    ground.update(&[first, tied, lower], &WheelLineState::default(), UP, 80.0, false);
+    ground.update(
+        &[first, tied, lower],
+        &WheelLineState::default(),
+        UP,
+        80.0,
+        false,
+    );
     assert_eq!(ground.parts[6].normal, first.normal);
     assert_eq!(ground.part_contact_count, 1);
 }
@@ -85,13 +133,19 @@ fn observed_acceleration_retains_each_part_velocity_and_resets_with_collision_in
     let mut state = super::BoardGroundState::default();
     let first = core::array::from_fn(|i| crate::math::Vector3::new(i as f32, 2.0, -1.0));
     state.sample_accelerations(first, 0.5);
-    assert_eq!(state.accelerations[6], crate::math::Vector3::new(12.0, 4.0, -2.0));
+    assert_eq!(
+        state.accelerations[6],
+        crate::math::Vector3::new(12.0, 4.0, -2.0)
+    );
     state.sample_accelerations(first, 0.25);
     assert_eq!(state.accelerations, [crate::math::Vector3::ZERO; 7]);
     let mut next = first;
     next[6].x += 1.0;
     state.sample_accelerations(next, 0.25);
-    assert_eq!(state.accelerations[6], crate::math::Vector3::new(4.0, 0.0, 0.0));
+    assert_eq!(
+        state.accelerations[6],
+        crate::math::Vector3::new(4.0, 0.0, 0.0)
+    );
     assert_eq!(state.accelerations[5], crate::math::Vector3::ZERO);
     let reset = super::BoardGroundState::default();
     assert_eq!(reset.previous_velocities, [crate::math::Vector3::ZERO; 7]);
@@ -132,7 +186,13 @@ fn surface_flags_use_actual_contacts_and_reset_each_frame() {
     assert_eq!(ground.collision_flags, 1 << 25);
     assert_eq!(ground.surface_twelve_height, 5.0);
     //A wheel ray reporting surface8 alone does not set the physical flag.
-    ground.update(&[report(BodyId::RightFrontWheel, UP)], &lines, UP, 80.0, false);
+    ground.update(
+        &[report(BodyId::RightFrontWheel, UP)],
+        &lines,
+        UP,
+        80.0,
+        false,
+    );
     assert_eq!(ground.collision_flags, 1 << 31);
     ground.update(&[], &lines, UP, 80.0, false);
     assert_eq!(ground.collision_flags, 0);

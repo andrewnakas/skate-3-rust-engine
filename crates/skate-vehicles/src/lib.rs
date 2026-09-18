@@ -1,15 +1,15 @@
 //! Bevy-independent, fixed-step Rapier vehicle simulation and validated mod definitions.
-mod definition;
-mod safety;
-mod handling;
 mod assists;
-pub use safety::Ejection;
+mod definition;
+mod handling;
+mod safety;
 pub use definition::*;
 pub use rapier3d;
 use rapier3d::{
     control::{DynamicRayCastVehicleController, WheelTuning},
     prelude::*,
 };
+pub use safety::Ejection;
 use std::collections::BTreeMap;
 #[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -73,10 +73,13 @@ impl Simulation {
         }
         // Weld shared vertices and use neighboring face normals at internal edges.
         // Keep authored triangles: this does not simplify or delete map geometry.
-        let collider = ColliderBuilder::trimesh_with_flags(vertices, indices,
-            rapier3d::parry::shape::TriMeshFlags::FIX_INTERNAL_EDGES)
-            .map_err(|e| e.to_string())?
-            .friction(1.);
+        let collider = ColliderBuilder::trimesh_with_flags(
+            vertices,
+            indices,
+            rapier3d::parry::shape::TriMeshFlags::FIX_INTERNAL_EDGES,
+        )
+        .map_err(|e| e.to_string())?
+        .friction(1.);
         self.world.insert(RigidBodyBuilder::fixed(), collider);
         self.world.step();
         Ok(())
@@ -94,13 +97,22 @@ impl Simulation {
         let d = &definition;
         let r = d.collider_rounding;
         let shape = if r > 0. {
-            ColliderBuilder::round_cuboid(d.half_extents[0]-r, d.half_extents[1]-r, d.half_extents[2]-r, r)
+            ColliderBuilder::round_cuboid(
+                d.half_extents[0] - r,
+                d.half_extents[1] - r,
+                d.half_extents[2] - r,
+                r,
+            )
         } else {
             ColliderBuilder::cuboid(d.half_extents[0], d.half_extents[1], d.half_extents[2])
         };
         let [x, y, z] = d.inertia_half_extents.unwrap_or(d.half_extents);
-        let inertia = Vector::new(y*y+z*z, x*x+z*z, x*x+y*y) * (d.mass / 3.);
-        let mass_properties = MassProperties::new(Vector::from_array(d.center_of_mass) - Vector::from_array(d.collider_offset), d.mass, inertia);
+        let inertia = Vector::new(y * y + z * z, x * x + z * z, x * x + y * y) * (d.mass / 3.);
+        let mass_properties = MassProperties::new(
+            Vector::from_array(d.center_of_mass) - Vector::from_array(d.collider_offset),
+            d.mass,
+            inertia,
+        );
         let (body, _) = self.world.insert(
             RigidBodyBuilder::dynamic()
                 .translation(Vector::from_array(position))
@@ -108,7 +120,8 @@ impl Simulation {
                 .ccd_enabled(true)
                 .linear_damping(0.08)
                 .angular_damping(0.5),
-            shape.translation(Vector::from_array(d.collider_offset))
+            shape
+                .translation(Vector::from_array(d.collider_offset))
                 .mass_properties(mass_properties)
                 .friction(d.chassis_friction)
                 .friction_combine_rule(CoefficientCombineRule::Min),
@@ -138,7 +151,13 @@ impl Simulation {
         let rider = self.world.colliders.insert_with_parent(
             ColliderBuilder::capsule_y(safety.half_height, safety.radius)
                 .translation(Vector::from_array(d.seat) + Vector::from_array(safety.offset))
-                .density(0.).friction(0.2).enabled(false).build(), body, &mut self.world.bodies);
+                .density(0.)
+                .friction(0.2)
+                .enabled(false)
+                .build(),
+            body,
+            &mut self.world.bodies,
+        );
         let id = self.next;
         self.next += 1;
         self.vehicles.insert(
@@ -149,7 +168,11 @@ impl Simulation {
                 controller,
                 controls: Controls::default(),
                 handling: handling::Handling::default(),
-                rider, remote: false, occupied: false, inverted_time: 0., ejection: None,
+                rider,
+                remote: false,
+                occupied: false,
+                inverted_time: 0.,
+                ejection: None,
             },
         );
         Ok(id)
@@ -169,7 +192,9 @@ impl Simulation {
         for _ in 0..steps {
             self.world.integration_parameters.dt = h;
             for v in self.vehicles.values_mut() {
-                if v.remote {continue;}
+                if v.remote {
+                    continue;
+                }
                 handling::prepare(v, &mut self.world.bodies, h);
                 let queries = self.world.broad_phase.as_query_pipeline_mut(
                     self.world.narrow_phase.query_dispatcher(),
@@ -215,7 +240,8 @@ impl Simulation {
             wheel.forward_impulse = 0.;
             wheel.side_impulse = 0.;
         }
-        v.ejection = None; v.inverted_time = 0.;
+        v.ejection = None;
+        v.inverted_time = 0.;
         Ok(())
     }
     pub fn floor(&self, position: [f32; 3]) -> Option<[f32; 3]> {

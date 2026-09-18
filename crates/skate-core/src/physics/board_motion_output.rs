@@ -1,8 +1,8 @@
 //! Observed deck motion from TU3 Skateboard::FillPhysOut82C02A80.
 //! These calculations consume the live solver body and the actual Reckoning
 //! normal. They do not infer contact state from height or vertical velocity.
-use crate::math::{Basis3, Vector3};
 use super::{board::BodyId, board_runtime::BoardRuntime, native_arithmetic};
+use crate::math::{Basis3, Vector3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoardMotionOutput {

@@ -36,15 +36,128 @@
 //! the game does not boot there to reach the startup hook. Treat the first run on a working
 //! install as the real test, and start it with `SKATE_AUDIO_PLAY`.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use bevy::audio::{AddAudioSource, Source, Volume};
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
-use skate_audio_formats::eaac;
+use skate_audio_formats::{banks, eaac};
+use skate_core::physics::phase::PhysicsEvent;
 use skate_data::audio::{self, ffmpeg::FfmpegDecoder};
+
+#[path = "player_audio.rs"]
+pub mod player;
+
+/// One completed local-player physics tick, ready for the player-audio runtime.
+///
+/// This is transport only: it preserves the physics event order and raw surface vote without
+/// claiming that a physics material id is an authored audio-material id. Patch-message creation,
+/// random selection, and archive lookup remain the audio runtime's responsibilities.
+#[derive(Message, Clone, Debug, PartialEq)]
+pub struct PlayerAudioObservation {
+    pub tick: u64,
+    pub state: u32,
+    pub board_speed: f32,
+    pub rider_speed: f32,
+    pub grounded: bool,
+    /// The authoritative physical state is a grind. This is distinct from a deck scrape or a
+    /// wheel contact, which can occur without an admitted grind.
+    pub grinding: bool,
+    /// Retained native Grind PhysOut fields. These are the inputs consumed by the retail grind
+    /// audio updater; a ground-wheel material is not a substitute for its authored surface id.
+    pub grind_family: u32,
+    pub grind_substate: u32,
+    pub grind_audio_surface: u32,
+    pub grind_impact_speed: f32,
+    pub wiping_out: bool,
+    pub landed: bool,
+    /// Downward speed immediately before a landing contact, in metres per second.
+    pub landing_impact_speed: f32,
+    pub landing_clean: bool,
+    pub landing_sketchy: bool,
+    pub landing_type: u32,
+    pub landing_spin: f32,
+    pub landing_sideways_speed: f32,
+    pub footstep_strength: f32,
+    pub footstep_bone: i32,
+    pub foot_push_speed: f32,
+    /// Per-foot ground support while walking (left, right), from the offboard foot manager.
+    pub feet_supported: [bool; 2],
+    /// Packed foot-query audio material (low seven bits), independent of the board wheels.
+    pub foot_surface: u32,
+    pub contact_count: u32,
+    /// The stock MotionGraph's powerslide flag. This is the retail trigger for `Class_Squeaks`;
+    /// ordinary speed loss must not be treated as a powerslide.
+    pub powersliding: bool,
+    /// The authored scoring descriptor active on this tick, resolved through the retail scoring
+    /// catalog. The identifier is retained because its family (ollie, kickflip, shuv, and so on)
+    /// is one of the inputs used by the trick-foley selectors.
+    pub trick_id: Option<usize>,
+    pub trick_identifier: Option<String>,
+    pub animation_name: Option<String>,
+    pub riding_switch: bool,
+    pub riding_fakie: bool,
+    pub nollie: bool,
+    /// The retail audio-material vote from the low seven bits of the four wheel-query tags.
+    /// This is intentionally not the friction/physics surface stored in bits 7..11.
+    pub wheel_surface: u32,
+    pub events: Vec<PhysicsEvent>,
+    /// The native PhysOut fields the retail audio-state bridge `sub_824B0DA8` reads.
+    pub retail: RetailAudioInputs,
+}
+
+/// Raw native PhysOut fields for the retail audio-state bridge `sub_824B0DA8`, which copies them
+/// from the per-skater record `sub_827A1B78` builds. Transport only: the player-audio worker
+/// derives the audio-state bytes (edges, combinations) the way the bridge does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetailAudioInputs {
+    /// SkateboardMotion+164, the board's ground speed in m/s (audio state +208).
+    pub ground_speed: f32,
+    /// SystemReckoning+16, the COM velocity (audio state +96; its length is +212).
+    pub com_velocity: [f32; 3],
+    /// SystemReckoning+64, the skater position (audio state +48).
+    pub position: [f32; 3],
+    /// Collision+0 wheel count (audio state +200 = `(R152 >> 20) & 7`).
+    pub wheel_count: u32,
+    /// KnownAir+176 time in state (audio state +236).
+    pub air_time_in_state: f32,
+    /// Air+184 time until landing (audio state +240).
+    pub air_time_until_landing: f32,
+    /// KnownAir+200 jump height (audio state +260).
+    pub air_jump_height: f32,
+    /// Player state bytes 52..87 as published by the state output (index = offset - 52).
+    pub state_flags: [bool; 36],
+    /// OffBoard bytes 306 (left) and 307 (right).
+    pub offboard_feet: [bool; 2],
+    /// Air FootPlantManager bytes 449 (left) and 450 (right).
+    pub footplant: [bool; 2],
+    /// Interaction+0 `AudibleFootStepStrength` (audio state +796).
+    pub footstep_strength: f32,
+}
+
+impl Default for RetailAudioInputs {
+    fn default() -> Self {
+        Self {
+            ground_speed: 0.0,
+            com_velocity: [0.0; 3],
+            position: [0.0; 3],
+            wheel_count: 0,
+            air_time_in_state: 0.0,
+            air_time_until_landing: 0.0,
+            air_jump_height: 0.0,
+            state_flags: [false; 36],
+            offboard_feet: [false; 2],
+            footplant: [false; 2],
+            footstep_strength: 0.0,
+        }
+    }
+}
 
 /// Decoded interleaved 16-bit PCM, ready to hand to the mixer.
 #[derive(Asset, TypePath, Clone)]
@@ -52,11 +165,18 @@ pub struct StreamPcm {
     samples: Arc<Vec<i16>>,
     channels: u16,
     sample_rate: u32,
+    /// Frame interval to repeat for an inline EAAC loop. Archive streams without an inline loop
+    /// continue to use Bevy's whole-source looping setting.
+    loop_range: Option<(usize, usize)>,
 }
 
 impl StreamPcm {
     pub fn frames(&self) -> usize {
-        if self.channels == 0 { 0 } else { self.samples.len() / usize::from(self.channels) }
+        if self.channels == 0 {
+            0
+        } else {
+            self.samples.len() / usize::from(self.channels)
+        }
     }
 
     pub fn duration(&self) -> Duration {
@@ -64,6 +184,27 @@ impl StreamPcm {
             return Duration::ZERO;
         }
         Duration::from_secs_f64(self.frames() as f64 / f64::from(self.sample_rate))
+    }
+
+    /// A short mono sine wave for verifying the host mixer and output device without game data.
+    ///
+    /// This deliberately lives beside decoded streams so the diagnostic exercises the exact same
+    /// Bevy source, mixer and Windows device backend as retail audio does.
+    fn tone(hertz: f32, duration: Duration) -> Self {
+        const RATE: u32 = 48_000;
+        let frames = (duration.as_secs_f64() * f64::from(RATE)).round() as usize;
+        let angular_step = std::f32::consts::TAU * hertz / RATE as f32;
+        let samples = (0..frames)
+            // Keep headroom so the device test is not itself a clipping test.
+            .map(|frame| (angular_step * frame as f32).sin() * 0.20 * i16::MAX as f32)
+            .map(|sample| sample.round() as i16)
+            .collect();
+        Self {
+            samples: Arc::new(samples),
+            channels: 1,
+            sample_rate: RATE,
+            loop_range: None,
+        }
     }
 }
 
@@ -73,12 +214,19 @@ pub struct PcmPlayback {
     at: usize,
     channels: u16,
     sample_rate: u32,
+    loop_range: Option<(usize, usize)>,
 }
 
 impl Iterator for PcmPlayback {
     type Item = f32;
 
     fn next(&mut self) -> Option<f32> {
+        if let Some((start, end)) = self.loop_range {
+            let channels = usize::from(self.channels);
+            if self.at == end.saturating_mul(channels) {
+                self.at = start.saturating_mul(channels);
+            }
+        }
         let s = *self.samples.get(self.at)?;
         self.at += 1;
         // i16::MIN has no positive counterpart, so dividing by 32768 keeps the full range inside
@@ -89,7 +237,9 @@ impl Iterator for PcmPlayback {
 
 impl Source for PcmPlayback {
     fn current_frame_len(&self) -> Option<usize> {
-        Some(self.samples.len().saturating_sub(self.at))
+        self.loop_range
+            .is_none()
+            .then(|| self.samples.len().saturating_sub(self.at))
     }
     fn channels(&self) -> u16 {
         self.channels
@@ -98,7 +248,14 @@ impl Source for PcmPlayback {
         self.sample_rate
     }
     fn total_duration(&self) -> Option<Duration> {
-        let frames = if self.channels == 0 { 0 } else { self.samples.len() / usize::from(self.channels) };
+        if self.loop_range.is_some() {
+            return None;
+        }
+        let frames = if self.channels == 0 {
+            0
+        } else {
+            self.samples.len() / usize::from(self.channels)
+        };
         (self.sample_rate != 0)
             .then(|| Duration::from_secs_f64(frames as f64 / f64::from(self.sample_rate)))
     }
@@ -114,6 +271,177 @@ impl Decodable for StreamPcm {
             at: 0,
             channels: self.channels,
             sample_rate: self.sample_rate,
+            loop_range: self.loop_range,
+        }
+    }
+}
+
+/// A bounded, continuous float source for the recovered audio graph.
+///
+/// The audio thread never waits for the game thread. When a graph block has not arrived yet (or a
+/// producer momentarily owns the queue), its decoder supplies silence and remains live for the
+/// next block. Keeping the queue bounded also prevents a stalled output device from turning into
+/// delayed gameplay audio.
+#[derive(Asset, TypePath, Clone)]
+pub struct LivePcm {
+    samples: Arc<Mutex<VecDeque<f32>>>,
+    stats: Arc<LivePcmStats>,
+    channels: u16,
+    sample_rate: u32,
+    capacity: usize,
+}
+
+impl LivePcm {
+    /// Hold at most `capacity_frames` rendered frames. A zero channel count, rate, or capacity is
+    /// not a useful continuous audio source and is rejected at construction.
+    pub fn new(channels: u16, sample_rate: u32, capacity_frames: usize) -> Result<Self, String> {
+        if channels == 0 || sample_rate == 0 || capacity_frames == 0 {
+            return Err("live PCM needs nonzero channels, sample rate, and capacity".into());
+        }
+        Ok(Self {
+            samples: Arc::new(Mutex::new(VecDeque::with_capacity(
+                capacity_frames.saturating_mul(usize::from(channels)),
+            ))),
+            stats: Arc::new(LivePcmStats::default()),
+            channels,
+            sample_rate,
+            capacity: capacity_frames.saturating_mul(usize::from(channels)),
+        })
+    }
+
+    /// Append complete interleaved frames. If the renderer gets ahead of output, discard the
+    /// oldest complete frames so current gameplay remains current. The returned count is the
+    /// number of samples discarded from the front.
+    pub fn push(&self, samples: &[f32]) -> Result<usize, String> {
+        if samples.len() % usize::from(self.channels) != 0 {
+            return Err("live PCM input does not end on a frame boundary".into());
+        }
+        if samples.iter().any(|value| !value.is_finite()) {
+            return Err("live PCM contains a non-finite sample".into());
+        }
+        let mut queue = self
+            .samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let overflow = queue
+            .len()
+            .saturating_add(samples.len())
+            .saturating_sub(self.capacity);
+        let dropped = overflow.min(queue.len());
+        for _ in 0..dropped {
+            queue.pop_front();
+        }
+        // A block can be larger than this source's whole latency budget. Keep its newest complete
+        // frames for the same reason as normal queue overflow.
+        let keep = samples.len().min(self.capacity);
+        let skip = samples.len() - keep;
+        queue.extend(samples[skip..].iter().copied());
+        self.stats.pushed.fetch_add(keep as u64, Ordering::Relaxed);
+        Ok(dropped + skip)
+    }
+
+    /// Frames waiting in the shared queue, excluding the decoder's current small block.
+    pub fn queued_frames(&self) -> usize {
+        self.samples.lock().unwrap_or_else(|p| p.into_inner()).len() / usize::from(self.channels)
+    }
+
+    pub fn clear(&self) {
+        self.samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    pub fn snapshot(&self) -> LivePcmSnapshot {
+        LivePcmSnapshot {
+            pushed: self.stats.pushed.load(Ordering::Relaxed),
+            consumed: self.stats.consumed.load(Ordering::Relaxed),
+            consumed_nonzero: self.stats.consumed_nonzero.load(Ordering::Relaxed),
+            underflow: self.stats.underflow.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default)]
+struct LivePcmStats {
+    pushed: AtomicU64,
+    consumed: AtomicU64,
+    consumed_nonzero: AtomicU64,
+    underflow: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LivePcmSnapshot {
+    pub pushed: u64,
+    pub consumed: u64,
+    pub consumed_nonzero: u64,
+    pub underflow: u64,
+}
+
+/// The mixer-facing decoder for [`LivePcm`].
+pub struct LivePlayback {
+    samples: Arc<Mutex<VecDeque<f32>>>,
+    stats: Arc<LivePcmStats>,
+    channels: u16,
+    sample_rate: u32,
+    block: VecDeque<f32>,
+}
+
+impl Iterator for LivePlayback {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.block.is_empty() {
+            // Transfer only whole frames. Locking once per sample could insert silence in the
+            // middle of a stereo frame, permanently swapping L/R after contention or underflow.
+            if let Ok(mut queue) = self.samples.try_lock() {
+                let count = queue.len().min(256 * usize::from(self.channels));
+                self.block.extend(queue.drain(..count));
+            }
+            if self.block.is_empty() {
+                self.block.resize(usize::from(self.channels), 0.0);
+                self.stats
+                    .underflow
+                    .fetch_add(u64::from(self.channels), Ordering::Relaxed);
+            }
+        }
+        let sample = self.block.pop_front();
+        if let Some(value) = sample {
+            self.stats.consumed.fetch_add(1, Ordering::Relaxed);
+            if value.abs() > 1.0e-8 {
+                self.stats.consumed_nonzero.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        sample
+    }
+}
+
+impl Source for LivePlayback {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+impl Decodable for LivePcm {
+    type DecoderItem = f32;
+    type Decoder = LivePlayback;
+
+    fn decoder(&self) -> LivePlayback {
+        LivePlayback {
+            samples: self.samples.clone(),
+            stats: self.stats.clone(),
+            channels: self.channels,
+            sample_rate: self.sample_rate,
+            block: VecDeque::with_capacity(256 * usize::from(self.channels)),
         }
     }
 }
@@ -137,7 +465,12 @@ pub struct StreamRequest {
 }
 
 impl StreamRequest {
-    pub fn new(archive: impl Into<PathBuf>, entry: impl Into<String>, channels: u8, sample_rate: u32) -> Self {
+    pub fn new(
+        archive: impl Into<PathBuf>,
+        entry: impl Into<String>,
+        channels: u8,
+        sample_rate: u32,
+    ) -> Self {
         Self {
             archive: archive.into(),
             entry: entry.into(),
@@ -169,6 +502,38 @@ impl StreamRequest {
 #[derive(Message, Clone, Debug)]
 pub struct PlayStream(pub StreamRequest);
 
+/// Decode one inline EAAC sample from an `.abk` member of an owned archive.
+///
+/// This is an opt-in audition mechanism for comparing individual rider-and-board sound variants.
+/// It does not evaluate a bank program or map gameplay events to samples. An authored inline loop
+/// repeats from its recorded loop frame, instead of repeating the whole decoded waveform.
+#[derive(Message, Clone, Debug)]
+pub struct PlayBankSample(pub BankSampleRequest);
+
+#[derive(Clone, Debug)]
+pub struct BankSampleRequest {
+    pub archive: PathBuf,
+    pub bank: String,
+    pub sample: usize,
+    pub volume: f32,
+}
+
+impl BankSampleRequest {
+    pub fn new(archive: impl Into<PathBuf>, bank: impl Into<String>, sample: usize) -> Self {
+        Self {
+            archive: archive.into(),
+            bank: bank.into(),
+            sample,
+            volume: 1.0,
+        }
+    }
+
+    pub fn volume(mut self, volume: f32) -> Self {
+        self.volume = volume;
+        self
+    }
+}
+
 /// Ask for the ambience bed that suits a place, if the archive has one for it.
 ///
 /// Resolution is by member name (`skate_data::audio::ambience`), which is a stand-in for the
@@ -198,17 +563,25 @@ pub fn resolve_ambience(
     payload: &std::path::Path,
     place: &str,
 ) -> Result<StreamRequest, String> {
-    let header_data = std::fs::read(resident).map_err(|e| format!("{}: {e}", resident.display()))?;
+    let header_data =
+        std::fs::read(resident).map_err(|e| format!("{}: {e}", resident.display()))?;
     let described = audio::describe_archive(&header_data).map_err(|e| e.to_string())?;
     let beds: Vec<audio::ambience::Bed> = described
         .iter()
         .filter_map(|(name, _)| audio::ambience::parse_bed(name))
         .collect();
     if beds.is_empty() {
-        return Err(format!("{} holds no named ambience beds", resident.display()));
+        return Err(format!(
+            "{} holds no named ambience beds",
+            resident.display()
+        ));
     }
-    let bed = audio::ambience::pick(place, &beds)
-        .ok_or_else(|| format!("no bed matches {place:?} among {} in the archive", beds.len()))?;
+    let bed = audio::ambience::pick(place, &beds).ok_or_else(|| {
+        format!(
+            "no bed matches {place:?} among {} in the archive",
+            beds.len()
+        )
+    })?;
     let info = described
         .iter()
         .find(|(name, _)| *name == bed.member)
@@ -219,8 +592,8 @@ pub fn resolve_ambience(
     let stem = bed.member.strip_suffix(".snr").unwrap_or(&bed.member);
     let entry = format!("{stem}.sns");
     let payload_data = std::fs::read(payload).map_err(|e| format!("{}: {e}", payload.display()))?;
-    let archive = skate_audio_formats::eb::Archive::parse(&payload_data)
-        .map_err(|e| e.message.clone())?;
+    let archive =
+        skate_audio_formats::eb::Archive::parse(&payload_data).map_err(|e| e.message.clone())?;
     if archive.find(&entry).is_none() {
         return Err(format!("{} has no member {entry}", payload.display()));
     }
@@ -233,15 +606,41 @@ struct Decoding {
     request: StreamRequest,
 }
 
+#[derive(Component)]
+struct BankDecoding {
+    task: Task<Result<StreamPcm, String>>,
+    request: BankSampleRequest,
+}
+
 pub struct SkateAudioPlugin;
 
 impl Plugin for SkateAudioPlugin {
     fn build(&self, app: &mut App) {
+        player::install(app);
         app.add_audio_source::<StreamPcm>()
+            .add_audio_source::<LivePcm>()
             .add_message::<PlayStream>()
+            .add_message::<PlayBankSample>()
             .add_message::<PlayAmbience>()
-            .add_systems(Startup, play_requested_at_startup)
-            .add_systems(Update, (resolve_ambience_requests, start_decoding, finish_decoding));
+            .add_message::<PlayerAudioObservation>()
+            .add_systems(
+                Startup,
+                (
+                    play_requested_at_startup,
+                    play_bank_sample_at_startup,
+                    play_tone_at_startup,
+                ),
+            )
+            .add_systems(
+                Update,
+                (
+                    resolve_ambience_requests,
+                    start_decoding,
+                    start_bank_decoding,
+                    finish_decoding,
+                    finish_bank_decoding,
+                ),
+            );
     }
 }
 
@@ -250,14 +649,67 @@ impl Plugin for SkateAudioPlugin {
 /// that has no automatic ambience yet: which stream belongs to which map lives in the metadata
 /// table, and that table is not decoded.
 fn play_requested_at_startup(mut requests: MessageWriter<PlayStream>) {
-    let Ok(spec) = std::env::var("SKATE_AUDIO_PLAY") else { return };
+    let Ok(spec) = std::env::var("SKATE_AUDIO_PLAY") else {
+        return;
+    };
     match parse_spec(&spec) {
         Ok(request) => {
-            info!("skate-audio: playing {} entry {} on request", request.archive.display(), request.entry);
+            info!(
+                "skate-audio: playing {} entry {} on request",
+                request.archive.display(),
+                request.entry
+            );
             requests.write(PlayStream(request));
         }
         Err(e) => warn!("skate-audio: SKATE_AUDIO_PLAY={spec}: {e}"),
     }
+}
+
+/// `SKATE_AUDIO_BANK_SAMPLE=<archive>|<bank.abk>|<sample>` auditions one bank sample at startup.
+///
+/// Pipes leave Windows drive-letter paths intact. The requested bank must be an uncompressed
+/// member of the owned archive; the parser rejects an absent sample slot and never reads into the
+/// next member.
+fn play_bank_sample_at_startup(mut requests: MessageWriter<PlayBankSample>) {
+    let Ok(spec) = std::env::var("SKATE_AUDIO_BANK_SAMPLE") else {
+        return;
+    };
+    match parse_bank_sample_spec(&spec) {
+        Ok(request) => {
+            info!(
+                "skate-audio: auditioning {} sample {} from {}",
+                request.bank,
+                request.sample,
+                request.archive.display()
+            );
+            requests.write(PlayBankSample(request));
+        }
+        Err(e) => warn!("skate-audio: SKATE_AUDIO_BANK_SAMPLE={spec}: {e}"),
+    }
+}
+
+/// `SKATE_AUDIO_TONE[=<hertz>]` plays a one-second test tone without an archive or decoder.
+///
+/// It is deliberately opt-in: it is a Windows output-device diagnostic, not game content. A
+/// malformed value keeps the conventional 440 Hz tone and reports the issue rather than making a
+/// silent diagnostic run look successful.
+fn play_tone_at_startup(mut commands: Commands, mut assets: ResMut<Assets<StreamPcm>>) {
+    let Ok(value) = std::env::var("SKATE_AUDIO_TONE") else {
+        return;
+    };
+    let hertz = match value.parse::<f32>() {
+        Ok(hertz) if hertz.is_finite() && hertz > 0.0 => hertz,
+        Ok(_) | Err(_) if value.is_empty() || value == "1" => 440.0,
+        Ok(_) | Err(_) => {
+            warn!(
+                "skate-audio: SKATE_AUDIO_TONE={value:?} is not a positive frequency; using 440 Hz"
+            );
+            440.0
+        }
+    };
+    info!("skate-audio: playing {hertz:.1} Hz output-device test tone");
+    let handle = assets.add(StreamPcm::tone(hertz, Duration::from_secs(1)));
+    commands.spawn((AudioPlayer(handle), PlaybackSettings::DESPAWN));
 }
 
 /// Parse `archive:entry:channels:rate[:blocks]`. The archive path is taken from the left, so a
@@ -274,10 +726,16 @@ fn parse_spec(spec: &str) -> Result<StreamRequest, String> {
     Ok(StreamRequest::new(
         archive,
         entry,
-        channels.parse::<u8>().map_err(|e| format!("channels: {e}"))?,
+        channels
+            .parse::<u8>()
+            .map_err(|e| format!("channels: {e}"))?,
         rate.parse::<u32>().map_err(|e| format!("rate: {e}"))?,
     )
-    .blocks(blocks.parse::<usize>().map_err(|e| format!("blocks: {e}"))?))
+    .blocks(
+        blocks
+            .parse::<usize>()
+            .map_err(|e| format!("blocks: {e}"))?,
+    ))
 }
 
 /// Turn a place into a stream request, or say why it could not be.
@@ -288,7 +746,10 @@ fn resolve_ambience_requests(
     for ask in asked.read() {
         match resolve_ambience(&ask.resident, &ask.payload, &ask.place) {
             Ok(request) => {
-                info!("skate-audio: ambience for {:?}: {}", ask.place, request.entry);
+                info!(
+                    "skate-audio: ambience for {:?}: {}",
+                    ask.place, request.entry
+                );
                 streams.write(PlayStream(request.volume(ask.volume)));
             }
             // Not an error worth stopping for: a map with no bed simply has no ambience yet.
@@ -301,7 +762,21 @@ fn start_decoding(mut commands: Commands, mut requests: MessageReader<PlayStream
     for PlayStream(request) in requests.read() {
         let job = request.clone();
         let task = AsyncComputeTaskPool::get().spawn(async move { decode(&job) });
-        commands.spawn(Decoding { task, request: request.clone() });
+        commands.spawn(Decoding {
+            task,
+            request: request.clone(),
+        });
+    }
+}
+
+fn start_bank_decoding(mut commands: Commands, mut requests: MessageReader<PlayBankSample>) {
+    for PlayBankSample(request) in requests.read() {
+        let job = request.clone();
+        let task = AsyncComputeTaskPool::get().spawn(async move { decode_bank_sample(&job) });
+        commands.spawn(BankDecoding {
+            task,
+            request: request.clone(),
+        });
     }
 }
 
@@ -311,14 +786,19 @@ fn finish_decoding(
     mut pending: Query<(Entity, &mut Decoding)>,
 ) {
     for (entity, mut job) in &mut pending {
-        let Some(result) = block_on(future::poll_once(&mut job.task)) else { continue };
+        let Some(result) = block_on(future::poll_once(&mut job.task)) else {
+            continue;
+        };
         commands.entity(entity).despawn();
         match result {
             Ok(pcm) => {
                 info!(
                     "skate-audio: {} entry {} decoded, {} frames of {} channels ({:.2} s)",
-                    job.request.archive.display(), job.request.entry, pcm.frames(),
-                    pcm.channels, pcm.duration().as_secs_f64()
+                    job.request.archive.display(),
+                    job.request.entry,
+                    pcm.frames(),
+                    pcm.channels,
+                    pcm.duration().as_secs_f64()
                 );
                 let volume = job.request.volume;
                 let handle = assets.add(pcm);
@@ -327,9 +807,50 @@ fn finish_decoding(
                 } else {
                     PlaybackSettings::DESPAWN
                 };
-                commands.spawn((AudioPlayer(handle), settings.with_volume(Volume::Linear(volume))));
+                commands.spawn((
+                    AudioPlayer(handle),
+                    settings.with_volume(Volume::Linear(volume)),
+                ));
             }
-            Err(e) => warn!("skate-audio: {} entry {}: {e}", job.request.archive.display(), job.request.entry),
+            Err(e) => warn!(
+                "skate-audio: {} entry {}: {e}",
+                job.request.archive.display(),
+                job.request.entry
+            ),
+        }
+    }
+}
+
+fn finish_bank_decoding(
+    mut commands: Commands,
+    mut assets: ResMut<Assets<StreamPcm>>,
+    mut pending: Query<(Entity, &mut BankDecoding)>,
+) {
+    for (entity, mut job) in &mut pending {
+        let Some(result) = block_on(future::poll_once(&mut job.task)) else {
+            continue;
+        };
+        commands.entity(entity).despawn();
+        match result {
+            Ok(pcm) => {
+                info!(
+                    "skate-audio: {} sample {} decoded, {} frames of {} channels ({:.2} s)",
+                    job.request.bank,
+                    job.request.sample,
+                    pcm.frames(),
+                    pcm.channels,
+                    pcm.duration().as_secs_f64()
+                );
+                let handle = assets.add(pcm);
+                commands.spawn((
+                    AudioPlayer(handle),
+                    PlaybackSettings::DESPAWN.with_volume(Volume::Linear(job.request.volume)),
+                ));
+            }
+            Err(e) => warn!(
+                "skate-audio: {} sample {}: {e}",
+                job.request.bank, job.request.sample
+            ),
         }
     }
 }
@@ -338,13 +859,66 @@ fn finish_decoding(
 fn decode(request: &StreamRequest) -> Result<StreamPcm, String> {
     let data = std::fs::read(&request.archive).map_err(|e| format!("{e}"))?;
     let (at, end) = locate(&data, &request.entry)?;
+    decode_range(
+        &data,
+        at,
+        end,
+        request.channels,
+        request.sample_rate,
+        request.blocks,
+    )
+}
+
+fn decode_bank_sample(request: &BankSampleRequest) -> Result<StreamPcm, String> {
+    use skate_audio_formats::eb;
+
+    let data = std::fs::read(&request.archive).map_err(|e| format!("{e}"))?;
+    let archive = eb::Archive::parse(&data).map_err(|e| e.message.clone())?;
+    let member = archive
+        .find(&request.bank)
+        .ok_or_else(|| format!("no member named {}", request.bank))?;
+    if member.is_compressed() {
+        return Err(format!(
+            "bank {} is a chunkref block, not stored audio",
+            request.bank
+        ));
+    }
+    let member_range = member.range();
+    let bank_bytes = data
+        .get(member_range.clone())
+        .ok_or_else(|| format!("bank {} runs past archive end", request.bank))?;
+    let bank = banks::Abk::parse(bank_bytes).map_err(|e| e.message)?;
+    let sample_range = bank
+        .sample_range(request.sample)
+        .ok_or_else(|| format!("bank {} has no sample {}", request.bank, request.sample))?;
+    let at = member_range.start + sample_range.start;
+    let end = member_range.start + sample_range.end;
+    decode_range(&data, at, end, 0, 0, 0)
+}
+
+/// Decode an EAAC chain whose enclosing range is already known. Keeping `end` explicit prevents
+/// the final block of a bank sample from consuming the next sample's header as payload.
+fn decode_range(
+    data: &[u8],
+    at: usize,
+    end: usize,
+    fallback_channels: u8,
+    fallback_rate: u32,
+    blocks_limit: usize,
+) -> Result<StreamPcm, String> {
+    if at >= end || end > data.len() {
+        return Err("audio member has an invalid byte range".into());
+    }
     // A member may carry its own stream header -- the named wheel and grain sounds do -- or be a
     // bare block chain whose format lives in the metadata, as the ambience beds are. Prefer the
     // header when there is one, and skip it: its low 24 bits are the sample rate, so reading it
     // as a block header looks like a 48,000-byte block and fails far from the real mistake.
-    let (chain, channels, rate) = match audio::describe(&data, at) {
-        Ok(info) => (at + info.header_bytes, info.channels, info.sample_rate),
-        Err(_) => (at, request.channels, request.sample_rate),
+    // Keep the header parser inside the member/sample boundary too: a malformed looping header
+    // must not borrow its loop word from the next bank sample.
+    let header = eaac::Header::parse(&data[..end], at).ok();
+    let (chain, channels, rate) = match header {
+        Some(header) => (at + header.size(), header.channels(), header.sample_rate),
+        None => (at, fallback_channels, fallback_rate),
     };
     let widths = audio::context_widths(channels);
     let contexts = widths.len();
@@ -355,7 +929,7 @@ fn decode(request: &StreamRequest) -> Result<StreamPcm, String> {
     let mut chains: Vec<Vec<Vec<u8>>> = vec![Vec::new(); contexts];
     let mut seen = 0usize;
     for block in eaac::blocks(&data[chain..end]).map_err(|e| e.message.clone())? {
-        if request.blocks != 0 && seen >= request.blocks {
+        if blocks_limit != 0 && seen >= blocks_limit {
             break;
         }
         let range = block.data_range();
@@ -376,11 +950,42 @@ fn decode(request: &StreamRequest) -> Result<StreamPcm, String> {
             audio::ffmpeg::decode_chain(chunks, widths[context], rate).map_err(|e| e.message)?,
         );
     }
+    let samples = audio::interleave_contexts(&per_context, &widths);
+    let frames = samples.len() / usize::from(channels);
+    let loop_range = header.and_then(|header| {
+        header.loop_start.map(|start| {
+            let start = start as usize;
+            (start, frames)
+        })
+    });
+    if let Some((start, loop_end)) = loop_range
+        && start >= loop_end
+    {
+        return Err(format!(
+            "decoded loop start {start} is outside its {loop_end}-frame PCM"
+        ));
+    }
     Ok(StreamPcm {
-        samples: Arc::new(audio::interleave_contexts(&per_context, &widths)),
+        samples: Arc::new(samples),
         channels: u16::from(channels),
         sample_rate: rate,
+        loop_range,
     })
+}
+
+fn parse_bank_sample_spec(spec: &str) -> Result<BankSampleRequest, String> {
+    let mut fields = spec.rsplitn(3, '|');
+    let sample = fields
+        .next()
+        .ok_or("expected archive|bank.abk|sample")?
+        .parse::<usize>()
+        .map_err(|e| format!("sample: {e}"))?;
+    let bank = fields.next().ok_or("expected archive|bank.abk|sample")?;
+    let archive = fields.next().ok_or("expected archive|bank.abk|sample")?;
+    if archive.is_empty() || bank.is_empty() {
+        return Err("archive and bank must not be empty".into());
+    }
+    Ok(BankSampleRequest::new(archive, bank, sample))
 }
 
 /// Resolve a member to a byte range. The range matters as much as the offset: a block walk that
@@ -393,10 +998,14 @@ fn locate(data: &[u8], entry: &str) -> Result<(usize, usize), String> {
             .entries
             .get(index)
             .ok_or_else(|| format!("entry {index}: the archive has {}", archive.entries.len()))?,
-        Err(_) => archive.find(entry).ok_or_else(|| format!("no member named {entry}"))?,
+        Err(_) => archive
+            .find(entry)
+            .ok_or_else(|| format!("no member named {entry}"))?,
     };
     if member.is_compressed() {
-        return Err(format!("member {entry} is a chunkref block, not stored audio"));
+        return Err(format!(
+            "member {entry} is a chunkref block, not stored audio"
+        ));
     }
     let range = member.range();
     Ok((range.start, range.end.min(data.len())))
@@ -418,6 +1027,7 @@ mod tests {
             samples: Arc::new(vec![i16::MIN, i16::MAX, 0]),
             channels: 1,
             sample_rate: 48_000,
+            loop_range: None,
         };
         let got: Vec<f32> = pcm.decoder().collect();
         assert_eq!(got.len(), 3);
@@ -427,16 +1037,87 @@ mod tests {
     }
 
     #[test]
+    fn live_pcm_is_continuous_and_keeps_the_newest_complete_frames() {
+        let pcm = LivePcm::new(2, 48_000, 2).unwrap();
+        let mut playback = pcm.decoder();
+        assert_eq!(playback.next(), Some(0.0), "an empty live block is silence");
+        assert_eq!(
+            playback.next(),
+            Some(0.0),
+            "silence completes the stereo frame"
+        );
+        assert_eq!(playback.current_frame_len(), None);
+        assert_eq!(playback.total_duration(), None);
+        assert_eq!(pcm.push(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(), 2);
+        assert_eq!(
+            [
+                playback.next(),
+                playback.next(),
+                playback.next(),
+                playback.next()
+            ],
+            [Some(3.0), Some(4.0), Some(5.0), Some(6.0)]
+        );
+        assert_eq!(playback.next(), Some(0.0));
+        assert!(pcm.push(&[1.0]).is_err(), "partial frames are refused");
+        assert!(pcm.push(&[f32::NAN, 0.0]).is_err());
+    }
+
+    #[test]
+    fn live_pcm_underflow_cannot_swap_stereo_channels() {
+        let pcm = LivePcm::new(2, 48_000, 2).unwrap();
+        let mut playback = pcm.decoder();
+        assert_eq!(playback.next(), Some(0.0));
+        pcm.push(&[0.25, -0.5]).unwrap();
+        assert_eq!(playback.next(), Some(0.0));
+        assert_eq!(playback.next(), Some(0.25));
+        assert_eq!(playback.next(), Some(-0.5));
+    }
+
+    #[test]
     fn duration_counts_frames_not_samples() {
         // Five channels at 48 kHz: 240,000 samples are one second, not five.
         let pcm = StreamPcm {
             samples: Arc::new(vec![0i16; 48_000 * 5]),
             channels: 5,
             sample_rate: 48_000,
+            loop_range: None,
         };
         assert_eq!(pcm.frames(), 48_000);
         assert_eq!(pcm.duration(), Duration::from_secs(1));
         assert_eq!(pcm.decoder().total_duration(), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn inline_loop_restarts_at_its_authored_frame_not_at_zero() {
+        let pcm = StreamPcm {
+            samples: Arc::new(vec![100i16, 200, 300]),
+            channels: 1,
+            sample_rate: 48_000,
+            loop_range: Some((1, 3)),
+        };
+        let mut playback = pcm.decoder();
+        let got: Vec<i16> = (0..6)
+            .map(|_| (playback.next().unwrap() * 32767.0).round() as i16)
+            .collect();
+        assert_eq!(got, [100, 200, 300, 200, 300, 200]);
+        assert_eq!(playback.current_frame_len(), None);
+        assert_eq!(playback.total_duration(), None);
+    }
+
+    #[test]
+    fn output_test_tone_is_a_bounded_one_second_mono_source() {
+        let tone = StreamPcm::tone(440.0, Duration::from_secs(1));
+        assert_eq!(tone.channels, 1);
+        assert_eq!(tone.sample_rate, 48_000);
+        assert_eq!(tone.frames(), 48_000);
+        assert_eq!(tone.duration(), Duration::from_secs(1));
+        assert!(tone.samples.iter().any(|&sample| sample != 0));
+        assert!(
+            tone.samples
+                .iter()
+                .all(|&sample| sample.unsigned_abs() <= (i16::MAX as u16) / 4)
+        );
     }
 
     #[test]
@@ -452,6 +1133,21 @@ mod tests {
         assert_eq!(r.blocks, 8);
         assert!(parse_spec("/a/b.big:0:5").is_err());
         assert!(parse_spec("/a/b.big:0:many:48000").is_err());
+    }
+
+    #[test]
+    fn bank_sample_spec_keeps_a_windows_archive_path_intact() {
+        let request =
+            parse_bank_sample_spec(r"C:\\Skate 3\\audio\\audiofiles.big|GRINDS.abk|17").unwrap();
+        assert_eq!(
+            request.archive,
+            PathBuf::from(r"C:\\Skate 3\\audio\\audiofiles.big")
+        );
+        assert_eq!(request.bank, "GRINDS.abk");
+        assert_eq!(request.sample, 17);
+        assert!(parse_bank_sample_spec("archive|bank.abk").is_err());
+        assert!(parse_bank_sample_spec("archive||0").is_err());
+        assert!(parse_bank_sample_spec("archive|bank.abk|many").is_err());
     }
 
     #[test]

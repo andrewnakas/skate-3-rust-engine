@@ -4,15 +4,15 @@
 //! publication82C079E0, and world-contact normal selection82C07D20. The
 //! postphysics stage consumes actual solver reports, never speculative query
 //! contacts. Dynamic-object classification is outside the host's static world.
-use crate::{math::Vector3, trigonometry};
 use super::{
-    board::{BodyId, BODY_COUNT},
+    board::{BODY_COUNT, BodyId},
     board_motion_output::{add, dot, inverse_length_squared, length, scale, subtract},
     board_runtime::BoardRuntime,
     board_step::CollisionBody,
     contact_feedback::BoardContactReport,
     native_arithmetic,
 };
+use crate::{math::Vector3, trigonometry};
 
 const UP: Vector3 = Vector3::new(0.0, 1.0, 0.0);
 pub const WHEEL_LINE_LENGTH: f32 = f32::from_bits(0x3E4C_CCCD);
@@ -46,6 +46,9 @@ pub struct WheelLineHit {
 pub struct WheelLineState {
     pub normals: [Vector3; 4],
     pub distances: [f32; 4],
+    /// Low seven bits of the packed map material tag. This is the authored audio material and is
+    /// deliberately distinct from the five-bit friction/physics surface below.
+    pub audio_surfaces: [u32; 4],
     pub physics_surfaces: [u32; 4],
     pub minimum_distance: f32,
 }
@@ -55,6 +58,7 @@ impl Default for WheelLineState {
         Self {
             normals: [UP; 4],
             distances: [0.0; 4],
+            audio_surfaces: [0; 4],
             physics_surfaces: [0; 4],
             minimum_distance: 0.0,
         }
@@ -66,6 +70,7 @@ impl WheelLineState {
     pub fn publish(&mut self, hits: [Option<WheelLineHit>; 4]) {
         self.minimum_distance = WHEEL_LINE_LENGTH;
         for (i, hit) in hits.into_iter().enumerate() {
+            self.audio_surfaces[i] = 0;
             self.physics_surfaces[i] = 0;
             if let Some(hit) = hit {
                 let distance = hit.fraction * WHEEL_LINE_LENGTH;
@@ -76,6 +81,7 @@ impl WheelLineState {
                 };
                 self.normals[i] = hit.normal;
                 self.distances[i] = distance;
+                self.audio_surfaces[i] = hit.surface_tag & 0x7f;
                 self.physics_surfaces[i] = (hit.surface_tag >> 7) & 31;
             }
         }
@@ -90,7 +96,10 @@ pub struct PartGroundContact {
     pub relative_velocity: Vector3,
 }
 const EMPTY_PART: PartGroundContact = PartGroundContact {
-    in_contact: false, normal: UP, point: Vector3::ZERO, relative_velocity: Vector3::ZERO,
+    in_contact: false,
+    normal: UP,
+    point: Vector3::ZERO,
+    relative_velocity: Vector3::ZERO,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -127,7 +136,9 @@ pub struct BoardGroundState {
 impl Default for BoardGroundState {
     fn default() -> Self {
         Self {
-            parts: [EMPTY_PART; BODY_COUNT], overall_normal: UP, wheel_normal: UP,
+            parts: [EMPTY_PART; BODY_COUNT],
+            overall_normal: UP,
+            wheel_normal: UP,
             // CollisionInfo ctor82C00DC8/CC zeros both arrays. Board reset
             //82C0D758 calls that constructor again; per-frame reset retains velocities.
             previous_velocities: [Vector3::ZERO; BODY_COUNT],
@@ -137,8 +148,11 @@ impl Default for BoardGroundState {
             opposing_contact: 0.0,
             surface_twelve_height: 0.0,
             collision_flags: 0,
-            valid_wheel_normals: [false; 4], part_contact_count: 0,
-            wheel_contact_count: 0, time_without_wheel_contact: 0.0, wheel_angular_drag: [0.0; 4],
+            valid_wheel_normals: [false; 4],
+            part_contact_count: 0,
+            wheel_contact_count: 0,
+            time_without_wheel_contact: 0.0,
+            wheel_angular_drag: [0.0; 4],
         }
     }
 }
@@ -148,7 +162,8 @@ impl BoardGroundState {
     pub fn sample_accelerations(&mut self, velocities: [Vector3; BODY_COUNT], time_step: f32) {
         let inverse_dt = 1.0 / time_step;
         for (i, current) in velocities.into_iter().enumerate() {
-            self.accelerations[i] = scale(subtract(current, self.previous_velocities[i]), inverse_dt);
+            self.accelerations[i] =
+                scale(subtract(current, self.previous_velocities[i]), inverse_dt);
             self.previous_velocities[i] = current;
         }
     }
@@ -158,7 +173,9 @@ impl BoardGroundState {
     pub fn advance_contact_time(&mut self, time_step: f32) {
         self.time_without_wheel_contact = if self.wheel_contact_count == 0 {
             self.time_without_wheel_contact + time_step
-        } else { 0.0 };
+        } else {
+            0.0
+        };
     }
     /// Complete contact-normal/count/drag subpipeline of82C07D20 for the
     /// static world. Reports must already satisfy82AE1608/827682B0 eligibility.
@@ -188,17 +205,24 @@ impl BoardGroundState {
         let mut surfaces = [0; BODY_COUNT];
         surfaces[..4].copy_from_slice(&lines.physics_surfaces);
         for report in reports {
-            assert_eq!(report.other, CollisionBody::StaticWorld,
-                "dynamic object contact classification needs its recovered owner");
+            assert_eq!(
+                report.other,
+                CollisionBody::StaticWorld,
+                "dynamic object contact classification needs its recovered owner"
+            );
             let i = report.part.index();
             if report.part == BodyId::Deck {
                 let projection = dot(report.normal, reckoning_up);
                 minimum_projection = if minimum_projection - projection >= 0.0 {
                     projection
-                } else { minimum_projection };
+                } else {
+                    minimum_projection
+                };
                 maximum_projection = if maximum_projection - projection >= 0.0 {
                     maximum_projection
-                } else { projection };
+                } else {
+                    projection
+                };
             }
             //82C07ED0..7F2C: this is the OLD part velocity, not the report's
             //post-solve relative velocity or the finite-difference acceleration.
@@ -250,7 +274,10 @@ impl BoardGroundState {
             }
         }
         self.part_contact_count = self.parts.iter().filter(|part| part.in_contact).count() as u8;
-        self.wheel_contact_count = self.parts[..4].iter().filter(|part| part.in_contact).count() as u8;
+        self.wheel_contact_count = self.parts[..4]
+            .iter()
+            .filter(|part| part.in_contact)
+            .count() as u8;
         let angle_radians = maximum_ground_angle_degrees * f32::from_bits(0x3C8E_FA35);
         let minimum_up_dot = trigonometry::cos(angle_radians);
         let mut sum = Vector3::ZERO;
@@ -263,7 +290,11 @@ impl BoardGroundState {
                 sum = add(sum, contact.normal);
             }
             let drag = if contact.in_contact {
-                if board_wiping_out { f32::from_bits(0x3D23_D70A) } else { 0.0 }
+                if board_wiping_out {
+                    f32::from_bits(0x3D23_D70A)
+                } else {
+                    0.0
+                }
             } else {
                 f32::from_bits(0x3BC4_9BA6)
             };
@@ -276,8 +307,14 @@ impl BoardGroundState {
         } else {
             let mut support = Vector3::ZERO;
             // Native sum order: deck, front truck, back truck.
-            for i in [BodyId::Deck.index(), BodyId::FrontTruck.index(), BodyId::BackTruck.index()] {
-                if self.parts[i].in_contact { support = add(support, self.parts[i].normal); }
+            for i in [
+                BodyId::Deck.index(),
+                BodyId::FrontTruck.index(),
+                BodyId::BackTruck.index(),
+            ] {
+                if self.parts[i].in_contact {
+                    support = add(support, self.parts[i].normal);
+                }
             }
             let magnitude = length(support);
             if magnitude > f32::from_bits(0x3C23_D70A) {
@@ -298,15 +335,14 @@ pub fn angle_between(a: Vector3, b: Vector3) -> f32 {
     let a_squared = dot(a, a);
     let b_squared = dot(b, b);
     let epsilon = f32::from_bits(0x38D1_B717);
-    if !(a_squared > epsilon && b_squared > epsilon) { return 0.0; }
+    if !(a_squared > epsilon && b_squared > epsilon) {
+        return 0.0;
+    }
     let a = scale(a, inverse_length_squared(a_squared, 1));
     let b = scale(b, inverse_length_squared(b_squared, 1));
-    let cosine = native_arithmetic::vector_min(
-        native_arithmetic::vector_max(dot(a, b), -1.0), 1.0,
-    );
+    let cosine = native_arithmetic::vector_min(native_arithmetic::vector_max(dot(a, b), -1.0), 1.0);
     trigonometry::acos(cosine)
 }
-
 
 #[cfg(test)]
 #[path = "tests/board_ground.rs"]

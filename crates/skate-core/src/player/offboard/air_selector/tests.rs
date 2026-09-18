@@ -190,8 +190,12 @@ fn animation_correction_retains_native_fused_up_plus_forward_operation() {
     let mut s = selected();
     //Finite orthogonal axes deliberately exercise cancellation. This is an
     //arithmetic regression for82D6DF40, not a stock gameplay tuning fixture.
-    let axes = [[0., 0., 1., 0.], [0.8, 0.6, 0., 0.],
-        [0.6, -0.8, 0., 0.], [0.; 4]];
+    let axes = [
+        [0., 0., 1., 0.],
+        [0.8, 0.6, 0., 0.],
+        [0.6, -0.8, 0., 0.],
+        [0.; 4],
+    ];
     s.adjust_animation(10, [0., 0.6, -0.8, 0.], axes, 0.);
     let forward = 0.6_f32 * -0.8;
     let expected = -0.8_f32.mul_add(0.6, forward);
