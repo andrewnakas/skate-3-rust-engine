@@ -25,3 +25,4 @@ pub mod host;
 pub mod player;
 pub mod rng;
 pub mod seek;
+pub mod stream;

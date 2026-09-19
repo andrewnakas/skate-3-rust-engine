@@ -24,6 +24,7 @@ pub(crate) mod seams;
 pub(crate) mod speed;
 pub(crate) mod treatment;
 pub(crate) mod tricks;
+pub(crate) mod wheels;
 pub(crate) mod words;
 
 use skate_audio_core::authored::AuthoredRuntime;

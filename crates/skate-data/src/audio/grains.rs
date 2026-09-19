@@ -131,6 +131,75 @@ pub fn load_grains(
     Ok(out)
 }
 
+/// Load the named members of an EB archive (`wheels.big`) as the resource loaders place them.
+/// `.snr` members (an EAAC header at offset 0 and one resident block) also get their stream
+/// decoded, through the same ffmpeg path and cache as the grains. Every other member (`.sek` seek
+/// tables) comes back with its bytes only (`samples` empty, `channels` and `rate` 0).
+pub fn load_members(
+    archive: &Path,
+    names: &[&str],
+    cache: Option<&Path>,
+) -> Result<Vec<GrainMember>, Error> {
+    let data = std::fs::read(archive).map_err(|e| io_error(archive, e))?;
+    let parsed = skate_audio_formats::eb::Archive::parse(&data)?;
+    let mut out = Vec::new();
+    for name in names {
+        let entry = parsed
+            .find(name)
+            .ok_or_else(|| Error::Format(format!("{} has no member {name}", archive.display())))?;
+        if entry.is_compressed() {
+            return Err(Error::Format(format!("{name}: compressed members are unsupported")));
+        }
+        let range = entry.range();
+        let bytes = data
+            .get(range)
+            .ok_or_else(|| Error::Format(format!("{name}: member out of bounds")))?
+            .to_vec();
+        if !name.to_ascii_lowercase().ends_with(".snr") {
+            out.push(GrainMember {
+                name: (*name).to_owned(),
+                bytes,
+                samples: Arc::from(Vec::new()),
+                channels: 0,
+                rate: 0,
+            });
+            continue;
+        }
+        let header = skate_audio_formats::eaac::Header::parse(&bytes, 0)?;
+        let channels = header.channels();
+        let expected = header.num_samples as usize * usize::from(channels);
+        let cached = cache
+            .map(|c| cache_path(c, name, &bytes))
+            .and_then(|p| read_cache(&p, &bytes, expected));
+        let samples = match cached {
+            Some(pcm) => pcm,
+            None => {
+                let pcm = super::ffmpeg::decode_resident(&bytes)
+                    .map_err(|e| Error::Format(format!("{name}: {e}")))?;
+                if pcm.len() != expected {
+                    return Err(Error::Format(format!(
+                        "{name}: decoded {} frames, EAAC declares {}",
+                        pcm.len() / usize::from(channels),
+                        header.num_samples
+                    )));
+                }
+                if let Some(c) = cache {
+                    let _ = write_cache(&cache_path(c, name, &bytes), &bytes, &pcm);
+                }
+                pcm
+            }
+        };
+        out.push(GrainMember {
+            name: (*name).to_owned(),
+            channels,
+            rate: header.sample_rate,
+            samples: Arc::from(samples),
+            bytes,
+        });
+    }
+    Ok(out)
+}
+
 /// The vault rows of the grain class, keyed by collection key.
 pub struct GrainVault {
     rows: Vec<Value>,

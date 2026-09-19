@@ -10,14 +10,27 @@
 //!   w6 0, w7 vf60(1), w3; wind w0 (vault), w2 vf56(3), w6 0, w7 vf60(4), w3. The updater's
 //!   intensity uses `fmsubs` (`v × 3.6 − low` fused, one rounding).
 //!
-//! Not ported (out of scope): the `x_jet_rolling.grain` "AudBoard Rocket" grain player at `+100`
-//! (`+128` playing flag, started above `+136` = 35 km/h by `sub_828EC040`/`sub_828ECAB0`/
-//! `sub_828EC3F0`, stopped by `sub_828EBF90`, fed by the updater's second block with vf60(5),
-//! vf56(3) and `+132`).
+//! The `x_jet_rolling.grain` "AudBoard Rocket" layer ([`Rocket`]), a grain player at `+100`:
+//! - Loaded as a type-14 resource (`sub_824E7658`); the player is created by slot 7
+//!   (`sub_824E78F0`).
+//! - Process, between the rattle and the wind: above `+136` km/h (`7508154FF73DDCED`, 35) it binds
+//!   the grain to the default output target `[[[0x830CFDBC]+44]]` (`sub_828EC040`).
+//!   - It copies the GrainParams at `+104..+120` into the player: vault `D18D1174735E5CDE`, which
+//!     `sub_824E80D0` copies over the constructor's constants (0.1, 0.4, 0.1, 2.4, 0.1).
+//!   - It picks and starts a grain (`sub_828ECAB0`, `sub_828EC3F0`) and sets `+128`.
+//! - At or below `+136` it stops the player twice (`sub_828EBF90`).
+//! - Update, between the rattle and the wind, while `+128`: the player record is
+//!   - gain `level(5)/32767 × +132 / 32767` (`9BC13FA19CC4DF00`, 22000);
+//!   - pitch `pitch(3) / 4096`;
+//!   - position `clamp01((v × 3.6 − +136) / (+140 − +136))`, the subtraction fused
+//!     (`1185E9A69919B051`, 60).
 //!
 //! Tuning: `sub_824E80D0` reads holder `*(0x830CFDA4)+132` = class `6E878344774A7999`/`default`;
 //! eEQChain from holder `+140` = `42AFE160E647167C`/`default`.
 
+use skate_audio_core::fp::nmsub_single;
+use skate_audio_core::grain::board::GrainRecord;
+use skate_data::audio::grains::GrainMember;
 use skate_data::collections::Collections;
 
 use super::super::audio_state::AudioState;
@@ -148,6 +161,64 @@ pub(crate) fn wind_update(words: &mut [u32; WIND_WORDS], tuning: &SpeedTuning, a
     words[3] = clamp_word(update_intensity(audio.com_speed_212, tuning.wind_bounds(audio)), 0, 1_000);
 }
 
+/// The rocket layer's vault values (holder `+132`, class `6E878344774A7999`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RocketTuning {
+    /// `+136` `7508154FF73DDCED`, `+140` `1185E9A69919B051`: km/h.
+    pub start_kmh: f32,
+    pub top_kmh: f32,
+    /// `+132` `9BC13FA19CC4DF00` (an Int32, converted with `fcfid ; frsp`).
+    pub gain: f32,
+    /// `+104..+120` GrainParams `D18D1174735E5CDE`.
+    pub params: [f32; 5],
+}
+
+impl RocketTuning {
+    pub(crate) fn load(vault: &Collections) -> Result<Self, String> {
+        let words = vault.words::<5>(TUNING_CLASS, DEFAULT_KEY, "Hash_D18D1174735E5CDE")?;
+        Ok(Self {
+            start_kmh: vault.float(TUNING_CLASS, DEFAULT_KEY, "Hash_7508154FF73DDCED")?,
+            top_kmh: vault.float(TUNING_CLASS, DEFAULT_KEY, "Hash_1185E9A69919B051")?,
+            gain: vault.integer(TUNING_CLASS, DEFAULT_KEY, "Hash_9BC13FA19CC4DF00")? as i32 as f32,
+            params: words.map(f32::from_bits),
+        })
+    }
+}
+
+/// `sub_824E7980`'s rocket branch: `Some(true)` to start, `Some(false)` to stop.
+pub(crate) fn rocket_step(kmh: f32, start_kmh: f32, running: bool) -> Option<bool> {
+    if kmh > start_kmh {
+        (!running).then_some(true)
+    } else {
+        running.then_some(false)
+    }
+}
+
+/// `sub_824E7CB0`'s rocket record.
+pub(crate) fn rocket_record(speed: f32, tuning: &RocketTuning, level_5: u32, pitch_3: i32) -> GrainRecord {
+    const INV_32767: f32 = f32::from_bits(0x3800_0100);
+    const INV_4096: f32 = f32::from_bits(0x3980_0000);
+    // fmsubs f12 = v·3.6 − start, fused.
+    let over = -nmsub_single(f64::from(speed), f64::from(KMH_PER_MS), f64::from(tuning.start_kmh)) as f32;
+    let ratio = over / (tuning.top_kmh - tuning.start_kmh);
+    let clamped = if -ratio >= 0.0 { 0.0 } else { ratio };
+    let position = if ONE - clamped >= 0.0 { clamped } else { ONE };
+    let level = level_5 as i32 as f32 * INV_32767;
+    GrainRecord {
+        gain: tuning.gain * level * INV_32767,
+        pitch: pitch_3 as f32 * INV_4096,
+        position,
+    }
+}
+
+/// The rocket grain player (`+100`) and its playing flag (`+128`).
+pub(crate) struct Rocket {
+    tuning: RocketTuning,
+    player: u32,
+    member: String,
+    running: bool,
+}
+
 /// What one process call did.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SpeedEvents {
@@ -163,6 +234,7 @@ pub(crate) struct SenseOfSpeed {
     local_72: bool,
     rattle: Option<(u32, [u32; RATTLE_WORDS])>,
     wind: Option<(u32, [u32; WIND_WORDS])>,
+    rocket: Option<Rocket>,
 }
 
 impl SenseOfSpeed {
@@ -171,8 +243,70 @@ impl SenseOfSpeed {
     }
 
     fn with_tuning(tuning: SpeedTuning) -> Self {
-        Self { tuning, local_72: true, rattle: None, wind: None }
+        Self { tuning, local_72: true, rattle: None, wind: None, rocket: None }
     }
+
+    /// [`SenseOfSpeed::new`] plus the rocket layer: place `x_jet_rolling.grain` (from the loaded
+    /// `grains.big` members) and create its player (`sub_824E7658`, `sub_824E78F0`).
+    pub(crate) fn with_rocket(tick: &mut Tick, vault: &Collections, grains: &[GrainMember]) -> Result<Self, String> {
+        const MEMBER: &str = "x_jet_rolling.grain";
+        let member = grains
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(MEMBER))
+            .ok_or_else(|| format!("{MEMBER} is not loaded"))?;
+        let mut g = tick.runtime.grains();
+        g.load(&member.name, &member.bytes, member.samples.clone(), member.channels, member.rate)
+            .map_err(|e| e.to_string())?;
+        let player = g.create_player().map_err(|e| e.to_string())?;
+        let mut this = Self::new(vault)?;
+        this.rocket = Some(Rocket {
+            tuning: RocketTuning::load(vault)?,
+            player,
+            member: member.name.clone(),
+            running: false,
+        });
+        Ok(this)
+    }
+
+    /// `sub_824E7980`'s rocket branch.
+    fn rocket_process(&mut self, tick: &mut Tick) -> Result<(), String> {
+        let local = self.local_72;
+        let Some(rocket) = self.rocket.as_mut().filter(|_| local) else {
+            return Ok(());
+        };
+        let kmh = tick.audio.ground_speed_208 * KMH_PER_MS;
+        let mut g = tick.runtime.grains();
+        match rocket_step(kmh, rocket.tuning.start_kmh, rocket.running) {
+            Some(true) => {
+                let bus = g.root_bus().map_err(|e| e.to_string())?;
+                g.bind(rocket.player, &rocket.member, rocket.tuning.params, bus)
+                    .map_err(|e| e.to_string())?;
+                rocket.running = true;
+            }
+            Some(false) => {
+                g.stop(rocket.player).map_err(|e| e.to_string())?;
+                g.stop(rocket.player).map_err(|e| e.to_string())?;
+                rocket.running = false;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// `sub_824E7CB0`'s rocket block.
+    fn rocket_update(&mut self, tick: &mut Tick) -> Result<(), String> {
+        let local = self.local_72;
+        let Some(rocket) = self.rocket.as_ref().filter(|r| r.running && local) else {
+            return Ok(());
+        };
+        let c = tick.controls;
+        let record = rocket_record(tick.audio.ground_speed_208, &rocket.tuning, c.level(5), c.pitch(3));
+        tick.runtime
+            .grains()
+            .set_record(rocket.player, record)
+            .map_err(|e| e.to_string())
+    }
+
 
     /// `sub_824E7980` (without the rocket grain).
     pub(crate) fn step_process(&self, audio: &AudioState) -> SpeedEvents {
@@ -241,6 +375,7 @@ impl Component for SenseOfSpeed {
         if let Some(words) = events.post_rattle {
             self.rattle = Some((post(tick.runtime, RATTLE_OBJECT, &words)?, words));
         }
+        self.rocket_process(tick)?;
         if events.release_wind {
             let mut handle = self.wind.take().map(|(handle, _)| handle);
             release(tick.runtime, &mut handle)?;
@@ -256,6 +391,7 @@ impl Component for SenseOfSpeed {
         if let Some((handle, words)) = self.rattle.as_ref() {
             redeliver(tick.runtime, *handle, words)?;
         }
+        self.rocket_update(tick)?;
         if let Some((handle, words)) = self.wind.as_ref() {
             redeliver(tick.runtime, *handle, words)?;
         }
@@ -395,5 +531,93 @@ mod tests {
         wind_up.print();
         println!("rattle w3 mismatches: fused {fused_diff}, unfused {plain_diff}");
         println!("frames with matching post/release {timing_ok}; mismatches (frame, ours, retail) {timing_bad:?}");
+    }
+
+    fn rocket_tuning() -> RocketTuning {
+        // Vault class 6E878344774A7999/default.
+        RocketTuning {
+            start_kmh: 35.0,
+            top_kmh: 60.0,
+            gain: 22_000.0,
+            params: [0x3DCC_CCCD, 0x3ECC_CCCD, 0x3DCC_CCCD, 0x4019_999A, 0x3DCC_CCCD].map(f32::from_bits),
+        }
+    }
+
+    #[test]
+    fn rocket_starts_above_35_kmh_and_stops_at_or_below() {
+        assert_eq!(rocket_step(35.1, 35.0, false), Some(true));
+        assert_eq!(rocket_step(35.1, 35.0, true), None);
+        assert_eq!(rocket_step(35.0, 35.0, true), Some(false));
+        assert_eq!(rocket_step(20.0, 35.0, false), None);
+    }
+
+    /// Player records at the rocket's retail grain picks (`picks.tsv`, player `40C98FC0`): the
+    /// state one frame before the update, the update's `level(5)` and `pitch(3)`.
+    #[test]
+    fn rocket_records_match_the_retail_picks() {
+        let t = rocket_tuning();
+        for (speed, level, pitch, words) in [
+            (0x412D_AA75u32, 1165u32, 4086i32, [0x3CC3_8DA6u32, 0x3F7F_6000, 0x3E26_E788]),
+            (0x413A_68E6, 1270, 4086, [0x3CD5_2DA5, 0x3F7F_6000, 0x3E8E_2D18]),
+            (0x412B_062C, 1295, 4086, [0x3CD9_5FEE, 0x3F7F_6000, 0x3E0E_8EE3]),
+            (0x413D_A31D, 1428, 4086, [0x3CEF_B31E, 0x3F7F_6000, 0x3E9D_0C4B]),
+            (0x411E_BB0D, 1332, 4086, [0x3CDF_95DE, 0x3F7F_6000, 0x3CEA_1825]),
+        ] {
+            let r = rocket_record(f32::from_bits(speed), &t, level, pitch);
+            assert_eq!([r.gain.to_bits(), r.pitch.to_bits(), r.position.to_bits()], words);
+        }
+    }
+
+    /// Plays the rocket layer headlessly: above 35 km/h the grain binds and sounds, at 20 km/h it
+    /// stops and the output falls silent.
+    #[test]
+    #[ignore = "needs the installed assets"]
+    fn rocket_plays_headless() {
+        use super::super::wheels::tests::Fixed;
+        use skate_audio_core::authored::AuthoredRuntime;
+        use skate_data::audio::catalog::PlayerAudioCatalog;
+        let assets = std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+        let cache = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .map(|p| p.join("Skate3RustEngine/audio-pcm-cache"));
+        let catalog = PlayerAudioCatalog::from_assets(&assets, cache.as_deref()).unwrap();
+        let mut runtime = AuthoredRuntime::new(catalog.guest, catalog.projects, catalog.banks).unwrap();
+        let vault = Collections::load(&assets).unwrap();
+        let grains = skate_data::audio::grains::load_grains(
+            &assets.join("private/stock/data/audio/grains.big"),
+            &["x_jet_rolling.grain"],
+            cache.as_deref(),
+        )
+        .unwrap();
+        let controls = Fixed(&[(60, 5, 20_000), (56, 3, 4096)]);
+        let mut audio = AudioState::default();
+        let mut speed = {
+            let mut tick = Tick { runtime: &mut runtime, audio: &audio, controls: &controls, dt: 1.0 / 60.0, tick: 0 };
+            SenseOfSpeed::with_rocket(&mut tick, &vault, &grains).unwrap()
+        };
+        let mut rms = Vec::new();
+        let mut blocks = 0.0f64;
+        for frame in 0..180u64 {
+            audio.ground_speed_208 = if (10..120).contains(&frame) { 14.0 } else { 5.0 };
+            {
+                let mut tick = Tick { runtime: &mut runtime, audio: &audio, controls: &controls, dt: 1.0 / 60.0, tick: frame };
+                speed.rocket_process(&mut tick).unwrap();
+                speed.rocket_update(&mut tick).unwrap();
+            }
+            blocks += 48_000.0 / 256.0 / 60.0;
+            let (mut sum, mut n) = (0.0f64, 0usize);
+            while blocks >= 1.0 {
+                blocks -= 1.0;
+                let pcm = runtime.pump_once().unwrap();
+                sum += pcm.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>();
+                n += pcm.len();
+            }
+            rms.push((sum / n.max(1) as f64).sqrt());
+        }
+        let loud = rms[20..115].iter().filter(|r| **r > 1e-4).count();
+        let after = rms[150..].iter().fold(0.0f64, |m, r| m.max(*r));
+        println!("frames with sound while above 35 km/h {loud}/95, max rms after the stop {after:e}");
+        assert!(loud > 85, "the rocket layer is silent");
+        assert!(after < 1e-6, "the rocket layer keeps sounding");
     }
 }

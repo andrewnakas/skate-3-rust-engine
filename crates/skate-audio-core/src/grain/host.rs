@@ -35,7 +35,7 @@ use crate::scheduler::{self, SchedulerHost};
 use crate::{Error, Guest, Result, classes, play};
 
 use super::board::{ChainValues, GrainRecord};
-use super::{chain, player, seek};
+use super::{chain, player, seek, stream};
 
 /// `(f32) 256/48000`, the block delta the capture shows the plug-in receiving.
 pub const BLOCK_DELTA_BITS: u32 = 0x3BAE_C33E;
@@ -86,6 +86,9 @@ pub struct GrainRuntime {
     spare: Vec<u32>,
     /// Each player's bus-chain record (`chain`), built once.
     chains: HashMap<u32, u32>,
+    /// Voice slots of resident-stream owners ([`Grains::reserve_voices`]), each of which may start
+    /// a SndPlayer1 between two decoder top-ups.
+    stream_voices: usize,
     /// Every voice start, oldest first. The owner may drain it.
     pub starts: Vec<StartEvent>,
 }
@@ -252,7 +255,7 @@ pub fn tick_bucket_zero<H: Heap + ?Sized>(
         return Ok(());
     }
     // Keep enough decoder blocks for every voice a tick can start before the next top-up.
-    let wanted = 2 * runtime.players.len() + 2;
+    let wanted = 2 * runtime.players.len() + runtime.stream_voices + 2;
     while runtime.spare.len() < wanted {
         let at = heap.alloc(g, 128, 16)?;
         if at == 0 {
@@ -325,6 +328,114 @@ impl Grains<'_> {
         );
         self.runtime.names.insert(name.to_owned(), stream);
         Ok(data)
+    }
+
+    /// Place a resident `.snr` (an EAAC header at offset 0) in guest memory, unmodified, as the
+    /// resource loader `sub_828DC158` leaves it, and register its decoded stream under its own
+    /// address: the address is the SndPlayer1 play request's stream (`SFXObj_Wheels`).
+    pub fn load_resident(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        samples: Arc<[i16]>,
+        channels: u8,
+        rate: u32,
+    ) -> Result<u32> {
+        install(self.g, self.heap, self.runtime)?;
+        if let Some(&key) = self.runtime.names.get(name) {
+            return Ok(key);
+        }
+        let data = self.place(bytes)?;
+        let source = PcmSource::new(samples.clone(), channels)?;
+        self.sources.insert(
+            data,
+            CachedPcm {
+                source,
+                sample_rate: rate,
+            },
+        );
+        self.runtime.sources.insert(
+            data,
+            GrainSource {
+                name: name.to_owned(),
+                data,
+                stream: data,
+                samples,
+                channels,
+                rate,
+            },
+        );
+        self.runtime.names.insert(name.to_owned(), data);
+        Ok(data)
+    }
+
+    /// Copy `bytes` into a fresh 16-aligned guest block (`sub_8298ED88`'s whole-file load, used
+    /// for `.sek` seek tables).
+    pub fn place(&mut self, bytes: &[u8]) -> Result<u32> {
+        let at = self.heap.alloc(self.g, bytes.len() as u32, 16)?;
+        if at == 0 {
+            return Err(Error::new(0, "guest heap exhausted placing a resident file"));
+        }
+        self.g.set_span(at, bytes)?;
+        Ok(at)
+    }
+
+    /// `[[[BUS_ROOT]+44]]`, the default output target (the rocket grain player's bus).
+    pub fn root_bus(&self) -> Result<u32> {
+        let root = self.g.u32(classes::BUS_ROOT)?;
+        self.g.u32(self.g.u32(root + 44)?)
+    }
+
+    /// Keep `count` more decoder blocks in the spare pool for voices a resident-stream owner can
+    /// start within one tick.
+    pub fn reserve_voices(&mut self, count: usize) {
+        self.runtime.stream_voices += count;
+    }
+
+    /// `sub_824CE108` ([`stream::build_bus`]).
+    pub fn stream_bus(&mut self, eq_chain: u32) -> Result<stream::Bus> {
+        install(self.g, self.heap, self.runtime)?;
+        stream::build_bus(self.g, self.heap, &mut Image, eq_chain, self.sp)
+    }
+
+    /// `sub_824CEAF0` ([`stream::start`]).
+    pub fn stream_start(
+        &mut self,
+        bus: stream::Bus,
+        stream_address: u32,
+        seek_table: u32,
+        start: f32,
+    ) -> Result<stream::Voice> {
+        stream::start(
+            self.g,
+            self.heap,
+            &mut Image,
+            bus,
+            stream_address,
+            seek_table,
+            start,
+            self.sp,
+        )
+    }
+
+    /// `sub_824CEE00` ([`stream::set`]).
+    pub fn stream_set(&mut self, voice: stream::Voice, gain: f32, pitch: f32) -> Result<()> {
+        stream::set(self.g, voice, f64::from(gain), f64::from(pitch))
+    }
+
+    /// `sub_824CEF60` ([`stream::stop`]).
+    pub fn stream_stop(&mut self, voice: stream::Voice) -> Result<()> {
+        stream::stop(self.g, voice)
+    }
+
+    /// `[graph+71] == 2`.
+    pub fn stream_finished(&self, voice: stream::Voice) -> Result<bool> {
+        stream::finished(self.g, voice)
+    }
+
+    /// A property post to one bus module.
+    pub fn stream_post(&mut self, bus: stream::Bus, index: u32, id: u32, value: f32) -> Result<()> {
+        stream::post_bus(self.g, bus, index, id, value)
     }
 
     /// Allocate and construct a 372-byte player (`sub_828EBD88`), as the board owner's constructor
