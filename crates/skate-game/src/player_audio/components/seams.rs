@@ -604,3 +604,294 @@ impl Component for Seams {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::contacts::capture::{self, Captured, Matches};
+    use super::*;
+
+    /// The stock vault's pattern records (`skater-collections.json`, class `7242F32831ED3332`),
+    /// so the unit tests need no assets; `vault_values_match_the_owner_vault` checks them.
+    fn record(gain: u32, angle: i32, grid: u32, class: i32, mode: i32, spacing: u32) -> PatternRecord {
+        PatternRecord {
+            gain_0: f32::from_bits(gain),
+            angle_4: angle,
+            grid_8: f32::from_bits(grid),
+            grid_12: f32::from_bits(grid),
+            class_16: class,
+            mode,
+            min_frames: 1,
+            speed_threshold: f32::from_bits(0x3D4C_CCCD),
+            spacing: f32::from_bits(spacing),
+            level: 1.0,
+        }
+    }
+
+    fn tuning() -> SeamTuning {
+        let default = record(0x3F21_47AE, 30, 0x4040_0000, 2, 1, 0x4296_0000);
+        let mut patterns = [default; 15];
+        patterns[3] = record(0x3F21_47AE, 14, 0x3F00_0000, 3, 1, 0x4296_0000); // square_8_x_8
+        patterns[7] = record(0x3F80_0000, 30, 0x3E99_999A, 7, 1, 0x4296_0000); // irregular_medium
+        patterns[9] = record(0x3F3A_E148, 30, 0x4040_0000, 9, 2, 0x4248_0000); // slats
+        patterns[10] = record(0x3F66_6666, 85, 0x4040_0000, 10, 1, 0x437A_0000); // sidewalk
+        // Synthetic AudioSurfaceMap: material 2 seams surface (+32) 2, material 3 transition
+        // surface (+36) 3; entry 94 (the fallback) is the stock one.
+        let mut entries = vec![[0u32; 18]; 95];
+        entries[94] = [0x5E, 3, 0, 2, 4, 0, 1, 2, 2, 0, 2, 3, 8, 8, 8, 8, 8, 2];
+        entries[2][8] = 2;
+        entries[3][8] = 5;
+        entries[3][9] = 3;
+        SeamTuning {
+            default,
+            patterns,
+            surfaces: SurfaceMap::from_entries(entries),
+            surface3_scale: 2.0,
+            eq_chain: 8,
+        }
+    }
+
+    struct Fixed;
+    impl Controls for Fixed {
+        fn raw(&self, _: u32) -> u32 {
+            10
+        }
+        fn pitch(&self, _: u32) -> i32 {
+            4081
+        }
+        fn level(&self, id: u32) -> u32 {
+            [0, 2896, 0, 24971, 77, 729, 49][id as usize]
+        }
+    }
+
+    impl SeamState {
+        fn take_writes(&mut self) -> Vec<u32> {
+            std::mem::take(&mut self.controller_writes)
+        }
+    }
+
+    #[test]
+    fn create_posts_the_constructor_packet_per_wheel() {
+        // Capture frame 2707: four posts, w10 = 0 (no material), w14 = wheel, w19 = 8.
+        let inputs = SeamInputs { wheel_material_620: [143; 4], ..SeamInputs::default() };
+        let state = SeamState::create(&tuning(), &inputs);
+        for (wheel, packet) in state.packets.iter().enumerate() {
+            let mut expected = [0u32; SEAM_WORDS];
+            expected[1] = 0x7FFF;
+            expected[4] = 0x1000;
+            expected[5] = 0x61A8;
+            expected[14] = wheel as u32;
+            expected[19] = 8;
+            assert_eq!(*packet, expected);
+        }
+    }
+
+    #[test]
+    fn update_rewrites_gain_speed_turn_and_pattern_words() {
+        let tuning = tuning();
+        let mut inputs = SeamInputs {
+            ground_speed_208: 0.5,
+            wheel_material_620: [2; 4],
+            ..SeamInputs::default()
+        };
+        let mut state = SeamState::create(&tuning, &inputs);
+        state.record = tuning.patterns[10];
+        inputs.turn_204 = -0.35;
+        for wheel in 0..4 {
+            state.update(&inputs, &Fixed, wheel);
+        }
+        let packet = state.packets[0];
+        assert_eq!(&packet[..7], &[0x7FFF, 2896, 729, 10, 4081, 24971, 77]);
+        assert_eq!(packet[8], 0);
+        assert_eq!(packet[13], 10);
+        assert_eq!(packet[16], fctiwz(f32::from_bits(0x3F66_6666) * LEVEL_SCALE) as u32);
+        assert_eq!(packet[18], 32_767);
+        // The turn slews 100 per wheel iteration: wheels 0..3 see 100, 200, 300, 350.
+        assert_eq!(state.packets.map(|p| p[15]), [100, 200, 300, 350]);
+    }
+
+    #[test]
+    fn grid_crossing_alternates_w7_and_marks_single_wheel_hits() {
+        let tuning = tuning();
+        let mut inputs = SeamInputs {
+            ground_speed_208: 5.0,
+            wheel_material_620: [2; 4],
+            wheel_seam_636: [4; 4],
+            ..SeamInputs::default()
+        };
+        let mut state = SeamState::create(&tuning, &inputs);
+        // First process: every cell differs from 0x7FFFFFFF. Wheel 1 is blocked by the gap
+        // against wheel 0's hit this frame, wheel 3 by wheel 2's; both hits are pairs (w9 = 0).
+        state.process(&tuning, &inputs, 1.0 / 60.0).unwrap();
+        assert_eq!(state.packets.map(|p| p[7]), [1, 0, 1, 0]);
+        assert_eq!(state.packets[0][9], 0);
+        assert_eq!(state.packets[0][10], 2);
+        // Still: no crossing, w7 back to 0.
+        state.process(&tuning, &inputs, 1.0 / 60.0).unwrap();
+        assert_eq!(state.packets.map(|p| p[7]), [0; 4]);
+        // Wheel 0 alone crosses a 0.5 m cell: a single-wheel hit (w9 = 1), w7 alternates to 2.
+        inputs.wheel_position_384[0] = [0.6, 0.0, 0.0];
+        state.process(&tuning, &inputs, 1.0 / 60.0).unwrap();
+        assert_eq!(state.packets[0][7], 2);
+        assert_eq!(state.packets[0][9], 1);
+        assert_eq!(state.take_writes(), vec![0, 32_767, 32_767, 0, 0, 32_767]);
+    }
+
+    #[test]
+    fn material_change_fires_the_transition_surface_and_skips_patterns() {
+        let tuning = tuning();
+        let mut inputs = SeamInputs {
+            ground_speed_208: 5.0,
+            wheel_material_620: [2; 4],
+            ..SeamInputs::default()
+        };
+        let mut state = SeamState::create(&tuning, &inputs);
+        state.process(&tuning, &inputs, 1.0 / 60.0).unwrap();
+        inputs.wheel_material_620[2] = 3;
+        state.process(&tuning, &inputs, 1.0 / 60.0).unwrap();
+        // Transition entry +36 of material 3 is 3, plus 5.
+        assert_eq!(state.packets[2][10], 8);
+        assert_eq!(state.packets.map(|p| p[7]), [0, 0, 1, 0]);
+        // Airborne clears the history: the next change is not a transition.
+        inputs.in_known_air_332 = true;
+        inputs.wheel_material_620[2] = 2;
+        state.process(&tuning, &inputs, 1.0 / 60.0).unwrap();
+        assert_eq!(state.packets.map(|p| p[7]), [0; 4]);
+    }
+
+    #[test]
+    fn pattern_zero_clears_w13_and_manual_reads_the_rear_pattern() {
+        let tuning = tuning();
+        let mut inputs = SeamInputs {
+            ground_speed_208: 5.0,
+            wheel_material_620: [2; 4],
+            wheel_seam_636: [11, 11, 0, 0],
+            ..SeamInputs::default()
+        };
+        let mut state = SeamState::create(&tuning, &inputs);
+        state.process(&tuning, &inputs, 1.0 / 60.0).unwrap();
+        assert_eq!(state.record.class_16, 10);
+        state.update(&inputs, &Fixed, 0);
+        assert_eq!(state.packets[0][13], 10);
+        // Manual with wheel 0's landed latch clear: wheel 3's pattern 0 applies.
+        inputs.balance_340 = true;
+        state.process(&tuning, &inputs, 1.0 / 60.0).unwrap();
+        assert_eq!(state.packets[0][13], 0);
+        assert_eq!(state.record.class_16, 10);
+    }
+
+    #[test]
+    fn distance_mode_fires_front_then_rear_after_fifty() {
+        let mut tuning = tuning();
+        tuning.patterns[9].spacing = 100.0;
+        let inputs = SeamInputs {
+            ground_speed_208: 3.0,
+            time_scale_220: 1.0,
+            wheel_material_620: [2; 4],
+            wheel_seam_636: [10; 4],
+            ..SeamInputs::default()
+        };
+        let mut state = SeamState::create(&tuning, &inputs);
+        let mut fired = Vec::new();
+        for frame in 0..12 {
+            state.process(&tuning, &inputs, 0.05).unwrap();
+            if state.packets.iter().any(|p| p[7] != 0) {
+                fired.push((frame, state.packets.map(|p| p[7] != 0)));
+            }
+        }
+        // 15 per frame: the front passes 100 on the 7th frame and arms the rear at 50, which
+        // reaches 0 four frames later. (With the stock slats spacing of 50 the front refires,
+        // re-arming the rear, on the very frame the rear would have fired.)
+        assert_eq!(fired, vec![(6, [true, true, false, false]), (10, [false, false, true, true])]);
+    }
+
+    fn assets() -> Option<Collections> {
+        let root = std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+        root.join("private/stock/skater-collections.json")
+            .exists()
+            .then(|| Collections::load(&root).unwrap())
+    }
+
+    /// Skipped without the owner's assets.
+    #[test]
+    fn vault_values_match_the_owner_vault() {
+        let Some(vault) = assets() else { return };
+        let loaded = SeamTuning::load(&vault).unwrap();
+        let fixture = tuning();
+        assert_eq!(loaded.default, fixture.default);
+        for index in [3, 7, 9, 10] {
+            assert_eq!(loaded.patterns[index], fixture.patterns[index], "pattern {}", index + 1);
+        }
+        assert_eq!(loaded.patterns[0].mode, 0); // spidercrack
+        assert_eq!((loaded.surface3_scale, loaded.eq_chain), (2.0, 8));
+        assert_eq!(loaded.surfaces.lookup(200, 32), 2);
+    }
+
+    /// Replays the retail capture: the local Cracks component's creation, then per capture frame
+    /// its update (with the MixMap values that update read) and its process, each against the
+    /// delivered words. `cargo test ... seams::tests::capture_replay -- --ignored --nocapture`
+    ///
+    /// Result: every word of every update and process delivery matches (74176 + 74204 rows) when
+    /// the update reads the previous frame's state row and the process the current one; with a
+    /// single lag for both, either the process words (w7, w9, w10, w13, w16) or the update words
+    /// (w8, w12, w15, w17) drift. The bridge runs between the two ticks.
+    #[test]
+    #[ignore]
+    fn capture_replay() {
+        let (Some(root), Some(vault)) = (capture::root(), assets()) else { return };
+        let tuning = SeamTuning::load(&vault).unwrap();
+        let states = capture::states(&root);
+        let rows = capture::rows(&root, OBJECT);
+        const LOCAL: &str = "4A26A8E0";
+        let local: std::collections::HashSet<String> =
+            rows.iter().filter(|r| r.ctrl == LOCAL).map(|r| r.payload.clone()).collect();
+        let posts: Vec<_> = rows.iter().filter(|r| r.kind == "PO" && local.contains(&r.payload)).collect();
+        let first = posts[0].frame;
+        assert!(posts.iter().all(|p| p.frame == first), "local seams are posted once");
+        for (update_lag, process_lag) in [(1u32, 0u32), (1, 1), (0, 0)] {
+            let inputs_at = |frame: u32, lag: u32| states.get(&(frame - lag)).map(|w| SeamInputs::from_capture(w));
+            // The capture's state rows start the frame after the posts (no wheel material yet).
+            let initial = SeamInputs { wheel_material_620: [143; 4], ..SeamInputs::default() };
+            let mut state = SeamState::create(&tuning, &inputs_at(first, process_lag).unwrap_or(initial));
+            let mut post = Matches::new("post", SEAM_WORDS);
+            for row in &posts {
+                post.add(row.frame, &row.words, &state.packets[row.words[14] as usize]);
+            }
+            let mut update = Matches::new("update", SEAM_WORDS);
+            let mut process = Matches::new("process", SEAM_WORDS);
+            let mut by_frame: std::collections::BTreeMap<u32, Vec<&capture::Row>> = Default::default();
+            for row in rows.iter().filter(|r| r.kind == "UP" && local.contains(&r.payload) && r.frame > first) {
+                by_frame.entry(row.frame).or_default().push(row);
+            }
+            let mut missing = 0;
+            for (&frame, frame_rows) in &by_frame {
+                let (Some(earlier), Some(inputs)) = (inputs_at(frame, update_lag), inputs_at(frame, process_lag)) else {
+                    missing += 1;
+                    continue;
+                };
+                let (updates, processes): (Vec<&&capture::Row>, Vec<&&capture::Row>) =
+                    frame_rows.iter().partition(|r| r.ctrl == LOCAL);
+                for row in &updates {
+                    let wheel = row.words[14] as usize;
+                    let controls = Captured::from_reads(&row.reads, 0x824C_1F18..0x824C_2428);
+                    state.update(&earlier, &controls, wheel);
+                    update.add(frame, &row.words, &state.packets[wheel]);
+                }
+                if !processes.is_empty() {
+                    state.process(&tuning, &inputs, 1.0 / 60.0).unwrap();
+                    for row in &processes {
+                        process.add(frame, &row.words, &state.packets[row.words[14] as usize]);
+                    }
+                }
+            }
+            println!("=== update lag {update_lag}, process lag {process_lag} (frames skipped: {missing})");
+            post.print();
+            update.print();
+            process.print();
+            if (update_lag, process_lag) == (1, 0) {
+                for m in [&post, &update, &process] {
+                    assert!(m.exact.iter().all(|&e| e == m.total), "{} words drift", m.name);
+                }
+            }
+        }
+    }
+}

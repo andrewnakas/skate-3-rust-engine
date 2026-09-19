@@ -31,7 +31,7 @@ use skate_data::collections::Collections;
 
 use super::words::fctiwz;
 use super::{Component, Controls, Tick, post, redeliver};
-use crate::player_audio::audio_state::AudioState;
+use super::super::audio_state::AudioState;
 
 /// The patch object both packets post to.
 pub(crate) const OBJECT: &str = "playercharacter_footstep";

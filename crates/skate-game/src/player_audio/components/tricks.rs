@@ -518,15 +518,7 @@ mod tests {
     }
 
     fn air(id: i32, latched: i32, rates: [f32; 3]) -> AudioState {
-        AudioState {
-            in_known_air_332: true,
-            trick_active_343: id != NO_TRICK,
-            audio_trick_348: id as u32,
-            audio_trick_352: latched as u32,
-            deck_angular_velocity_480: rates,
-            time_scale_220: 1.0,
-            ..Default::default()
-        }
+        { let mut s = AudioState::default(); s.in_known_air_332 = true; s.trick_active_343 = id != NO_TRICK; s.audio_trick_348 = id as u32; s.audio_trick_352 = latched as u32; s.deck_angular_velocity_480 = rates; s.time_scale_220 = 1.0; s }
     }
 
     #[test]
@@ -549,7 +541,7 @@ mod tests {
         let owner = TricksOwner::LOCAL;
         assert_eq!(flip_post_id(&air(35, NO_TRICK, [0.0; 3]), owner), None);
         assert_eq!(flip_post_id(&air(36, NO_TRICK, [0.0; 3]), owner), None);
-        let mut ground = AudioState { hold_expired_310: true, audio_trick_348: 5, ..Default::default() };
+        let mut ground = { let mut s = AudioState::default(); s.hold_expired_310 = true; s.audio_trick_348 = 5; s };
         assert_eq!(flip_post_id(&ground, owner), Some(HOLD_TRICK));
         assert!(flip_keeps(&ground, owner, HOLD_TRICK));
         ground.hold_expired_310 = false;
@@ -584,7 +576,8 @@ mod tests {
         let events = tricks.step_process(&air(3, 28, [0.0; 3]), &controls, dt);
         assert_eq!(events.post_cloth_a.map(|w| w[9]), Some(3));
         tricks.apply_local(&events, &mut handles);
-        tricks.apply_local(&tricks.step_process(&air(3, 28, [0.0; 3]), &controls, dt), &mut handles);
+        let events = tricks.step_process(&air(3, 28, [0.0; 3]), &controls, dt);
+        tricks.apply_local(&events, &mut handles);
         // The id drops to −1: cloth B posts id 28, held for the 0.5 s duration.
         let events = tricks.step_process(&air(NO_TRICK, NO_TRICK, [0.0; 3]), &controls, dt);
         assert_eq!(events.post_cloth_b.map(|w| w[9]), Some(28));

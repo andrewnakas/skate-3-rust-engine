@@ -120,6 +120,7 @@ fn scorable_id(flags: u32, trick: Option<i32>) -> i32 {
 fn retail_inputs(
     physics: &GamePhysics,
     skater: &SkaterRuntime,
+    camera: &crate::camera::CameraRuntime,
 ) -> crate::skate_audio::RetailAudioInputs {
     let physical = &skater.player_input.physical;
     let processed = &skater.player_input.processed;
@@ -200,6 +201,15 @@ fn retail_inputs(
         deck_rows: deck.basis.columns,
         effective_deck_up: riding.motion.effective_basis.columns[1],
         wheel_positions: std::array::from_fn(|i| lanes(bodies[i].rates.position)),
+        // Native camera basis columns are right, up, at: the world matrix's row 2 is At.
+        camera: camera.frame.as_ref().map(|frame| {
+            (
+                frame.basis.columns[2],
+                [frame.position[0], frame.position[1], frame.position[2]],
+            )
+        }),
+        deck_position: lanes(bodies[BodyId::Deck.index()].rates.position),
+        deck_forward: riding.motion.effective_basis.columns[2],
         ground_normal: triple(physical.ground.vector_80),
         turn: skater.animation_input.fields.turn,
         jump_strength: skater.animation_input.extra.jump_strength,
@@ -216,6 +226,7 @@ fn landing_state_edge(previous: Option<u32>, current: u32) -> bool {
 pub(crate) fn publish(
     physics: Res<GamePhysics>,
     skater: Res<SkaterRuntime>,
+    camera: Res<crate::camera::CameraRuntime>,
     mut cursor: ResMut<AudioObservationCursor>,
     mut observations: MessageWriter<crate::skate_audio::PlayerAudioObservation>,
 ) {
@@ -295,7 +306,7 @@ pub(crate) fn publish(
         nollie: skater.animation.packet.weight_forwards,
         wheel_surface,
         events: output.events.clone(),
-        retail: retail_inputs(&physics, &skater),
+        retail: retail_inputs(&physics, &skater, &camera),
     };
     let powerslide_changed = cursor.last_powersliding != observation.powersliding;
     let trick_changed = cursor.last_trick_id != observation.trick_id;

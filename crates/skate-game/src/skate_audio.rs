@@ -225,6 +225,14 @@ pub struct RetailAudioInputs {
     pub effective_deck_up: [f32; 3],
     /// PhysOut slot B+0, +208+16i: wheel body positions (audio state +384+16i).
     pub wheel_positions: [[f32; 3]; 4],
+    /// The camera the listener `*(0x830CFDD4)` follows (`sub_8248CC08`): its world matrix row 2
+    /// (native At, the view direction) and row 3 (position). `None` before the first camera frame.
+    pub camera: Option<([f32; 3], [f32; 3])>,
+    /// The deck position and effective forward axis, standing in for the board PhysOut record's
+    /// `+144` / `+128` that the second position controller (`60010020`) is bound to. UNVERIFIED:
+    /// the writer of B+0 +128/+144 was not traced.
+    pub deck_position: [f32; 3],
+    pub deck_forward: [f32; 3],
     /// Ground+80: the wheel-contact normal (`ground.vector_80`).
     pub ground_normal: [f32; 3],
     /// Ground+264 = Processed+2676, the turn attribute.
@@ -239,6 +247,9 @@ pub struct RetailAudioInputs {
 impl Default for RetailAudioInputs {
     fn default() -> Self {
         Self {
+            camera: None,
+            deck_position: [0.0; 3],
+            deck_forward: [0.0; 3],
             dt: 0.0,
             ground_speed: 0.0,
             com_velocity: [0.0; 3],

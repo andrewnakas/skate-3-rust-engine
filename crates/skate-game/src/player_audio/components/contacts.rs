@@ -542,7 +542,9 @@ mod tests {
         assert_eq!((tuning.eq_brake, tuning.eq_manual), (7, 7));
         // Element 94 (every material ≥ 94) has foot drag surface 0.
         assert_eq!(tuning.surfaces.lookup(200, 20), 0);
-        assert_eq!(tuning.surfaces.lookup(0, 20), 1);
+        // Element 0 (material 0) is 0, element 2 is 1 (stock `4CA607558B1CF440`).
+        assert_eq!(tuning.surfaces.lookup(0, 20), 0);
+        assert_eq!(tuning.surfaces.lookup(2, 20), 1);
     }
 
     /// Replays the retail capture: runs the component's trigger and updater over every captured
@@ -558,7 +560,8 @@ mod tests {
         let states = super::capture::states(&root);
         let rows = super::capture::rows(&root, OBJECT);
         const LOCAL: &str = "4A26A8B0";
-        for lag in [1u32, 0] {
+        // The updater reads the previous frame's state row, the trigger the current one.
+        for (update_lag, process_lag) in [(1u32, 0u32), (1, 1), (0, 0)] {
             let mut matches = Matches::new("foot drag updates", FOOT_DRAG_WORDS);
             let mut post_matches = Matches::new("foot drag posts", FOOT_DRAG_WORDS);
             let retail_posts: Vec<_> = rows.iter().filter(|r| r.kind == "PO").collect();
@@ -574,8 +577,11 @@ mod tests {
             let mut held: Option<[u32; FOOT_DRAG_WORDS]> = None;
             let (mut our_posts, mut our_releases, mut our_updates) = (vec![], vec![], vec![]);
             for (&frame, _) in states.range(2709..) {
-                let Some(state) = states.get(&(frame - lag)) else { continue };
-                let inputs = FootDragInputs::from_capture(state);
+                let (Some(earlier), Some(state)) = (states.get(&(frame - update_lag)), states.get(&(frame - process_lag)))
+                else {
+                    continue;
+                };
+                let inputs = FootDragInputs::from_capture(earlier);
                 // Update.
                 if let Some(words) = held.as_mut() {
                     if !foot_drag_active(&inputs, true) {
@@ -591,6 +597,7 @@ mod tests {
                     }
                 }
                 // Process.
+                let inputs = FootDragInputs::from_capture(state);
                 if held.is_none() && foot_drag_active(&inputs, true) {
                     let words = foot_drag_constructor(&tuning, &inputs, true);
                     if let Some(row) = retail_posts.iter().find(|r| r.frame == frame) {
@@ -600,7 +607,7 @@ mod tests {
                     our_posts.push(frame);
                 }
             }
-            println!("lag {lag}");
+            println!("update lag {update_lag}, process lag {process_lag}");
             post_matches.print();
             matches.print();
             let retail_post_frames: Vec<u32> = retail_posts.iter().map(|r| r.frame).collect();

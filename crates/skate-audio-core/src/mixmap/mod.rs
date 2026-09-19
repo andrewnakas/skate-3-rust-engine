@@ -37,6 +37,7 @@
 pub mod build;
 pub mod controller;
 pub mod eval;
+pub mod inputs;
 pub mod tables;
 
 use crate::patch::Heap;

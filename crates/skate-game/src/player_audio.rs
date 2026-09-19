@@ -27,6 +27,11 @@ mod tuning;
 mod audio_state;
 #[path = "player_audio/components/mod.rs"]
 mod components;
+#[path = "player_audio/sound.rs"]
+mod sound;
+#[cfg(test)]
+#[path = "player_audio/headless.rs"]
+mod headless;
 
 const OUTPUT_CHANNELS: u16 = 2;
 const SAMPLE_RATE: u32 = 48_000;
@@ -172,16 +177,24 @@ fn cache_directory() -> Option<PathBuf> {
         .map(|root| root.join("Skate3RustEngine/audio-pcm-cache"))
 }
 
-fn run(
-    assets: PathBuf,
-    live: LivePcm,
-    observations: Receiver<PlayerAudioObservation>,
-    status: &mpsc::Sender<WorkerStatus>,
-) -> Result<(), String> {
-    let catalog = PlayerAudioCatalog::from_assets(&assets, cache_directory().as_deref())
+/// Everything the worker builds before its first block: the authored runtime with its banks and
+/// PCM, the boot utilities, the MixMap and every player-sound component.
+pub(crate) struct Prepared {
+    pub runtime: AuthoredRuntime,
+    pub sound: sound::PlayerSound,
+    pub samples: usize,
+    pub cache_hits: usize,
+}
+
+pub(crate) fn prepare(assets: &std::path::Path) -> Result<Prepared, String> {
+    let catalog = PlayerAudioCatalog::from_assets(assets, cache_directory().as_deref())
         .map_err(|error| error.to_string())?;
     let sample_count = catalog.samples.len();
     let cache_hits = catalog.cache_hits;
+    let mixmap = catalog
+        .mixmap
+        .clone()
+        .ok_or("MixMapSK8.mxb is not staged in the assets (rerun setup)")?;
     let mut runtime = AuthoredRuntime::new(catalog.guest, catalog.projects, catalog.banks)
         .map_err(|error| error.to_string())?;
     for sample in catalog.samples {
@@ -237,6 +250,29 @@ fn run(
     } else {
         None
     };
+    runtime.load_mixmap(&mixmap).map_err(|error| error.to_string())?;
+    let sound = sound::build(&mut runtime, assets, cache_directory().as_deref())?;
+    eprintln!("SKATE_PLAYER_AUDIO player_sound ready");
+    Ok(Prepared {
+        runtime,
+        sound,
+        samples: sample_count,
+        cache_hits,
+    })
+}
+
+fn run(
+    assets: PathBuf,
+    live: LivePcm,
+    observations: Receiver<PlayerAudioObservation>,
+    status: &mpsc::Sender<WorkerStatus>,
+) -> Result<(), String> {
+    let Prepared {
+        mut runtime,
+        mut sound,
+        samples: sample_count,
+        cache_hits,
+    } = prepare(&assets)?;
     let _ = status.send(WorkerStatus::Ready {
         samples: sample_count,
         cache_hits,
@@ -244,93 +280,51 @@ fn run(
     eprintln!("SKATE_PLAYER_AUDIO ready samples={sample_count} cache_hits={cache_hits}");
 
     let block = Duration::from_secs_f64(f64::from(PCM_FRAMES_PER_BLOCK) / f64::from(SAMPLE_RATE));
-    let mut producer = EventProducer::default();
-    let mut audible_grind = false;
-    let mut audible_rolling = false;
-    let mut audible_rattle = false;
-    let mut wheel_graph_active = false;
-    let mut last_wheel_voices = (0u64, 0usize);
-    let mut last_wheel_render_voices = (0u64, 0usize);
     let mut deadline = Instant::now();
     let trace = std::env::var_os("SKATE_AUDIO_OBSERVE").is_some();
+    // Diagnostics: one line per second with the rendered level and voice counts, plus the audio
+    // state that drives the board, so a playtest log shows what the retail components saw.
+    let mut window_peak = 0.0f32;
+    let mut window_blocks = 0u32;
     loop {
         // Every observation may contain a one-tick contact or landing. Consume FIFO, allowing
         // the evaluator to run between observations; draining to the newest packet loses edges
         // and can overwrite a post's controls before its first audio block. At 187.5 blocks/s
         // this catches up with the normal 60 Hz simulation without discarding intermediate ticks.
         if let Some(observation) = next_observation(&observations)? {
-            if trace {
-                eprintln!(
-                    "SKATE_PLAYER_AUDIO observation tick={} block={} footstep={} bone={} push={} landed={}",
-                    observation.tick, runtime.stats().blocks, observation.footstep_strength,
-                    observation.footstep_bone, observation.foot_push_speed, observation.landed
-                );
-            }
-            producer.apply(&mut runtime, &observation)?;
-            let stats = runtime.stats();
-            let active = producer.rolling.is_some() || producer.rattle.is_some();
-            let voices = (stats.voices_opened, stats.live_voices);
-            if active && (!wheel_graph_active || voices != last_wheel_voices) {
-                eprintln!(
-                    "SKATE_PLAYER_AUDIO wheel_graph tick={} opened={} live={}",
-                    observation.tick, stats.voices_opened, stats.live_voices
-                );
-            }
-            wheel_graph_active = active;
-            last_wheel_voices = voices;
+            sound.frame(&mut runtime, &observation)?;
         }
         let native = runtime.pump_once().map_err(|error| error.to_string())?;
-        let rendered = runtime.stats();
-        let rendered_voices = (rendered.voices_opened, rendered.live_voices);
-        if (producer.rolling.is_some() || producer.rattle.is_some())
-            && rendered_voices != last_wheel_render_voices
-        {
-            eprintln!(
-                "SKATE_PLAYER_AUDIO wheel_render block={} opened={} live={} peak={:.6}",
-                rendered.blocks, rendered.voices_opened, rendered.live_voices, rendered.peak
-            );
-        }
-        last_wheel_render_voices = rendered_voices;
         if native.len() != PCM_FRAMES_PER_BLOCK as usize * usize::from(PCM_CHANNELS) {
             return Err(format!(
                 "authored graph returned {} samples for one block",
                 native.len()
             ));
         }
-        let peak = native
-            .iter()
-            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
         // Player audio reaches the host only through the recovered retail message and graph
         // path.  Do not substitute decoded-bank one-shots here: that bypasses the authored
         // selector, pitch, envelope, filter, layer, and bus controls and therefore cannot be
         // considered a Skate 3 match.
         let stereo = downmix(&native);
-        let device_peak = stereo
-            .iter()
-            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-        if producer.grind.is_some() && peak > 1.0e-6 && !audible_grind {
+        window_peak = native.iter().fold(window_peak, |peak, sample| peak.max(sample.abs()));
+        window_blocks += 1;
+        if trace && window_blocks as u64 * u64::from(PCM_FRAMES_PER_BLOCK) >= u64::from(SAMPLE_RATE) {
+            let stats = runtime.stats();
+            let audio = sound.audio();
             eprintln!(
-                "SKATE_PLAYER_AUDIO grind_pcm native_peak={peak:.6} device_peak={device_peak:.6}"
+                "SKATE_PLAYER_AUDIO second block={} peak_dbfs={:.1} opened={} live={} speed={:.2} wheels={} air={} grind={} walk={}",
+                stats.blocks,
+                20.0 * window_peak.max(1.0e-9).log10(),
+                stats.voices_opened,
+                stats.live_voices,
+                audio.ground_speed_208,
+                audio.wheel_count_200,
+                audio.in_known_air_332,
+                audio.grinding_341,
+                audio.walking_716,
             );
-            audible_grind = true;
-        } else if producer.grind.is_none() {
-            audible_grind = false;
-        }
-        if producer.rolling.is_some() && peak > 1.0e-6 && !audible_rolling {
-            eprintln!(
-                "SKATE_PLAYER_AUDIO rolling_pcm native_peak={peak:.6} device_peak={device_peak:.6}"
-            );
-            audible_rolling = true;
-        } else if producer.rolling.is_none() {
-            audible_rolling = false;
-        }
-        if producer.rattle.is_some() && peak > 1.0e-6 && !audible_rattle {
-            eprintln!(
-                "SKATE_PLAYER_AUDIO rattle_pcm native_peak={peak:.6} device_peak={device_peak:.6}"
-            );
-            audible_rattle = true;
-        } else if producer.rattle.is_none() {
-            audible_rattle = false;
+            window_peak = 0.0;
+            window_blocks = 0;
         }
         live.push(&stereo)?;
         deadline += block;

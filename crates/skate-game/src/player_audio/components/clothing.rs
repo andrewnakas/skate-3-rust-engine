@@ -559,11 +559,32 @@ mod tests {
 
     /// Frames whose packets belong to the local skater: UP rows by the local controller, and
     /// posts/releases whose payload/node a local UP row carries.
+    /// The local skater's rows. Message objects and nodes are reused across skaters, so a post
+    /// is local when the next update of its payload is, and a release when the last update of
+    /// its node was.
     fn local_rows(rows: &[capture::Row]) -> (Vec<&capture::Row>, Vec<&capture::Row>, Vec<&capture::Row>) {
-        let payloads: std::collections::HashSet<_> =
-            rows.iter().filter(|r| r.kind == "UP" && r.ctrl == LOCAL).map(|r| (r.payload.clone(), r.node.clone())).collect();
-        let posts = rows.iter().filter(|r| r.kind == "PO" && payloads.iter().any(|p| p.0 == r.payload)).collect();
-        let releases = rows.iter().filter(|r| r.kind == "RL" && payloads.iter().any(|p| p.1 == r.node)).collect();
+        let updates: Vec<&capture::Row> = rows.iter().filter(|r| r.kind == "UP").collect();
+        let posts = rows
+            .iter()
+            .filter(|r| r.kind == "PO")
+            .filter(|r| {
+                updates
+                    .iter()
+                    .find(|u| u.payload == r.payload && u.frame > r.frame)
+                    .is_some_and(|u| u.ctrl == LOCAL)
+            })
+            .collect();
+        let releases = rows
+            .iter()
+            .filter(|r| r.kind == "RL")
+            .filter(|r| {
+                updates
+                    .iter()
+                    .rev()
+                    .find(|u| u.node == r.node && u.frame <= r.frame)
+                    .is_some_and(|u| u.ctrl == LOCAL)
+            })
+            .collect();
         let updates = rows.iter().filter(|r| r.kind == "UP" && r.ctrl == LOCAL).collect();
         (posts, releases, updates)
     }
@@ -587,7 +608,8 @@ mod tests {
         };
         let (slide_up, falls_up) = (by_frame(&slide_updates), by_frame(&falls_updates));
         let (slide_po, falls_po) = (by_frame(&slide_posts), by_frame(&falls_posts));
-        for lag in [1u32, 0] {
+        // The updaters read the previous frame's state row, the triggers the current one.
+        for (update_lag, process_lag) in [(1u32, 0u32), (1, 1), (0, 0)] {
             let mut slide_post_m = Matches::new("body slide posts", BODY_SLIDE_WORDS);
             let mut slide_up_m = Matches::new("body slide updates", BODY_SLIDE_WORDS);
             let mut falls_post_m = Matches::new("cloth falls posts", CLOTH_FALLS_WORDS);
@@ -597,9 +619,11 @@ mod tests {
             let (mut previous_bail, mut level) = (false, 0);
             let mut ours = [vec![], vec![], vec![], vec![], vec![], vec![]];
             for (&frame, _) in states.range(2709..) {
-                let Some(state) = states.get(&(frame - lag)) else { continue };
-                let slide_in = BodySlideInputs::from_capture(state);
-                let falls_in = ClothFallsInputs::from_capture(state);
+                let (Some(earlier), Some(state)) = (states.get(&(frame - update_lag)), states.get(&(frame - process_lag)))
+                else {
+                    continue;
+                };
+                let slide_in = BodySlideInputs::from_capture(earlier);
                 // Update: body slide, then cloth falls.
                 if let Some(words) = slide.as_mut() {
                     ours[2].push(frame);
@@ -618,6 +642,8 @@ mod tests {
                     }
                 }
                 // Process: cloth falls, then body slide.
+                let slide_in = BodySlideInputs::from_capture(state);
+                let falls_in = ClothFallsInputs::from_capture(state);
                 let (body, new_level) = cloth_falls_speeds(&falls_tuning, &falls_in);
                 level = new_level;
                 match cloth_falls_action(&falls_in, previous_bail, falls.is_some()) {
@@ -653,7 +679,7 @@ mod tests {
                     _ => {}
                 }
             }
-            println!("==== lag {lag}");
+            println!("==== update lag {update_lag}, process lag {process_lag}");
             for m in [&slide_post_m, &slide_up_m] {
                 m.print();
             }

@@ -6,9 +6,12 @@
 //! component's MixMap controller ([`Controls`]), tuning from the owner's AttribSys vault. Word
 //! formulas are in [`words`], each checked against the retail recomp capture.
 //!
-//! Retail components read the audio state the bridge wrote on the previous frame (verified: every
-//! capture-checked formula matches with a one-frame lag, and only then), so the worker hands them
-//! last tick's state.
+//! Per game frame, as retail runs it at a fixed 60 Hz (both halves of `sub_82485190` each frame,
+//! because dt > 0.02 would otherwise alternate them): the bridge writes the audio state and the
+//! state controller's inputs, every component's `process` writes its owner inputs, the MixMap
+//! evaluates, then every component's `update` reads this evaluation's outputs. (The capture's
+//! apparent one-frame lag between the state dump and the updates is only where its frame counter
+//! increments: at the mixer evaluation, between the two halves.)
 
 pub(crate) mod board;
 pub(crate) mod clothing;
@@ -38,7 +41,7 @@ pub(crate) trait Controls {
 /// What one component tick sees.
 pub(crate) struct Tick<'a> {
     pub runtime: &'a mut AuthoredRuntime,
-    /// The bridge's state from the previous frame (see the module note).
+    /// This frame's audio state (see the module note).
     pub audio: &'a AudioState,
     pub controls: &'a dyn Controls,
     /// Game frame time in seconds.
@@ -51,6 +54,48 @@ pub(crate) trait Component {
     fn process(&mut self, tick: &mut Tick) -> Result<(), String>;
     /// Vtable slot 10 / `+40`: rewrite and redeliver the held packets.
     fn update(&mut self, tick: &mut Tick) -> Result<(), String>;
+    /// The MixMap controller inputs (`id`, 32-bit word) this component wrote to its own controller
+    /// (controller vfunc 8) since the last call, in retail call order. The worker applies them
+    /// before the next evaluation.
+    fn take_owner_inputs(&mut self) -> Vec<(u32, u32)> {
+        Vec::new()
+    }
+}
+
+/// Number of controller output ids a snapshot keeps. Output blocks are 15 words of packed int16
+/// pairs plus the enable word, so ids stay below 30.
+pub(crate) const CONTROLLER_OUTPUTS: usize = 30;
+
+/// One controller's outputs, read once after the evaluation through the retail owner readers.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ControlSnapshot {
+    raw: [u32; CONTROLLER_OUTPUTS],
+    pitch: [i32; CONTROLLER_OUTPUTS],
+    level: [u32; CONTROLLER_OUTPUTS],
+}
+
+impl ControlSnapshot {
+    pub(crate) fn read(runtime: &AuthoredRuntime, controller: u32) -> Self {
+        let mut snapshot = Self::default();
+        for id in 0..CONTROLLER_OUTPUTS {
+            snapshot.raw[id] = runtime.mixmap_raw(controller, id as u32);
+            snapshot.pitch[id] = runtime.mixmap_pitch(controller, id as u32) as i32;
+            snapshot.level[id] = runtime.mixmap_level(controller, id as u32);
+        }
+        snapshot
+    }
+}
+
+impl Controls for ControlSnapshot {
+    fn raw(&self, id: u32) -> u32 {
+        self.raw.get(id as usize).copied().unwrap_or(0)
+    }
+    fn pitch(&self, id: u32) -> i32 {
+        self.pitch.get(id as usize).copied().unwrap_or(0)
+    }
+    fn level(&self, id: u32) -> u32 {
+        self.level.get(id as usize).copied().unwrap_or(0)
+    }
 }
 
 /// Release a held message, if any.

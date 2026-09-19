@@ -218,7 +218,7 @@ mod tests {
         // Frame 2710 (state 2709): reads 60:2 = 0x130F, 52:0 = 0xFFFF, 56:1 = 0xFF6.
         let mut words = treatment_constructor(&tuning(), TreatmentOwner::LOCAL);
         words[13] = 10_000;
-        let audio = AudioState { time_scale_220: 1.0, air_time_236: f32::from_bits(0x3F33_3333), ..Default::default() };
+        let audio = { let mut s = AudioState::default(); s.time_scale_220 = 1.0; s.air_time_236 = f32::from_bits(0x3F33_3333); s };
         let controls = Fixed(&[(60, 2, 0x130F), (52, 0, 0xFFFF), (56, 1, 0xFF6)]);
         treatment_update(&mut words, &audio, &controls, &TreatmentGlobal::default());
         assert_eq!(words[0], 0x130F);
