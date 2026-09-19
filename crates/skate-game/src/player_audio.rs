@@ -29,6 +29,8 @@ mod audio_state;
 mod components;
 #[path = "player_audio/sound.rs"]
 mod sound;
+#[path = "player_audio/trace.rs"]
+mod trace;
 #[cfg(test)]
 #[path = "player_audio/headless.rs"]
 mod headless;

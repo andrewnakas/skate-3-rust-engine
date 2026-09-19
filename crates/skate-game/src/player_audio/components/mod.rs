@@ -113,6 +113,7 @@ pub(crate) fn release(runtime: &mut AuthoredRuntime, holder: &mut Option<u32>) -
         if trace_posts() {
             eprintln!("SKATE_PLAYER_AUDIO release handle={handle:#010x}");
         }
+        super::trace::release(handle);
         runtime.release(handle).map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -123,9 +124,11 @@ pub(crate) fn post(runtime: &mut AuthoredRuntime, object: &str, words: &[u32]) -
     if trace_posts() {
         eprintln!("SKATE_PLAYER_AUDIO post {object} handle={handle:#010x} words={words:x?}");
     }
+    super::trace::post(object, handle, words);
     Ok(handle)
 }
 
 pub(crate) fn redeliver(runtime: &mut AuthoredRuntime, handle: u32, words: &[u32]) -> Result<(), String> {
+    super::trace::update(handle, words);
     runtime.redeliver(handle, words).map_err(|error| error.to_string())
 }

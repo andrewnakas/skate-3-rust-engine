@@ -540,6 +540,9 @@ pub(crate) struct AudioState {
     /// +264: signed deck tilt, record +136 = SkateboardMotion+184 (SkateboardBody+256, written
     /// by FillPhysOut `82C02A80`).
     pub deck_tilt_264: f32,
+    /// +680: the listener-facing factor `sub_824B2088` writes alongside state controller input 3
+    /// (camera/listener direction against the deck). Set by the worker, which owns the camera.
+    pub listener_facing_680: f32,
     /// +268 / +272: |local toe velocity Y| of foot 1 / foot 0 (record +292 / +288 =
     /// |Skeleton+212| / |Skeleton+196|, `82BF22A0`).
     pub toe_local_speed_y_268: f32,
@@ -1008,6 +1011,7 @@ impl AudioState {
             wheel_air_factor_244: std::array::from_fn(|i| w.float(244 + 4 * i)),
             air_jump_height_260: w.float(260),
             deck_tilt_264: w.float(264),
+            listener_facing_680: w.float(680),
             toe_local_speed_y_268: w.float(268),
             toe_local_speed_y_272: w.float(272),
             toe_local_speed_xz_276: w.float(276),

@@ -93,13 +93,13 @@ pub(crate) struct WheelsVault {
 
 impl WheelsVault {
     pub(crate) fn load(c: &Collections) -> Result<Self, String> {
+        // `EA::Reflection::Text` fields hold the string itself.
         let text = |name: &str| -> Result<String, String> {
-            let data = &c.field(HOLDER, WHEELS, name)?.data;
-            let bytes: Vec<u8> = (0..data.len() / 2)
-                .map(|i| u8::from_str_radix(&data[2 * i..2 * i + 2], 16).map_err(|e| e.to_string()))
-                .collect::<Result<_, _>>()?;
-            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            String::from_utf8(bytes[..end].to_vec()).map_err(|e| e.to_string())
+            let field = c.field(HOLDER, WHEELS, name)?;
+            if field.type_name != "EA::Reflection::Text" {
+                return Err(format!("Expected text at {HOLDER}/{WHEELS}/{name}"));
+            }
+            Ok(field.data.clone())
         };
         let float = |name: &str| c.float(HOLDER, WHEELS, name);
         let int = |name: &str| c.integer(HOLDER, WHEELS, name).map(|v| v as i32);
@@ -375,6 +375,8 @@ impl Component for Wheels {
 
     /// Slot 10, `sub_824CDC70`.
     fn update(&mut self, tick: &mut Tick) -> Result<(), String> {
+        // +680 is written by the bridge (`sub_824B2088`) before the components run.
+        self.camera_680 = tick.audio.listener_facing_680;
         let triggers = triggers(tick.audio, self.local, self.handplant_760);
         for (index, trigger) in triggers.into_iter().enumerate() {
             self.spin(tick, index, trigger)?;

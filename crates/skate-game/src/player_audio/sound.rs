@@ -144,7 +144,9 @@ impl PlayerSound {
         };
 
         // 1. Bridge, then `sub_824B19C8`.
+        super::trace::frame(self.tick);
         self.audio.update(&observation.retail, &self.tuning);
+        super::trace::state(&self.audio);
         let audio = &self.audio;
         let fields = inputs::StateFields {
             wheel_count_200: audio.wheel_count_200,
@@ -181,11 +183,12 @@ impl PlayerSound {
             let v4 = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
             // `a` = record +496 = [B+0]+80 (the effective deck up); `b` = record +64 = [B+0]+128.
             // UNVERIFIED: B+0 +128 is not traced; the deck's effective forward stands in.
-            let (facing, _) = inputs::listener_facing(
+            let (facing, factor_680) = inputs::listener_facing(
                 inputs::normalize3(v4(retail.effective_deck_up)),
                 inputs::normalize3(v4(retail.deck_forward)),
                 inputs::normalize3(v4(camera_at)),
             );
+            self.audio.listener_facing_680 = factor_680;
             set(runtime, self.state_controller, &[(3, facing)])?;
         }
         let flag = inputs::player_flag(true, self.audio.soft_wheels_684, &[]);
@@ -311,6 +314,7 @@ pub(crate) fn build(
         speed::SenseOfSpeed,
         treatment::Treatment,
         tricks::Tricks,
+        wheels::{self, Wheels},
     };
     use skate_data::collections::Collections;
 
@@ -334,12 +338,29 @@ pub(crate) fn build(
         };
         Board::new(&mut tick, BoardVault::load(assets)?, &grains, BoardConfig::default())?
     };
+    let (wheels_vault, wheel_members) = wheels::load(assets, cache)?;
+    let (wheels_component, speed) = {
+        let audio = AudioState::default();
+        let controls = ControlSnapshot::default();
+        let mut tick = Tick {
+            runtime: &mut *runtime,
+            audio: &audio,
+            controls: &controls,
+            dt: FRAME_SECONDS,
+            tick: 0,
+        };
+        (
+            Wheels::new(&mut tick, wheels_vault, &wheel_members, true)?,
+            SenseOfSpeed::with_rocket(&mut tick, &vault, &grains)?,
+        )
+    };
     let ctrl = |runtime: &AuthoredRuntime, object: u32, name: &str| {
         controller(runtime, object_key(object), name)
     };
     let entries = vec![
         Entry::new("SkateBoard", ctrl(runtime, 0, "SkateBoard")?, Box::new(board)),
         Entry::new("Contacts", ctrl(runtime, 1, "Contacts")?, Box::new(FootDrag::new(&vault)?)),
+        Entry::new("Wheels", ctrl(runtime, 2, "Wheels")?, Box::new(wheels_component)),
         Entry::new("Rail", ctrl(runtime, 3, "Rail")?, Box::new(Grind::new(&vault)?)),
         Entry::new("Cracks", ctrl(runtime, 4, "Cracks")?, Box::new(Seams::new(&vault)?)),
         Entry::new("Tricks", ctrl(runtime, 5, "Tricks")?, Box::new(Tricks::new(&vault)?)),
@@ -348,7 +369,7 @@ pub(crate) fn build(
         Entry::new(
             "SenseOfSpeed",
             ctrl(runtime, 8, "SenseOfSpeed")?,
-            Box::new(SenseOfSpeed::new(&vault)?),
+            Box::new(speed),
         ),
         Entry::new("OffBoard", ctrl(runtime, 9, "OffBoard")?, Box::new(Footsteps::new(&vault)?)),
     ];
