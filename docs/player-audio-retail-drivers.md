@@ -183,16 +183,77 @@ v = state+208 ground speed.
   vfunc60(1)/32767 × (1 − max(+1164, +1168)) × optional vault/+1456 multipliers; second player
   mixes vfunc60(2), +1164, +1508. Pitch = vfunc56(3)/4096. `sub_824C8588` slews a speed intensity
   with per-surface vault steps (0.06); `sub_824C9058` pushes per-surface filter values.
-- **GrainPlayer** (`sub_828EBD88` class, 372 bytes, `.47.cpp`): own graphs of 'SnP1', 'Rsp0',
-  'GaF0', 'Sen0', 'Gai0'. Pick `sub_828ECAB0`: position → start + (duration − start) × position;
-  up to 64 candidate windows (`sub_828ECA08`), skip a 16-entry recent list, random pick
-  `sub_82A8AF10`. Scheduler `sub_828EC6F0` (per-block callback): two voices crossfade through
-  attack/sustain/release (`sub_828EC208`/`sub_828EC2F8`), jumps early when target drifts past a
-  threshold; gain/pitch each tick via property-stamp handler 0x82B463A8. Constructor defaults
-  0.01, 0.5, 0.01, 4.0, 0.05. Vault GrainParams bytes `00020002 00140000` then 0.1, 0.2, 0.1 —
-  layout unresolved.
-- `.grain` file: header-length word, float duration, prefix (seek) table, one 12–22 s EAAC
-  recording at 44.1/48 kHz.
+- **GrainPlayer** (`sub_828EBD88` class, 372 bytes, `.47.cpp`; ported in
+  `skate-audio-core/src/grain/player.rs`, layout confirmed bit-exact against the retail capture).
+  Object: `+0..+12` the owner's record `{gain, pitch, 0, position}`; `+16..+32` GrainParams
+  (attack, sustain, release, search window, drift threshold; constructor defaults 0.01, 0.5, 0.01,
+  4.0, 0.05); `+36` hold byte; `+40` send target; `+44` bound byte; `+48..+64` grain data, header
+  length, duration, seek table (`data+8`), EAAC stream (`data+H`); `+68..+84` classes SnP1, Rsp0,
+  GaF0, Sen0, Gai0 (Gai0 unused); two 28-byte voice slots at `+88`/`+116` (`+0` module table, `+4`
+  graph, `+8` state timer, `+12` start s, `+16` position at pick, `+20` state 1/2/3); `+144` active
+  slot; `+148` the 24-byte scheduler instance; `+172` 16 recent-window entries `{start, end, u16
+  next}`; `+364/+366/+368` used head, last inserted, free head.
+- **GrainParams** (vault `0xD18D1174735E5CDE`, only in `default`): an array `{u16 capacity 2, u16
+  count 2, u16 stride 0x14, pad}` of two 20-byte elements of five floats. Element 0 = A players
+  (0.1, 0.2, 0.1, 1.6, 0.05), element 1 = B players (0.2, 0.1, 0.2, 1.5, 0.05); `sub_824C5CA8`
+  copies element `which` (lookup `sub_82B72420(key, which)`) to player+16..+32.
+- **Grain members per surface** (`sub_824C8370`, soft when `sub_824B23C8 == 1`; filename = vault
+  layout `+64`; slots A/B = `owner+40+4·slot`, both players get the same file): 1
+  `asphalt_rough_soft` (key `943B1CB05BA9A6BA`, 14/15) / `asphalt_rough_hard` (`7EB8015B4C02405E`,
+  0/1); 2 `concrete_rough_soft` (`B29FADBBBC2F39C2`, 16/17) / `_hard` (`03721D0FA99A03C8`, 2/3); 3
+  `asphalt_smooth_soft` (`DC1009D50E327F8F`, 18/19) / `_hard` (`7C5912FC2DABF98C`, 4/5); 4
+  `concrete_smooth_soft` (`607A6BC3D427DA49`, 20/21) / `_hard` (`FFB5E3E62E0B4943`, 6/7); 5
+  `wood_ramp_soft` (`382B12636ED9D8DA`, 22/23) / `_hard` (`7947A259F181FDB4`, 8/9); 6
+  `concrete_aggregate_soft` (`863C58AC34BAD599`, 24/25) / `_hard` (`B303AED8241530E2`, 10/11); 9
+  `metal_smooth_hard` only (`1C9C52CC0E1CD4CF`, 12/13). Layout: `+0` 4×4 Bezier matrix (column 1
+  of rows 0..3 = P3..P0), `+64` filename, `+68` max km/h, `+72` B boost gain, `+76` boost ramp
+  km/h, `+80` A shift per boost, `+84` intensity cap, `+88` B base shift.
+- **Pick** `sub_828ECAB0`: grain length L = attack + sustain + release; target T = (duration −
+  window) × position; the free gaps of the start-sorted recent list (initial sentinel {−2, −1}),
+  clamped to [T, T + window], are cut into back-to-back windows of L (`sub_828ECA08`, ≤ 64);
+  index = int(rand × 2⁻³¹ × 0.5 × count) with `sub_82A8AF10` (a global add-with-carry generator
+  at `0x82FD7D74` shared by ~100 call sites, so retail pick sequences are not reproducible); no
+  candidate or last entry 15 → the list collapses to its last entry and, if window/L > 1, the
+  search repeats, else T is returned. The capture's `GP ret` value is the window end, not the start.
+- **Per-block plug-in**: `sub_828EBE68` registers `player+148` in scheduler bucket 0
+  (`sub_82481BE0`: pool `system+112`, 74 nodes, process `sub_828ECE98` → `sub_828EC6F0`, context
+  the player, name "Grain Player"); the block driver `sub_82B48530` runs bucket 0 in phase 1,
+  before the command drain, with f1 = `[system+176]` = `0x3BAEC33E` = (f32) 256/48000 (pinned by
+  the capture's attack timer 0.1 → `3DAC0831` → `3D962FC9` …). Drift: if |slot[active].+16 −
+  position| > `+32` (and hold clear) the other slot is released if busy, else the active one
+  releases and a new grain starts in the other. Each live voice: gain → Sen0 prop 0, pitch → Rsp0
+  prop 0 (stamp `0x82B463A8`); timer −= dt (sustain: −= dt × pitch, fused); attack → sustain;
+  sustain → release, stop the other slot, pick, start there; release → stop (deferred
+  `0x82B49238`).
+- **Voice graph** `sub_828EC3F0`: `SnP1 → Rsp0 → GaF0 → Sen0`, 1 channel, order 0; SnP1 param 5
+  with sample = EAAC stream, detail = seek table, start = clamp(start, 0, duration) as a double at
+  block+16; fader to 0 at once, then attack (fade to 1 over `+16`); Sen0 → `+40`; gain stamped.
+- `.grain` file: `+0` header length H (112..176), `+4` duration (f32, stored; 3 members are 1–3 ulp
+  off num_samples/rate), `+8` seek table `00 10 0180 00000018` + run-length varint columns (reader
+  `sub_82B470D0` / `sub_82B474B8`; in every grain row 0 spans the whole single-block stream, so a
+  seek is "restart at 0, 384-sample preroll, skip target − 384"), `+H` mono XMA EAAC at 44.1/48
+  kHz, 12–22 s, one block. The play command's start frame is `fctiwz(rate × start)`.
+- **Bus chain** (`sub_824C8878`, per player, record at `owner+1192+24k`; ported in
+  `grain/chain.rs`): graph 1 (order 2) `Sub0 → HI20 → LI20 → FrequencyShiftSsb(arg 0.0) → Sen0(→
+  graph 3, level +1556 = 0) → Gai0 → Sen0(→ graph 2)`; graph 2 (order 5) `Sub0 → Sen0(→
+  [[manager+116]], level 0) → Sen0(→ [[manager+52]]) → Pn21 (6 ch) → Sen0(→ eEQChain bus 8 = the
+  default bus)`; graph 3 (order 3, local player) `Sub0 → DCl0(+1528 = 0.09) → Gai0 → HS20(+1548 =
+  5000 Hz, +1552 = 0.65) → Sen0(→ graph 2)`. Voices send to graph 1's Sub0. FrequencyShiftSsb
+  (`sub_82B22898`) = two cascades of two allpass biquads (Hilbert I/Q) then I·cos φ − Q·sin φ
+  (`sub_824531C8` / `sub_82473930`), φ += 2π·shift/rate. `sub_824C9058` per truck: HI20 ←
+  vfunc64(12), LI20 ← vfunc64(11) (capture 77 / 24971), FSS A ← (latch ? 150 : 0) + [+1152 if
+  +1156 clear] + boost × `+80`, FSS B ← `+88` + [+1152] + boost × `0x7FFF3A8AD44809EF`, Pn21 ←
+  vfunc52(0) × 360/65535, env send ← vfunc60(13)/32767, local sends ← vfunc60(21)/(22)/32767.
+- **Record inputs resolved**: `owner+912`, `+1036`, `+1340` are 124-byte segment envelopes
+  (`sub_8248D368` reset, `sub_8248D3C0` add, `sub_8248D498` add chained, `sub_8248D510` advance);
+  `+1028`/`+1032` = the `+912` envelope's value/idle byte, `+1152`/`+1156` the `+1036` one's. On
+  every push (state `+335`) `sub_824C6198` programs `+912`: current value (or 1.0) → 1.4 + t·(1.1 −
+  1.4) over 35 ms, hold 200 ms, → 1.0 over 600 ms; and `+1036`: 0 → −52 + t·32 Hz over 30 ms, hold
+  200, → 0 over 600 (t = clamp((v − 1)·3.6/45)); both advanced by dt each frame while not idle.
+  So the grain speed is scaled by the push envelope while it runs. `sub_824CA688` (`+1504`): set
+  while state `+340` (balance ≠ 0, manual), cleared once wheels in contact (`+200`) is 0 or 4.
+  `sub_824CA6E0` (`+1505`): set while state `+372` (bit 23 of the airborne trick packet word
+  `+152`, refreshed only while `+332`), cleared once `+615 && +616` (feet in the deck box).
 - `Class_rolling` patch: random-range ops, shuffle bags, timer, window latch, oscillators, ramps,
   curves, one voice op; samples 0.09–0.75 s, loop bit clear. Retail opens ~25–30 per 166 s.
 - Rolling updater `sub_824C9948` (holders +1304 layer 0, +1308 layer 3): w0 32767; w1
@@ -459,3 +520,65 @@ Loose-board scrape during bails (rail boardslides are Class_grind). Ctor: w2 409
 `F2B44F93BD91662E` = 7, w10 state780 == 2, rest 0. Post while state780 ≠ 0; release at 0. Update:
 w3 = trunc(clamp01((v − 0.5) / 15 × 3.6) × 10000) (15 `9635B780C7472A6E`); w11 = 15000
 (`662CEE73D2E3FE2F`/`AB87C3D1EDDDDCBC`); spatial vf ids 23–27.
+
+## 6. Native sources of the audio-state fields (traced 2026-09-18)
+
+PhysOut bundle slot sizes (reset `sub_82DE53F0`, templates `sub_82DE4940`): 0=288, 4 Motion=288,
+8 Air=464, 12=48, 16 Grinds=336, 20 Skeleton=608, 24 Collision=3488, 28 State=88, 32 Ground=336,
+36 Reckoning=176, **40=224**, 44=112, 48=128, 52 Interaction=80, 56 Animation=176, **60=14672**,
+64 Filtered=88, 68=140, 72 OffBoard=336.
+
+- **B+40** (template `sub_82DE3358`) is written after the physics tick by an 800-byte PhysOut
+  audio conditioner (vtable `0x82310A74`, built in `sub_82DF2130`, owner+12 = slot 3, constructor
+  tail `sub_827725E8`), run by `sub_82DF2710` after the chromosome conditioner (slot 1) and before
+  the filtered one (slot 5). Update `sub_82772748` (writes +0, +24, +36, +209, +210); helpers
+  `sub_82772E18` (+16/+20), `sub_82772FD8` (+52..+91), `sub_827731C8` (+28/+32/+40/+208),
+  `sub_82773298` (+92..+207), `sub_82772B88` (+44), `sub_827729B8` (+211..+215), `sub_82772D30`
+  (+48). The engine has no port; its inputs mostly exist.
+- **B+60** is PhysOutScoring2 (engine publishes only +204 `scoring.capabilities_204`); writers
+  `sub_82DA33E0`, `sub_82DA4238`, `sub_82DA6630`, `sub_82DA4A48`, trick id `sub_82DAC498`.
+
+Corrections to §1: 615/616 = **Skeleton 600/601** (feet inside the deck box), not Collision;
+612/613/614 = Collision 3473/3474/3475 (front truck, back truck, deck contact); 696 = B60+136 (if >
+0); B60+140 is never read by the bridge.
+
+| State | Source | Writer | Meaning | Engine |
+|---|---|---|---|---|
+| 192 | B40+28 | `827731C8`: Grinds+136 while Grinds+316, starts −1 | grind family, latched | `grinds.words_136_140[0]` gated by `grinding_316` + latch |
+| 228 | B40+32 | `827731C8`: Grinds+128 if > 0 else previous | last positive grind impact | `grinds.impact_speed_128` + latch |
+| 232 | B40+20 | `82772E18`: clamp((\|Motion80 · deckX\| − K2)/K1, 0, 1); 0 if wheel count 0; K1/K2 vault via `*(0x830CFDA4)`+84, keys `0x56D931D202881C2D` / `0xE6C3FFE8AA70F944` | slip (lateral deck speed) | missing: `skateboard.vector_80` · deck part basis X |
+| 468 | B40+24 (only when Air440) | `82772748`: \|Air+112\| × K`0x822F8A44`, clamp to 1 above `0x821CCD60` | jump velocity delta | `air.jump_velocity_delta_112`, Air440 = `flags_2468` bit 22 |
+| 480 | B40+0 | `82772748`: Motion+64 projected on deck-part basis rows | deck-local angular velocity | `skateboard.vector_64` + deck `part_transforms` basis |
+| 668 | B40+36 | max of last 4 Collision+24 (`82C02A80`: clamp(\|deck accel · deck normal\| × k), deck contact only) | deck scrape | `BoardGroundState.accelerations[6]`, `parts[6].normal` |
+| 664 | Collision+20 | `82C02A80`: \|tangential deck relative velocity\| | deck slide speed | `parts[Deck].relative_velocity`, `.normal` |
+| 692 | B40+40 | Grinds+216 while grinding (−1, clamp 0..143) | grind material, latched | `grinds.audio_surface_216` + latch |
+| 300 | B40+44 | `82772B88`: 4-sample ring of Reckoning+20, \|min(v,0)\| vs vault (+92 class, key `0x7385078DD3C063BA`, entries 2/1/0 → 4/3/2, else 1). Bridge forces 1 if (343 && 348 ≠ 31) or 720 == 0 (720 = 20 while filtered state 7, counts down) | landing bucket 1..4 | `reckoning.vector_16[1]`, `filtered_state_0` |
+| 304 | B40+48 | `82772D30`: Ground+300 (jump strength) vs vault (+136 class, key `0x46875250BEE65CDB`) → 2/1/0 | jump bucket | `jump_strength` (Processed2624) |
+| 448–460 | B40+52..64 | `82772FD8`: per-wheel touchdown after > 5 air frames: clamp(−(prev wheel vel Motion+208+16i · wheel normal Coll+3376+16i)/K, 0, 1) | wheel impact | per-wheel velocity + normal |
+| 464–467 | B40+68..71 | `82772FD8` | per-wheel landed latch (cleared after > 5 air frames) | `collision.wheel_contact_3296_3299` |
+| 496–611 | B40+92..207 | `82773298`: Collision+80..195 (ragdoll contacts, `sub_82BD60C8`) | body contacts (528 slides, 560 materials, 592/593 flags) | missing: port `sub_82BD60C8` |
+| 341 | B40 byte208 | State+12 == 400 or (State+16 == 701 && Grinds+323) | grinding | `state.category_12`, `state_16`, `grinds.flag_323` |
+| 740 | B40 211..213 | `827729B8`: 212 ? (211 ? 2 : 4) : 213 ? (211 ? 3 : 5) : 1 | step code | needs Skeleton+144/+160 + port |
+| 343 / 348 / 352 / 344 | B60+152 (EScorableID from `sub_82DA5AC8`; valid only with packet flags bit 24/25) | builder: trick name `*(0x820862A8 + 24·id + 20)`, key hash64(lowercase) (`sub_82B69B68`), collection `sub_82B69B08(0x6918469984A8C596, key)`, layout `sub_82B6CC78` offsets +164 → 348, +172 → 352, byte +176 → 344 | audio trick ids | `score_packet` → `scoring.data.by_name(..).metadata.id` + flags gate |
+| 368 | B60+12312 | builder, while 332 | spin bucket | missing |
+| 717 | B60 byte14657 | `82DA33E0` | Processed2484 bit 31 or < 30 frames since State78 | derivable |
+| 204 | Ground+264 = Processed+2676 | ProcessOutput `82DB6EC0` | turn input | `turn` attribute / `ControlFeedback.turn` |
+| 264 | Motion+184 = SkateboardBody+256 (filtered steering, `sub_82C040F0`) | `82C02A80` | signed deck tilt | `skater.ground.steering.deck_tilt` |
+| 684 | Motion+200 < 0.5 = Processed+2764 | `82C02A80` | soft wheels | `processed.scalar_2764 < 0.5` |
+| 332 | Air byte438 | ProcessOutput: 200 ≤ state < 300 && Collision+0 == 0 | in known air | `state.state_16`, `collision.wheel_count_0` |
+| 768 | Air byte448; foot materials from Air+224 | FootPlant | footplant | `air.flag_448`, `footplant_surface_224` |
+| 760 / 764 | Air 451 / +228 | HandPlantManager +3056 / +3012 | handplant | missing |
+| 328 | \|Skeleton+288\| | ragdoll body velocity | body speed | missing |
+| 292 / 296 | \|Skeleton+324\| / \|Skeleton+308\| | ragdoll foot bodies (+1612 / +1996) | per-foot vertical speed | missing |
+| 268 / 272 | \|Skeleton+212\| / \|Skeleton+196\| | `82BF22A0` | local toe velocity Y | `foot_physical.output.local_velocity[1][1]` / `[0][1]` |
+| 280 / 276 | max xz | same | local toe velocity XZ | `local_velocity[0]` / `[1]` x, z |
+| 284 / 288 | max(\|224\|,\|232\|) / max(\|240\|,\|248\|) | same | world foot speed XZ | `foot_physical.output.world_velocity[0]` / `[1]` |
+| 672 | 0.25 × Σ limb speeds rel. COM | `82BE1AE8` | limb speed | missing |
+| 677 | Skeleton 599 | `82D3EEE8` | end of bail | `physical.skeleton.over_599` |
+| 615 / 616 | Skeleton 600 / 601 | `82BF22A0` | feet in deck box | `physical.skeleton.flag_600` / `flag_601` |
+| 620–632 | Coll 3440.. = tag & 0x7F | `82C079E0` | per-wheel material | `WheelLineState.audio_surfaces` |
+| 636–648 | Coll 3456.. = (tag >> 12) & 0xF | `82C079E0` | per-wheel seam pattern | **discarded at `board_ground.rs:84-85`** |
+| 652 / 656 / 660 | Coll +4/+8/+12 | contact reports `82C07D20` | truck/deck materials | `board_ground.rs:234-240` keeps only physics bits |
+| 780 | builder | (676 or state 500) && deck contact && deck material < 94; d = deck up · wheel normal: d < [0x822F8994] → 1; [0x8207268C] < d < 0.1 → 2 | loose board | derivable once Coll+12 exists |
+| 718 | [B+64]+0 == 7 | — | OffboardAir | `physical.filtered_state_0 == 7` |
+| 309 / 320 | OffBoard 309 / 310 | Processed2480 bits 18 / 7 | — | processed flags |

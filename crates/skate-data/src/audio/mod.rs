@@ -409,6 +409,7 @@ pub fn interleave_contexts(per_context: &[Vec<i16>], widths: &[u8]) -> Vec<i16> 
 pub mod ambience;
 pub mod catalog;
 pub mod ffmpeg;
+pub mod grains;
 
 #[cfg(test)]
 mod tests;

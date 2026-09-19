@@ -36,6 +36,9 @@ pub const PLAYER_BANKS: &[&str] = &[
     "sense_of_speed.abk",
 ];
 
+/// Where the installer stages the MixMap under `assets`.
+pub const MIXMAP_PATH: &str = "private/stock/data/audio/MixMapSK8.mxb";
+
 /// One decoded sample, addressed by its original EAAC header offset within its bank.
 #[derive(Clone, Debug)]
 pub struct BankPcm {
@@ -53,16 +56,23 @@ pub struct PlayerAudioCatalog {
     pub banks: Vec<(String, Vec<u8>)>,
     pub samples: Vec<BankPcm>,
     pub cache_hits: usize,
+    /// `data/audio/MixMapSK8.mxb`, the MixMap the game loads in `sub_82484FE8` (a loose file,
+    /// staged at `<assets>/private/stock/data/audio/`). Set by [`Self::from_assets`]; `None` when
+    /// the file is not staged or the catalog was built from explicit paths. Install it with
+    /// `AuthoredRuntime::load_mixmap`.
+    pub mixmap: Option<Vec<u8>>,
 }
 
 impl PlayerAudioCatalog {
     /// Load the prepared setup layout under an installation's `assets` directory.
     pub fn from_assets(assets: &Path, cache: Option<&Path>) -> Result<Self, Error> {
-        Self::load(
+        let mut catalog = Self::load(
             &assets.join("private/stock/data/audio/audiofiles.big"),
             &assets.join("private/stock/audio-runtime-image"),
             cache,
-        )
+        )?;
+        catalog.mixmap = std::fs::read(assets.join(MIXMAP_PATH)).ok();
+        Ok(catalog)
     }
 
     /// Decode all rider/board samples, or load a cache whose source bytes match exactly.
@@ -106,6 +116,7 @@ impl PlayerAudioCatalog {
             banks: Vec::new(),
             samples: Vec::new(),
             cache_hits: 0,
+            mixmap: None,
         };
         for &name in names {
             let member = archive

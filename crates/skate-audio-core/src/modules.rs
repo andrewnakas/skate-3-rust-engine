@@ -207,6 +207,11 @@ pub fn class_size(g: &Guest, function: u32, descriptor: u32) -> Result<u64> {
             Ok(head + rlwinm(three, 4, 0xFFFF_FFF0)) // rlwinm r10,r8,4,0,27 ; add r3
         }
         DELAY_SIZE => Ok(192),
+        // The grain chain's two extra classes (`crate::grain::fss`).
+        #[cfg(target_arch = "x86_64")]
+        crate::grain::fss::FSS_SIZE => crate::grain::fss::fss_size(g, descriptor),
+        #[cfg(target_arch = "x86_64")]
+        crate::grain::fss::HS_SIZE => Ok(crate::grain::fss::HS_SIZE_BYTES),
         _ => Err(Error::new(
             function,
             "module class size function not ported",
@@ -260,6 +265,11 @@ pub fn construct<H: Heap + ?Sized, T: Trig + ?Sized>(
         PAN_CONSTRUCT => construct_pan(g, trig, instance, arg),
         SNDPLAYER_CONSTRUCT => construct_sndplayer(g, heap, instance, arg),
         DELAY_CONSTRUCT => construct_delay(g, heap, instance, arg),
+        // The grain chain's two extra classes (`crate::grain::fss`).
+        #[cfg(target_arch = "x86_64")]
+        crate::grain::fss::FSS_CONSTRUCT => crate::grain::fss::construct_fss(g, instance, arg),
+        #[cfg(target_arch = "x86_64")]
+        crate::grain::fss::HS_CONSTRUCT => crate::grain::fss::construct_hs(g, instance),
         _ => Err(Error::new(function, "module constructor not ported")),
     }
 }

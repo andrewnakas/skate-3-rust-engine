@@ -215,3 +215,41 @@ fn opposing_contacts_use_deck_projection_range_and_reset_without_deck_contacts()
     state.update(&reports[2..], &lines, UP, 80.0, false);
     assert_eq!(state.opposing_contact, 0.0);
 }
+
+/// 82C079E0 keeps tag & 0x7F, (tag >> 7) & 31 and (tag >> 12) & 0xF per wheel and clears all
+/// three on a miss; 82C07D20 keeps the audio/seam bits of truck/deck reports (last wins) after
+/// Reset 82C00CA0 cleared them.
+#[test]
+fn audio_material_and_seam_bits_are_preserved_from_the_same_tags() {
+    let tag = (0xB << 12) | (3 << 7) | 0x45;
+    let mut lines = WheelLineState::default();
+    lines.publish([
+        Some(WheelLineHit {
+            fraction: 0.1,
+            normal: UP,
+            surface_tag: tag,
+        }),
+        None,
+        None,
+        None,
+    ]);
+    assert_eq!(lines.audio_surfaces, [0x45, 0, 0, 0]);
+    assert_eq!(lines.physics_surfaces, [3, 0, 0, 0]);
+    assert_eq!(lines.seam_patterns, [0xB, 0, 0, 0]);
+    lines.publish([None; 4]);
+    assert_eq!(lines.seam_patterns, [0; 4]);
+
+    let mut ground = BoardGroundState::default();
+    let mut first = report(BodyId::Deck, UP);
+    first.other_surface = ((0x4 << 12) | 0x02) as u16;
+    let mut last = report(BodyId::Deck, UP);
+    last.other_surface = ((0x8 << 12) | (2 << 7) | 0x10) as u16;
+    let mut truck = report(BodyId::BackTruck, UP);
+    truck.other_surface = 0x03;
+    ground.update(&[first, last, truck], &lines, UP, 80.0, false);
+    assert_eq!(ground.part_audio_surfaces, [0, 0x03, 0x10]);
+    assert_eq!(ground.part_seam_patterns, [0, 0, 0x8]);
+    ground.update(&[], &lines, UP, 80.0, false);
+    assert_eq!(ground.part_audio_surfaces, [0; 3]);
+    assert_eq!(ground.part_seam_patterns, [0; 3]);
+}

@@ -27,6 +27,12 @@
 //!      col3 = 1 on a key entry. A row whose col2 is negative ends the table.
 //! ```
 //!
+//! In every grain the first row is `{block bytes, side length, num_samples, 1}` -- one entry
+//! spanning the whole single-block stream -- so the reader stops in row 0 for any in-range target
+//! and the seek resolves to "restart at sample 0, decode `preroll` samples, skip `target −
+//! preroll`" (the side data at `+24`, about one byte per 2048-byte XMA packet, is what the hardware
+//! decoder uses to find the packet). The rows after it are never reached.
+//!
 //! The varint and column decoders operate on guest memory in `skate_audio_core::grain::seek`,
 //! where they are transliterated from the lifted functions; [`SeekHeader`] here only names the
 //! eight header bytes so a loader can validate a member before placing it.
@@ -72,9 +78,14 @@ impl<'a> Grain<'a> {
         let duration = f32::from_bits(be32(bytes, 4)?);
         let h = header_len as usize;
         if h < 16 || h > bytes.len() {
-            return Err(Error::new(0, format!("grain header length {h} is out of range")));
+            return Err(Error::new(
+                0,
+                format!("grain header length {h} is out of range"),
+            ));
         }
-        let byte1 = *bytes.get(9).ok_or_else(|| Error::new(9, "truncated seek table"))?;
+        let byte1 = *bytes
+            .get(9)
+            .ok_or_else(|| Error::new(9, "truncated seek table"))?;
         let seek = SeekHeader {
             kind: bytes[8],
             low: byte1 & 0xF,
@@ -122,7 +133,10 @@ pub fn members(archive: &[u8]) -> Result<Vec<(String, std::ops::Range<usize>)>> 
         }
         let range = entry.range();
         if range.end > archive.len() {
-            return Err(Error::new(range.start, format!("{name}: member out of bounds")));
+            return Err(Error::new(
+                range.start,
+                format!("{name}: member out of bounds"),
+            ));
         }
         out.push((name.to_owned(), range));
     }
@@ -139,13 +153,14 @@ mod tests {
         let mut bytes = vec![0u8; 0xB0 + 16];
         let head = [
             0x00, 0x00, 0x00, 0xB0, 0x41, 0xAE, 0xBC, 0x39, // H = 176, 21.8418 s
-            0x00, 0x10, 0x01, 0x80, 0x00, 0x00, 0x00, 0x18, // kind 0, layout 1, preroll 384, +24
+            0x00, 0x10, 0x01, 0x80, 0x00, 0x00, 0x00,
+            0x18, // kind 0, layout 1, preroll 384, +24
         ];
         bytes[..16].copy_from_slice(&head);
         // 0300AC44 000EB29C 0003F727 000EB29C: codec 3, mono, 44.1 kHz, 963228 samples, one block.
         bytes[0xB0..0xB0 + 16].copy_from_slice(&[
-            0x03, 0x00, 0xAC, 0x44, 0x00, 0x0E, 0xB2, 0x9C, 0x00, 0x03, 0xF7, 0x27, 0x00, 0x0E, 0xB2,
-            0x9C,
+            0x03, 0x00, 0xAC, 0x44, 0x00, 0x0E, 0xB2, 0x9C, 0x00, 0x03, 0xF7, 0x27, 0x00, 0x0E,
+            0xB2, 0x9C,
         ]);
         bytes
     }

@@ -24,7 +24,7 @@ from collections import defaultdict
 def main():
     capture, out = sys.argv[1], sys.argv[2]
     local_state = sys.argv[3] if len(sys.argv) > 3 else "40C10E20"
-    local_board = sys.argv[4] if len(sys.argv) > 4 else "40C3C020"
+    local_board = sys.argv[4] if len(sys.argv) > 4 else "40C3B020"
     os.makedirs(os.path.join(out, "updates"), exist_ok=True)
     os.makedirs(os.path.join(out, "mixmap"), exist_ok=True)
     files = {}

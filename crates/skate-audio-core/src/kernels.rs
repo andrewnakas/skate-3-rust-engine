@@ -90,6 +90,11 @@ impl<T: Trig> GraphHost for VoiceKernels<'_, T> {
             0x82B3_4278 => sndplayer::render_block(g, self.fill, object, owner),
             0x82B3_1838 => bus::mix_source(g, object, owner, flag, self.sp),
             0x82B2_38A8 => gains::advance_gain_ramp(g, self.trig, object, owner),
+            // The grain chain's FrequencyShiftSsb and HighShelfIir2 (`crate::grain::fss`).
+            crate::grain::fss::FSS_PROCESS => {
+                crate::grain::fss::process_fss(g, object, owner, self.sp)
+            }
+            crate::grain::fss::HS_PROCESS => filters::shelf_stage(g, self.trig, object, owner),
             other => Err(Error::new(
                 other,
                 format!("process function {other:#010x} is not a voice kernel"),

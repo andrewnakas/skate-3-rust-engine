@@ -126,8 +126,22 @@ mod tests {
         // The dumped image's state (g_82FD.bin + 0x7D74), then edge states that exercise every
         // carry and the ripple.
         let seeds = [
-            [0xF22D_0E56, 0x8831_26E9, 0xC624_DD2F, 0x0702_C49C, 0x9E35_3F7D, 0x6FDF_3B64],
-            [0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF],
+            [
+                0xF22D_0E56,
+                0x8831_26E9,
+                0xC624_DD2F,
+                0x0702_C49C,
+                0x9E35_3F7D,
+                0x6FDF_3B64,
+            ],
+            [
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+            ],
             [0, 0, 0, 0, 0xFFFF_FFFF, 1],
             [1, 2, 3, 0xFFFF_FFFF, 0, 0xFFFF_FFFF],
         ];

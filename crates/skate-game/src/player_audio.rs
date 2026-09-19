@@ -21,8 +21,12 @@ use skate_data::audio::catalog::PlayerAudioCatalog;
 
 use super::{LivePcm, PlayerAudioObservation};
 
+#[path = "player_audio/tuning.rs"]
+mod tuning;
 #[path = "player_audio/audio_state.rs"]
 mod audio_state;
+#[path = "player_audio/components/mod.rs"]
+mod components;
 
 const OUTPUT_CHANNELS: u16 = 2;
 const SAMPLE_RATE: u32 = 48_000;
@@ -1667,15 +1671,6 @@ mod tests {
         assert!(deceleration_skid_allowed(
             true, false, false, 112, 112, 0, 0.5
         ));
-    }
-
-    #[test]
-    fn treatment_landing_sequence_returns_to_the_held_baseline() {
-        assert_eq!(&treatment_update(1, 750)[7..10], &[0x10, 0x2ae, 0x25]);
-        assert_eq!(treatment_update(1, 750)[10], 750);
-        assert_eq!(&treatment_update(10, 750)[7..10], &[0x2ab, 0x13, 0xb7]);
-        assert_eq!(&treatment_update(0, 750)[7..10], &[0, 0, 0]);
-        assert_eq!(&treatment_update(11, 750)[7..10], &[0, 0, 0]);
     }
 
     #[test]

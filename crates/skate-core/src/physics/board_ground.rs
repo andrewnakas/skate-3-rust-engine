@@ -50,6 +50,10 @@ pub struct WheelLineState {
     /// deliberately distinct from the five-bit friction/physics surface below.
     pub audio_surfaces: [u32; 4],
     pub physics_surfaces: [u32; 4],
+    /// Seam pattern of the same tag, `(tag >> 12) & 0xF`: `82C079E0` stores it at
+    /// CollisionInfo+812+4i (FillPhysOut `82C02A80` copies it to Collision+3456+4i, audio state
+    /// +636..+648). Cleared to 0 on a miss together with both surfaces.
+    pub seam_patterns: [u32; 4],
     pub minimum_distance: f32,
 }
 impl Default for WheelLineState {
@@ -60,6 +64,7 @@ impl Default for WheelLineState {
             distances: [0.0; 4],
             audio_surfaces: [0; 4],
             physics_surfaces: [0; 4],
+            seam_patterns: [0; 4],
             minimum_distance: 0.0,
         }
     }
@@ -72,6 +77,7 @@ impl WheelLineState {
         for (i, hit) in hits.into_iter().enumerate() {
             self.audio_surfaces[i] = 0;
             self.physics_surfaces[i] = 0;
+            self.seam_patterns[i] = 0;
             if let Some(hit) = hit {
                 let distance = hit.fraction * WHEEL_LINE_LENGTH;
                 self.minimum_distance = if distance - self.minimum_distance >= -0.0 {
@@ -83,6 +89,7 @@ impl WheelLineState {
                 self.distances[i] = distance;
                 self.audio_surfaces[i] = hit.surface_tag & 0x7f;
                 self.physics_surfaces[i] = (hit.surface_tag >> 7) & 31;
+                self.seam_patterns[i] = (hit.surface_tag >> 12) & 0xf;
             }
         }
     }
@@ -119,6 +126,13 @@ pub struct BoardGroundState {
     ///Other-assembly group flags require actual dynamic-object reports.
     pub surface_twelve_height: f32,
     pub collision_flags: u32,
+    /// CollisionInfo+800/+804/+808: audio material (`tag & 0x7F`) of the front truck, back truck
+    /// and deck. Reset `82C00CA0` clears them each frame; `82C07D20` (82C081B4..81E0) stores the
+    /// tag of every report for parts 4..6, the last report winning. FillPhysOut `82C02A80` copies
+    /// them to Collision+4/+8/+12 (audio state +652/+656/+660).
+    pub part_audio_surfaces: [u32; 3],
+    /// CollisionInfo+828/+832/+836: the same reports' seam patterns, `(tag >> 12) & 0xF`.
+    pub part_seam_patterns: [u32; 3],
     /// CollisionInfo+0. Can use truck/deck normals when the wheel sum fails.
     pub overall_normal: Vector3,
     /// CollisionInfo+16. Retained until a valid contacting-wheel sum replaces it.
@@ -148,6 +162,8 @@ impl Default for BoardGroundState {
             opposing_contact: 0.0,
             surface_twelve_height: 0.0,
             collision_flags: 0,
+            part_audio_surfaces: [0; 3],
+            part_seam_patterns: [0; 3],
             valid_wheel_normals: [false; 4],
             part_contact_count: 0,
             wheel_contact_count: 0,
@@ -195,6 +211,8 @@ impl BoardGroundState {
         self.maximum_closing_speed = 0.0;
         self.surface_twelve_height = 0.0;
         self.collision_flags &= 0x01ff_ffff;
+        self.part_audio_surfaces = [0; 3];
+        self.part_seam_patterns = [0; 3];
         self.overall_normal = UP;
         self.valid_wheel_normals.fill(true);
         let mut highest_y = -2.0;
@@ -238,6 +256,10 @@ impl BoardGroundState {
             }
             if i >= 4 {
                 surfaces[i] = surface; //82C081B4..81E0, last report wins.
+                // The same stores keep the audio material and seam bits of the tag.
+                let tag = u32::from(report.other_surface);
+                self.part_audio_surfaces[i - 4] = tag & 0x7f;
+                self.part_seam_patterns[i - 4] = (tag >> 12) & 0xf;
             }
             let contact = &mut self.parts[i];
             if !contact.in_contact || report.normal.y > contact.normal.y {

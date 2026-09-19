@@ -5,6 +5,8 @@
 //! ring, runs the installed voice and bus graphs, and submits the final six-channel Dac buffer.
 //! File access and codec decoding never occur in this owner.
 
+mod mixmap_host;
+
 use std::collections::HashMap;
 
 use crate::eval::interp;
@@ -160,6 +162,8 @@ struct AuthoredDevice {
     players: HashMap<u32, SourceState>, // SndPlayer1 -> decoder state
     live: HashMap<u32, u32>,            // voice -> player
     opened: u64,
+    /// Grain-player hook (`grain::host`): grain files, pending grain plays and the plug-in clock.
+    grains: crate::grain::host::GrainRuntime,
 }
 
 impl AuthoredRuntime {
@@ -231,6 +235,7 @@ impl AuthoredRuntime {
             players: HashMap::new(),
             live: HashMap::new(),
             opened: 0,
+            grains: crate::grain::host::GrainRuntime::default(),
         };
         device.initialize(&mut guest)?;
         Ok(Self {
@@ -355,6 +360,24 @@ impl AuthoredRuntime {
 
     pub fn stats(&self) -> RuntimeStats {
         self.owner.stats
+    }
+
+    /// Grain-player hook: the game-side grain API (`grain::host::Grains`) over this owner's guest,
+    /// device heap and decoded sources.
+    pub fn grains(&mut self) -> crate::grain::host::Grains<'_> {
+        let device = &mut self.owner.device;
+        crate::grain::host::Grains {
+            g: &mut self.guest,
+            heap: &mut device.heap,
+            sources: &mut device.sources,
+            runtime: &mut device.grains,
+            sp: STACK,
+        }
+    }
+
+    /// Grain-player hook: voice starts the grain players have made so far (drained).
+    pub fn take_grain_starts(&mut self) -> Vec<crate::grain::host::StartEvent> {
+        std::mem::take(&mut self.owner.device.grains.starts)
     }
 
     pub fn pump_once(&mut self) -> Result<Vec<f32>> {
@@ -659,14 +682,44 @@ impl play::PlayHost for AuthoredDevice {
         self.streams.attach(decoder, cached.source);
         Ok(true)
     }
-    fn decode(&mut self, _g: &mut Guest, _stream: u32, _index: u8, _detail: u32) -> Result<bool> {
+    fn decode(&mut self, g: &mut Guest, stream: u32, index: u8, detail: u32) -> Result<bool> {
+        // Grain-player hook: a grain play starts at its retail seek frame (`grain::host`).
+        if let Some(decoder) = self.players.get(&stream).map(|s| s.decoder) {
+            self.grains.seek(
+                g,
+                &mut self.streams,
+                stream,
+                index,
+                detail,
+                decoder,
+                STACK - 0x1000,
+            )?;
+        }
         Ok(true)
     }
 }
 
 impl commands::CommandHost for AuthoredDevice {
     fn play(&mut self, g: &mut Guest, record: u32) -> Result<u32> {
-        play::append_resident(g, self, record)
+        // Grain-player hook: grain graphs are built by the player, not opened through the voice
+        // device, so their SndPlayer1 gets its decoder here, as `open` gives bank voices theirs.
+        if let Some(stream) = self.grains.begin_play(g, record)? {
+            if !self.players.contains_key(&stream) {
+                let decoder = self.grains.take_decoder().ok_or_else(|| {
+                    Error::new(stream, "no spare decoder for a grain voice")
+                })?;
+                self.players.insert(
+                    stream,
+                    SourceState {
+                        decoder,
+                        loop_range: None,
+                    },
+                );
+            }
+        }
+        let result = play::append_resident(g, self, record);
+        self.grains.end_play();
+        result
     }
     fn stop_player(&mut self, g: &mut Guest, _heap: &mut dyn Heap, record: u32) -> Result<u32> {
         self.stop_graph(g, g.u32(record + 4)?)?;
@@ -750,6 +803,14 @@ impl worker::WorkerHost for Owner {
                 heap: &mut self.patch_heap,
                 device: &mut self.device,
             },
+        )?;
+        // Grain-player hook: retail phase 1 ticks scheduler bucket 0 (the grain plug-ins) before
+        // the command drain (`grain::host::tick_bucket_zero`).
+        crate::grain::host::tick_bucket_zero(
+            g,
+            &mut self.device.heap,
+            &mut self.device.grains,
+            STACK,
         )?;
         let mut heap = std::mem::take(&mut self.device.heap);
         let drained = commands::drain(g, &mut heap, &mut self.device, SYSTEM, STACK);

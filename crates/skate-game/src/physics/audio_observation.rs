@@ -5,6 +5,7 @@
 
 use bevy::prelude::*;
 use skate_core::math::Vector3;
+use skate_core::physics::{board::BodyId, board_ground::BoardGroundState, board_motion_output};
 
 use super::{GamePhysics, SkaterRuntime};
 
@@ -46,11 +47,95 @@ fn raw_vector(raw: [u32; 4]) -> [f32; 3] {
     [f32::from_bits(raw[0]), f32::from_bits(raw[1]), f32::from_bits(raw[2])]
 }
 
-/// The native PhysOut fields `sub_827A1B78` packs for the audio-state bridge `sub_824B0DA8`,
-/// read from the engine's published native records.
-fn retail_inputs(skater: &SkaterRuntime) -> crate::skate_audio::RetailAudioInputs {
+fn triple(raw: [u32; 4]) -> [f32; 3] {
+    raw_vector(raw)
+}
+
+fn lanes(value: Vector3) -> [f32; 3] {
+    [value.x, value.y, value.z]
+}
+
+/// `0x822F8C8C`, the deck scrape scale in `82C02A80`.
+const DECK_SCRAPE_SCALE: f32 = f32::from_bits(0x3AA3_D70A);
+
+/// PowerPC `fsel`: `a >= 0 ? b : c`, NaN selecting `c`.
+fn fsel(a: f32, b: f32, c: f32) -> f32 {
+    if a >= 0.0 { b } else { c }
+}
+
+/// Skateboard::FillPhysOut `82C02A80` Collision+20 (loc_82C034D8..loc_82C0356C): with deck
+/// contact (CollisionInfo+850), the length of the deck's contact relative velocity
+/// (CollisionInfo+640) after removing its component along the deck contact normal
+/// (CollisionInfo+192); 0 without deck contact.
+fn deck_slide_speed(ground: &BoardGroundState) -> f32 {
+    let deck = ground.parts[BodyId::Deck.index()];
+    if !deck.in_contact {
+        return 0.0;
+    }
+    let normal = deck.normal;
+    let velocity = deck.relative_velocity;
+    let along = board_motion_output::dot(normal, velocity);
+    board_motion_output::length(Vector3::new(
+        velocity.x - normal.x * along,
+        velocity.y - normal.y * along,
+        velocity.z - normal.z * along,
+    ))
+}
+
+/// Skateboard::FillPhysOut `82C02A80` Collision+24 (loc_82C03498..loc_82C034D8): with deck
+/// contact, clamp(|deck acceleration (CollisionInfo+528) · deck normal| × 0.00125, 0, 1).
+fn deck_scrape(ground: &BoardGroundState) -> f32 {
+    let deck = ground.parts[BodyId::Deck.index()];
+    if !deck.in_contact {
+        return 0.0;
+    }
+    let scaled = board_motion_output::dot(ground.accelerations[BodyId::Deck.index()], deck.normal)
+        .abs()
+        * DECK_SCRAPE_SCALE;
+    let positive = fsel(-scaled, 0.0, scaled);
+    fsel(1.0 - positive, positive, 1.0)
+}
+
+/// Air byte438, ProcessOutput `sub_82DB6EC0` (loc_82DB7620..764C): State+16 in 200..300
+/// (signed) and no wheel contact (Collision+0, already written by `82C02A80` earlier in the same
+/// ProcessOutput).
+fn in_known_air(state: u32, wheel_count: u32) -> bool {
+    (200..300).contains(&(state as i32)) && wheel_count == 0
+}
+
+/// PhysOutScoring2+152, `sub_82DAC498`: the EScorableID of the score packet's trick name
+/// (`sub_82DA5AC8`, a lookup the engine performs with `ScoringData::by_name`), only while the
+/// packet flags carry bit 24 or 25; otherwise, or when the name is not scorable, -1.
+/// ScoringTrick (`8258FA20`) is the writer that sets bit 24 together with this name slot.
+fn scorable_id(flags: u32, trick: Option<i32>) -> i32 {
+    if flags & 0x0300_0000 == 0 {
+        return -1;
+    }
+    trick.unwrap_or(-1)
+}
+
+/// The native PhysOut fields `sub_827A1B78` packs for the audio-state bridge `sub_824B0DA8`
+/// and the PhysOut audio conditioner `sub_82772748`, read from the engine's published native
+/// records.
+fn retail_inputs(
+    physics: &GamePhysics,
+    skater: &SkaterRuntime,
+) -> crate::skate_audio::RetailAudioInputs {
     let physical = &skater.player_input.physical;
+    let processed = &skater.player_input.processed;
+    let riding = &physics.riding;
+    let ground = &riding.ground;
+    let bodies = physics.board.bodies();
+    let deck = physics.board.part_transforms()[BodyId::Deck.index()];
+    let feet = &skater.foot_physical.output;
+    let score = &skater.animation.motion.score_packet;
+    let trick = score
+        .trick_names
+        .first
+        .and_then(|name| skater.scoring.data.by_name(name))
+        .map(|definition| definition.metadata.id as i32);
     crate::skate_audio::RetailAudioInputs {
+        dt: processed.timestep_2604,
         ground_speed: physical.skateboard.scalar_164,
         com_velocity: raw_vector(physical.reckoning.vector_16),
         position: raw_vector(physical.reckoning.vector_64),
@@ -65,6 +150,60 @@ fn retail_inputs(skater: &SkaterRuntime) -> crate::skate_audio::RetailAudioInput
             physical.air.footplant_right_450 != 0,
         ],
         footstep_strength: skater.animation_input.extra.footstep_strength,
+        state_category: physical.state.category_12,
+        state: physical.state.state_16,
+        filtered_state: physical.filtered_state_0,
+        in_known_air: in_known_air(physical.state.state_16, physical.collision.wheel_count_0),
+        grinding: physical.grinds.grinding_316 != 0,
+        grind_family: physical.grinds.words_136_140[0],
+        grind_audio_surface: physical.grinds.audio_surface_216,
+        grind_impact_speed: physical.grinds.impact_speed_128,
+        grind_flag_323: physical.grinds.flag_323 != 0,
+        air_440: processed.flags_2468 & (1 << 22) != 0,
+        jump_velocity_delta: triple(physical.air.jump_velocity_delta_112),
+        footplant_448: physical.air.flag_448 != 0,
+        footplant_surface: physical.air.footplant_surface_224,
+        offboard_surface: processed.left_surface_2596,
+        offboard_309: processed.flags_2480 & (1 << 18) != 0,
+        offboard_310: processed.flags_2480 & (1 << 8) != 0,
+        offboard_311: physical.off_board.flag_311 != 0,
+        skeleton_599: physical.skeleton.over_599 != 0,
+        feet_in_deck_box: [
+            physical.skeleton.flag_600 != 0,
+            physical.skeleton.flag_601 != 0,
+        ],
+        foot_local_velocity: feet.local_velocity.map(|v| [v[0], v[1], v[2]]),
+        foot_world_velocity: feet.world_velocity.map(|v| [v[0], v[1], v[2]]),
+        wheel_contacts: physical.collision.wheel_contact_3296_3299.map(|flag| flag != 0),
+        truck_contacts: [
+            ground.parts[BodyId::FrontTruck.index()].in_contact,
+            ground.parts[BodyId::BackTruck.index()].in_contact,
+        ],
+        deck_contact: physical.collision.flag_3475 != 0,
+        wheel_contact_normals: std::array::from_fn(|i| {
+            if ground.parts[i].in_contact {
+                lanes(ground.parts[i].normal)
+            } else {
+                [0.0; 3]
+            }
+        }),
+        wheel_audio_surfaces: riding.wheel_lines.audio_surfaces,
+        wheel_seam_patterns: riding.wheel_lines.seam_patterns,
+        part_audio_surfaces: ground.part_audio_surfaces,
+        deck_slide_speed: deck_slide_speed(ground),
+        deck_scrape: deck_scrape(ground),
+        angular_velocity: triple(physical.skateboard.vector_64),
+        linear_velocity: triple(physical.skateboard.vector_80),
+        deck_tilt: skater.ground.steering.deck_tilt,
+        motion_200: processed.scalar_2764,
+        wheel_velocities: std::array::from_fn(|i| lanes(bodies[i].rates.linear_velocity)),
+        deck_rows: deck.basis.columns,
+        effective_deck_up: riding.motion.effective_basis.columns[1],
+        wheel_positions: std::array::from_fn(|i| lanes(bodies[i].rates.position)),
+        ground_normal: triple(physical.ground.vector_80),
+        turn: skater.animation_input.fields.turn,
+        jump_strength: skater.animation_input.extra.jump_strength,
+        scorable_id: scorable_id(score.flags, trick),
     }
 }
 
@@ -156,7 +295,7 @@ pub(crate) fn publish(
         nollie: skater.animation.packet.weight_forwards,
         wheel_surface,
         events: output.events.clone(),
-        retail: retail_inputs(&skater),
+        retail: retail_inputs(&physics, &skater),
     };
     let powerslide_changed = cursor.last_powersliding != observation.powersliding;
     let trick_changed = cursor.last_trick_id != observation.trick_id;
@@ -223,5 +362,39 @@ mod tests {
         assert!(landing_state_edge(Some(200), 100));
         assert!(!landing_state_edge(Some(101), 100));
         assert!(!landing_state_edge(Some(201), 403));
+    }
+
+    #[test]
+    fn deck_slide_and_scrape_need_deck_contact() {
+        let mut ground = BoardGroundState::default();
+        let deck = BodyId::Deck.index();
+        ground.parts[deck].normal = Vector3::new(0.0, 1.0, 0.0);
+        ground.parts[deck].relative_velocity = Vector3::new(3.0, -7.0, 4.0);
+        ground.accelerations[deck] = Vector3::new(1.0, -400.0, 2.0);
+        assert_eq!(deck_slide_speed(&ground), 0.0);
+        assert_eq!(deck_scrape(&ground), 0.0);
+        ground.parts[deck].in_contact = true;
+        // Only the tangential part (3, 0, 4) counts.
+        assert!((deck_slide_speed(&ground) - 5.0).abs() < 1e-5);
+        assert_eq!(deck_scrape(&ground), 400.0 * DECK_SCRAPE_SCALE);
+        ground.accelerations[deck] = Vector3::new(0.0, 1000.0, 0.0);
+        assert_eq!(deck_scrape(&ground), 1.0);
+    }
+
+    #[test]
+    fn known_air_is_an_air_state_without_wheel_contact() {
+        assert!(in_known_air(200, 0));
+        assert!(in_known_air(299, 0));
+        assert!(!in_known_air(201, 1));
+        assert!(!in_known_air(300, 0));
+        assert!(!in_known_air(103, 0));
+    }
+
+    #[test]
+    fn scorable_id_needs_packet_flag_bit_24_or_25() {
+        assert_eq!(scorable_id(0, Some(96)), -1);
+        assert_eq!(scorable_id(0x0100_0000, Some(96)), 96);
+        assert_eq!(scorable_id(0x0200_0000, Some(96)), 96);
+        assert_eq!(scorable_id(0x0100_0000, None), -1);
     }
 }

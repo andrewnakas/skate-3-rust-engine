@@ -113,13 +113,20 @@ pub struct PlayerAudioObservation {
 }
 
 /// Raw native PhysOut fields for the retail audio-state bridge `sub_824B0DA8`, which copies them
-/// from the per-skater record `sub_827A1B78` builds. Transport only: the player-audio worker
-/// derives the audio-state bytes (edges, combinations) the way the bridge does.
+/// from the per-skater record `sub_827A1B78` builds, and for the PhysOut audio conditioner
+/// (`sub_82772748`, PhysOut bundle slot B+40) whose output that record also packs. Transport
+/// only: the player-audio worker runs the conditioner, the record packing and the bridge the way
+/// retail does (`player_audio/audio_state.rs`). Field docs name the native PhysOut slot and
+/// offset (B = `[[player+1808]]->vfunc92()`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RetailAudioInputs {
+    /// The physics step (Processed+2604). The bridge's `f1` (hold clock +312) is the audio frame
+    /// time; the engine runs the bridge once per physics observation.
+    pub dt: f32,
     /// SkateboardMotion+164, the board's ground speed in m/s (audio state +208).
     pub ground_speed: f32,
-    /// SystemReckoning+16, the COM velocity (audio state +96; its length is +212).
+    /// SystemReckoning+16, the COM velocity (audio state +96; its length is +212; its Y is the
+    /// conditioner's landing sample, `sub_82772B88`).
     pub com_velocity: [f32; 3],
     /// SystemReckoning+64, the skater position (audio state +48).
     pub position: [f32; 3],
@@ -139,11 +146,100 @@ pub struct RetailAudioInputs {
     pub footplant: [bool; 2],
     /// Interaction+0 `AudibleFootStepStrength` (audio state +796).
     pub footstep_strength: f32,
+
+    /// State+12 physical category (`physical.state.category_12`).
+    pub state_category: u32,
+    /// State+16 physical state id (`physical.state.state_16`).
+    pub state: u32,
+    /// Filtered+0 (`[B+64]+0`, `physical.filtered_state_0`); 7 = OffboardAir.
+    pub filtered_state: u32,
+    /// Air byte438, written by ProcessOutput `sub_82DB6EC0` (82DB7620..764C): `200 <= State+16 < 300 &&
+    /// Collision+0 == 0`. The board FillPhysOut `82C02A80` has already run in that
+    /// ProcessOutput, so this is the current tick's wheel count.
+    pub in_known_air: bool,
+    /// Grinds byte316 (`grinds.grinding_316`).
+    pub grinding: bool,
+    /// Grinds+136 physical grind family (`grinds.words_136_140[0]`).
+    pub grind_family: u32,
+    /// Grinds+216 grind audio material (`grinds.audio_surface_216`).
+    pub grind_audio_surface: u32,
+    /// Grinds+128 grind impact speed (`grinds.impact_speed_128`).
+    pub grind_impact_speed: f32,
+    /// Grinds byte323 (`grinds.flag_323`).
+    pub grind_flag_323: bool,
+    /// Air byte440 = Processed2468 bit 22 (ProcessOutput `sub_82DB6EC0`).
+    pub air_440: bool,
+    /// Air+112 jump velocity delta (`air.jump_velocity_delta_112`).
+    pub jump_velocity_delta: [f32; 3],
+    /// Air byte448 (`air.flag_448`): the foot materials come from Air+224 instead of OffBoard.
+    pub footplant_448: bool,
+    /// Air+224 footplant surface tag (`air.footplant_surface_224`).
+    pub footplant_surface: u32,
+    /// OffBoard+52 and +56. ProcessOutput `sub_82DB6EC0` stores Processed+2596 into both.
+    pub offboard_surface: u32,
+    /// OffBoard bytes 309 / 310: ProcessOutput `sub_82DB6EC0` stores Processed2480 bits 18
+    /// and 8.
+    pub offboard_309: bool,
+    pub offboard_310: bool,
+    /// OffBoard byte311, the board possession owner's held flag (`off_board.flag_311`).
+    pub offboard_311: bool,
+    /// Skeleton byte599 end of bail (`skeleton.over_599`).
+    pub skeleton_599: bool,
+    /// Skeleton bytes 600/601, feet inside the deck box (`82BF22A0`).
+    pub feet_in_deck_box: [bool; 2],
+    /// Skeleton+192 / +208: local toe velocities (`82BF22A0`, `foot_physical.output`).
+    pub foot_local_velocity: [[f32; 3]; 2],
+    /// Skeleton+224 / +240: world foot velocities (`82BF22A0`).
+    pub foot_world_velocity: [[f32; 3]; 2],
+    /// Collision bytes 3296..3299: per-wheel contact (`82C02A80` from CollisionInfo+844).
+    pub wheel_contacts: [bool; 4],
+    /// Collision bytes 3473 / 3474: front / back truck contact (CollisionInfo+848/+849).
+    pub truck_contacts: [bool; 2],
+    /// Collision byte3475: deck contact (CollisionInfo+850).
+    pub deck_contact: bool,
+    /// Collision+3376+16i: the wheel's contact normal, zero when the wheel is not in contact
+    /// (`82C02A80`, loc_82C02D9C..2DA8 for wheel 0).
+    pub wheel_contact_normals: [[f32; 3]; 4],
+    /// Collision+3440+4i: wheel audio material, `tag & 0x7F` (0 = no hit).
+    pub wheel_audio_surfaces: [u32; 4],
+    /// Collision+3456+4i: wheel seam pattern, `(tag >> 12) & 0xF`.
+    pub wheel_seam_patterns: [u32; 4],
+    /// Collision+4/+8/+12: front truck / back truck / deck audio material (0 = no report).
+    pub part_audio_surfaces: [u32; 3],
+    /// Collision+20: deck slide speed (`82C02A80` 82C034E8..3570).
+    pub deck_slide_speed: f32,
+    /// Collision+24: deck scrape (`82C02A80` 82C03478..34D8).
+    pub deck_scrape: f32,
+    /// SkateboardMotion+64 / +80: deck angular / linear velocity.
+    pub angular_velocity: [f32; 3],
+    pub linear_velocity: [f32; 3],
+    /// SkateboardMotion+184 = SkateboardBody+256, the filtered signed deck tilt.
+    pub deck_tilt: f32,
+    /// SkateboardMotion+200 = Processed+2764.
+    pub motion_200: f32,
+    /// SkateboardMotion+208+16i: wheel body linear velocities.
+    pub wheel_velocities: [[f32; 3]; 4],
+    /// PhysOut slot B+0, +0/+16/+32: rows of the deck part transform (`82585CB0`, part 6).
+    pub deck_rows: [[f32; 3]; 3],
+    /// PhysOut slot B+0, +80: row 1 of the effective deck transform (`82C01BF8`).
+    pub effective_deck_up: [f32; 3],
+    /// PhysOut slot B+0, +208+16i: wheel body positions (audio state +384+16i).
+    pub wheel_positions: [[f32; 3]; 4],
+    /// Ground+80: the wheel-contact normal (`ground.vector_80`).
+    pub ground_normal: [f32; 3],
+    /// Ground+264 = Processed+2676, the turn attribute.
+    pub turn: f32,
+    /// Ground+300 = Processed+2624, the jump strength attribute.
+    pub jump_strength: f32,
+    /// PhysOutScoring2 (B+60)+152: the EScorableID `sub_82DAC498` looks up (`sub_82DA5AC8`)
+    /// while the score packet carries flag bit 24 or 25, else -1.
+    pub scorable_id: i32,
 }
 
 impl Default for RetailAudioInputs {
     fn default() -> Self {
         Self {
+            dt: 0.0,
             ground_speed: 0.0,
             com_velocity: [0.0; 3],
             position: [0.0; 3],
@@ -155,6 +251,48 @@ impl Default for RetailAudioInputs {
             offboard_feet: [false; 2],
             footplant: [false; 2],
             footstep_strength: 0.0,
+            state_category: 0,
+            state: 0,
+            filtered_state: 0,
+            in_known_air: false,
+            grinding: false,
+            grind_family: u32::MAX,
+            grind_audio_surface: 0,
+            grind_impact_speed: 0.0,
+            grind_flag_323: false,
+            air_440: false,
+            jump_velocity_delta: [0.0; 3],
+            footplant_448: false,
+            footplant_surface: 0,
+            offboard_surface: 0,
+            offboard_309: false,
+            offboard_310: false,
+            offboard_311: false,
+            skeleton_599: false,
+            feet_in_deck_box: [false; 2],
+            foot_local_velocity: [[0.0; 3]; 2],
+            foot_world_velocity: [[0.0; 3]; 2],
+            wheel_contacts: [false; 4],
+            truck_contacts: [false; 2],
+            deck_contact: false,
+            wheel_contact_normals: [[0.0; 3]; 4],
+            wheel_audio_surfaces: [0; 4],
+            wheel_seam_patterns: [0; 4],
+            part_audio_surfaces: [0; 3],
+            deck_slide_speed: 0.0,
+            deck_scrape: 0.0,
+            angular_velocity: [0.0; 3],
+            linear_velocity: [0.0; 3],
+            deck_tilt: 0.0,
+            motion_200: 0.0,
+            wheel_velocities: [[0.0; 3]; 4],
+            deck_rows: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            effective_deck_up: [0.0, 1.0, 0.0],
+            wheel_positions: [[0.0; 3]; 4],
+            ground_normal: [0.0, 1.0, 0.0],
+            turn: 0.0,
+            jump_strength: 0.0,
+            scorable_id: -1,
         }
     }
 }

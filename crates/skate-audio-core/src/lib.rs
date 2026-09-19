@@ -447,3 +447,13 @@ pub mod worker;
 /// Single-owner authored bank evaluator, voice graphs, decoded streams and Dac output.
 #[cfg(target_arch = "x86_64")]
 pub mod authored;
+
+/// Retail board rolling: the grain player over `grains.big`, its seek reader and the board math.
+#[cfg(target_arch = "x86_64")]
+pub mod grain;
+
+/// The retail MixMap mixer: controller inputs → every gain/pitch/filter output word.
+///
+/// Gated with the float modules: its evaluation holds the guest flush mode through [`vmx::Fpscr`].
+#[cfg(target_arch = "x86_64")]
+pub mod mixmap;
