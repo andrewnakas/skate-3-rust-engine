@@ -58,6 +58,8 @@ pub(crate) struct PlayerSound {
     contacts_controller: u32,
     contacts: inputs::Contacts,
     jitter: inputs::Jitter,
+    music: inputs::MusicEmphasis,
+    music_controller: u32,
     listener: inputs::Listener,
     positions: [(u32, inputs::ObjPos); 2],
     entries: Vec<Entry>,
@@ -102,6 +104,8 @@ impl PlayerSound {
             contacts_controller: controller(runtime, CONTACTS_CONTROLLER, "Contacts")?,
             contacts: inputs::Contacts::default(),
             jitter: inputs::Jitter::retail(),
+            music: inputs::MusicEmphasis::default(),
+            music_controller: controller(runtime, 0x4000_0010, "Music")?,
             listener: inputs::Listener::default(),
             positions: [
                 (
@@ -244,6 +248,14 @@ impl PlayerSound {
             local_player: true,
         });
         set(runtime, self.contacts_controller, &contacts)?;
+        // The combo multiplier: `sub_827A2E88`'s tier flags, then the Music process
+        // (`sub_824D1208`) — id 3 while x3, id 6 slewed toward the tier's emphasis. Every player
+        // controller reads these; x3 lifts e.g. the board grain chain's level 1267 -> 28343.
+        // `sub_824898C8`'s non-free-skate mode terms are false here.
+        let flags = inputs::multiplier_flags(Some(observation.retail.combo_multiplier));
+        self.audio.multiplier_flags_2f0d0 = flags;
+        let music = self.music.process(flags, false, FRAME_SECONDS);
+        set(runtime, self.music_controller, &music)?;
         // Jitter (`sub_824EF378`): 24 random-walk channels drawn from the shared retail generator.
         runtime
             .mixmap_jitter_tick(&mut self.jitter)

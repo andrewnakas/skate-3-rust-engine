@@ -543,6 +543,9 @@ pub(crate) struct AudioState {
     /// +680: the listener-facing factor `sub_824B2088` writes alongside state controller input 3
     /// (camera/listener direction against the deck). Set by the worker, which owns the camera.
     pub listener_facing_680: f32,
+    /// The frame record's multiplier tier flags (`*(0x83083C38)+0x2F0D0`, bits 0x2000 x3 /
+    /// 0x4000 x2 / 0x8000 x1.5, `sub_827A2E88`), read by Flips w12 and the Music controller.
+    pub multiplier_flags_2f0d0: u32,
     /// +268 / +272: |local toe velocity Y| of foot 1 / foot 0 (record +292 / +288 =
     /// |Skeleton+212| / |Skeleton+196|, `82BF22A0`).
     pub toe_local_speed_y_268: f32,
@@ -1012,6 +1015,7 @@ impl AudioState {
             air_jump_height_260: w.float(260),
             deck_tilt_264: w.float(264),
             listener_facing_680: w.float(680),
+            multiplier_flags_2f0d0: 0,
             toe_local_speed_y_268: w.float(268),
             toe_local_speed_y_272: w.float(272),
             toe_local_speed_xz_276: w.float(276),

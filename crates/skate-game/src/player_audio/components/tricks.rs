@@ -386,6 +386,7 @@ impl Tricks {
         }
         self.countdown_68 = if self.countdown_68 > 0.0 { self.countdown_68 - dt } else { 0.0 };
         self.prev_id_48 = id;
+        self.emphasis.flags_2f0d0 = audio.multiplier_flags_2f0d0;
         let target = emphasis_target(&self.tuning, self.emphasis);
         self.slew_72 = emphasis_slew(self.slew_72, target, &self.tuning, dt);
         events

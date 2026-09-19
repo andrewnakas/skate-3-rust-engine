@@ -15,6 +15,7 @@
 //! | `40010090` OffBoard | `sub_824E9270` (id 0) | [`off_board_input`] |
 //! | `400100A0` HandGrabs | `sub_824EC3E0` (id 0) | [`hand_grabs_input`] |
 //! | `40010000` SkateBoard | `sub_824C5CA8` (0, 6), `sub_824C6198` (4), `sub_824CA738` (2, 3), `sub_824C7438` (1) | ported in `skate-game`'s `components/board.rs`, not here |
+//! | `40000010` Music ids 3, 6 | `sub_824D1208` over the frame record's multiplier bits (`sub_827A2E88`) | [`multiplier_flags`], [`MusicEmphasis`] |
 //! | globals | see [`FREE_SKATE_GLOBALS`] | values only |
 //!
 //! Float work mirrors the lifted forms: scalar `fmuls`/`fsel`/`fctiwz` through [`crate::fp`] under
@@ -646,35 +647,155 @@ pub fn hand_grabs_input(grab_36: bool) -> (u32, u32) {
     (0, if grab_36 { 32767 } else { 0 })
 }
 
+// ---------------------------------------------------------------------- the combo multiplier
+
+/// The multiplier tier bits of the audio frame record's flags word (`*(0x83083C38) + 0x2F0D0`,
+/// the record at `+0x2F0B0` word `+32`): exactly one is set while the local player's combo
+/// multiplier is at least 1.5.
+pub const MULTIPLIER_X1_5: u32 = 0x8000;
+pub const MULTIPLIER_X2: u32 = 0x4000;
+pub const MULTIPLIER_X3: u32 = 0x2000;
+
+/// `0x82063B08` (3.0), `0x82060C50` (2.0), `0x822249B4` (1.5): the tier thresholds.
+const TIER_X3: u32 = 0x4040_0000;
+const TIER_X2: u32 = 0x4000_0000;
+const TIER_X1_5: u32 = 0x3FC0_0000;
+
+/// `sub_827A2E88` (the audio frame record builder, run for the local player by `sub_827A11B0`):
+/// clear bits `0xE000` of the record's `+32`, then — when the player's score object exists —
+/// read the multiplier the score module publishes (`[record+60]+56`, stored by `sub_82DA4238`
+/// from the combo timer's `+32` at module `+44`: the engine's `Session::combo.multiplier`) and set
+///
+/// ```text
+/// fcmpu m, 3.0 ; blt → ori 0x2000
+/// fcmpu m, 2.0 ; blt → ori 0x4000
+/// fcmpu m, 1.5 ; blt → ori 0x8000
+/// ```
+///
+/// (a NaN sets `0x2000`, as the unordered compare falls through). Returns the three bits only;
+/// the builder's other `+32` bits (`0x1000`, `0x800`, `0x400`, `0x200`, the top five) feed no
+/// player-audio reader.
+pub fn multiplier_flags(multiplier: Option<f32>) -> u32 {
+    let Some(m) = multiplier else { return 0 };
+    if !(m < f(TIER_X3)) {
+        MULTIPLIER_X3
+    } else if !(m < f(TIER_X2)) {
+        MULTIPLIER_X2
+    } else if !(m < f(TIER_X1_5)) {
+        MULTIPLIER_X1_5
+    } else {
+        0
+    }
+}
+
+/// `sub_824898C8(sys)`: the "x3" predicate the Music and Tricks writers test first — flag
+/// `0x2000`, or `mode_terms` = (`[0x830CFDC4]+932` byte and the byte at `+476`) or game mode
+/// `+1060 == 8`. `mode_terms` is false in free skate (the capture's Music id 3 is 0 whenever the
+/// Flips emphasis is below the x3 target).
+pub fn multiplier_x3(flags: u32, mode_terms: bool) -> bool {
+    flags & MULTIPLIER_X3 != 0 || mode_terms
+}
+
+/// Music (`40000010`) id 6's targets, the tuning record `C1831BDB6CB1B1EA`/`47EC76B4F9FC79F6`
+/// (the one the Flips emphasis also reads): `6EE4718F1A7EB772` = 5000 (flag `0x8000`),
+/// `50F6520E2DD3D54C` = 12000 (`0x4000`), `A6AA0C534DEA29E7` = 32767 (`0x2000` or x3).
+pub const MUSIC_EMPHASIS_TARGETS: [i32; 3] = [5000, 12000, 32767];
+/// Its slew rates per second: down `7C44AE016D99A9EE` (9000.0), up `1666A4A45EC309AE` (3000.0).
+pub const MUSIC_EMPHASIS_DOWN: u32 = 0x460C_A000;
+pub const MUSIC_EMPHASIS_UP: u32 = 0x453B_8000;
+
+/// The multiplier half of SFXObj_Music's process `sub_824D1208(this, dt)` (vtable `0x822FC4A0`
+/// slot 9, first half): id 3 = 32767 while [`multiplier_x3`], and id 6 = the component's `+176`
+/// slewed toward the tier's [`MUSIC_EMPHASIS_TARGETS`] entry (0 below x1.5). The process's other
+/// ids (0, 1, 2, 4, 5, 7, 8, 9) come from the music player and game state and are not here.
+///
+/// The emphasis is not music: the local player's SkateBoard (ids 21, 22 — the board grain
+/// chain's local levels), Wheels (4), Rail (6), Contacts (1) and Tricks (6, 7, 8) outputs all
+/// read Music ids 3 and 6. With the other inputs at their free-skate values, SkateBoard 21/22 go
+/// 1267/1835 (x1) → 1287/1865 (x1.5) → 1969/2853 (x2, the capture's values at the x2 plateau) →
+/// 28343/32730 (x3), Wheels 4 goes 3046 → 3183 → 7436 → 32730 and Rail 6 1636 → 1649 → 2129 →
+/// 20580.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MusicEmphasis {
+    /// Component `+176`: the slewed id-6 value (unclamped; the write clamps to 0..=32767).
+    pub value_176: i32,
+}
+
+impl MusicEmphasis {
+    /// One process call. `flags` from [`multiplier_flags`]; `mode_terms` as in
+    /// [`multiplier_x3`]; `dt` the frame time the process gets. Returns ids 3 and 6 in write
+    /// order.
+    pub fn process(&mut self, flags: u32, mode_terms: bool, dt: f32) -> [(u32, u32); 2] {
+        let mut fpscr = Fpscr::capture();
+        fpscr.disable_flush_mode_unconditional();
+        let x3 = multiplier_x3(flags, mode_terms);
+        let id3 = if x3 { 32767 } else { 0 };
+        // `fcmpu dt, 0.0 ; ble` skips the slew with r31 = 0 (also for a NaN dt).
+        let mut next = 0;
+        if dt > 0.0 {
+            let target = if x3 {
+                MUSIC_EMPHASIS_TARGETS[2]
+            } else if flags & MULTIPLIER_X1_5 != 0 {
+                MUSIC_EMPHASIS_TARGETS[0]
+            } else if flags & MULTIPLIER_X2 != 0 {
+                MUSIC_EMPHASIS_TARGETS[1]
+            } else {
+                0
+            };
+            // r30 = fctiwz(down × dt), r10 = fctiwz(dt × up).
+            let down = fctiwz_low_word(mul_single(f64::from(f(MUSIC_EMPHASIS_DOWN)), f64::from(dt))) as i32;
+            let up = fctiwz_low_word(mul_single(f64::from(dt), f64::from(f(MUSIC_EMPHASIS_UP)))) as i32;
+            let current = self.value_176;
+            next = target;
+            if target < current {
+                if current.wrapping_sub(target) > down {
+                    next = current.wrapping_sub(down);
+                }
+            } else if target > current && target.wrapping_sub(current) > up {
+                next = current.wrapping_add(up);
+            }
+        }
+        self.value_176 = next;
+        [(3, id3), (6, next.clamp(0, 32767) as u32)]
+    }
+}
+
 // ---------------------------------------------------------------------- globals
 
-/// The global controllers' inputs during free-skate gameplay, from the capture (evaluations
-/// 2709–21253, the modal value; `varies` marks words that change with game state and are not
-/// constants). Each class's writer is its vtable slot 9 process.
+/// The global controllers' inputs in the capture after the game started (evaluations 2709–21253,
+/// 18545 evaluations): every input id that is ever non-zero, with its non-zero count, its number
+/// of changes and its modal value. Real ids are 0–15 (key & 0xF); the capture's input words
+/// 16–23 belong to the next controller's block. Each class's writer is its vtable slot 9 process.
 ///
-/// | key | class (writer) | nonzero inputs in free-skate |
-/// |---|---|---|
-/// | `40000000` | Announcer | none |
-/// | `40000010` | Music (`sub_824D1208`) | 1, 2, 5 = 32767; 0, 6 vary (music playback); 3 mostly 0 |
-/// | `40000020` | Master (`sub_824D5160`) | 1–4 = 32767; 9, 10 briefly 32767 (16/60 changes) |
-/// | `40000030` | CameraMan | none |
-/// | `40000050` | Reverb (`sub_824DF468`) | 5 = 32767 most of the time; 4, 6 occasionally |
-/// | `40000060` | NIS (`sub_824E1230`) | 9 briefly |
-/// | `40000070` | Pause (`sub_824E1D00`) | none in play |
-/// | `40000080` | Speech (`sub_824E2050`) | 1, 4 briefly |
-/// | `40000090` | Bloom | none |
-/// | `400000A0` | VU (`sub_824EDBE8`) | 0 varies (a level) |
-/// | `400000B0`–`400000D0` | Challenge, HOM, Menu | none |
-/// | `400000E0` | Jitter (`sub_824EF378`, generators `sub_824EF4C8`, vault in `sub_824EF0B8`) | 0–4 random every frame |
-/// | `400D0000…` | PlayerSpeech | none (group 1 id 0 briefly) |
+/// | key | class (writer) | non-zero ids: count / changes / mode | free-skate handling |
+/// |---|---|---|---|
+/// | `40000000` | Announcer | none | — |
+/// | `40000010` | Music (`sub_824D1208`) | 0: 1966/1413/0 · 1: 16579/8/32767 · 2: 18545/0/32767 · 3: 1296/6/0 · 5: 13531/3/32767 · 6: 6305/3499/0 | 3, 6 = [`MusicEmphasis`] (the combo multiplier); 1, 2, 5 constant; 0 = [`FREE_SKATE_MUSIC_VU`] |
+/// | `40000020` | Master (`sub_824D5160`) | 1–4: always 32767 · 9: 523/16/0 · 10: 3176/60/0 | 1–4 constant; 9, 10 (voice activity, no player reader) left 0 |
+/// | `40000030` | CameraMan | none | — |
+/// | `40000050` | Reverb (`sub_824DF468`) | 4: 198/6/0 · 5: 12571/18/32767 · 6: 5776/12/0 | 5 = 32767 (mode); 4 and 6 follow the frame record's `+16` reverb key (`sub_824DE548`; set by `sub_827A2E88` from the world region lookup `sub_82C0EAC0` type 10 at the player's position) — not ported |
+/// | `40000060` | NIS (`sub_824E1230`) | 9: 579/6/0 | 0 (id 9 = `sub_82487ED0`: game-flow state `[0x830CFDC4]+1196` = 7, or 3 with a sub-state; not free skate) |
+/// | `40000070` | Pause (`sub_824E1D00`) | 0: 3949/2/0 (one pause) · 2: 4/6/0 | 0 |
+/// | `40000080` | Speech (`sub_824E2050`) | 1: 61/2/0 · 4: 372/10/0 | 0 |
+/// | `40000090` | Bloom | none | — |
+/// | `400000A0` | VU (`sub_824EDBE8`) | 0: 17476/9504/32767 | [`FREE_SKATE_MUSIC_VU`] |
+/// | `400000B0`–`400000D0` | Challenge, HOM, Menu | none | — |
+/// | `400000E0` | Jitter (`sub_824EF378`, generators `sub_824EF4C8`, vault in `sub_824EF0B8`) | 0–4 random every frame | [`Jitter`] |
+/// | `400D0000…` | PlayerSpeech | group 1 id 0: 310/8/0 · group 2 id 0: 61/2/0 | 0 |
 ///
-/// **Music and VU on the player's path.** The SkateBoard's outputs read Music ids 3 and 6 and VU
-/// ids 0 and 1. Retail's values come from music playback: `sub_824D1208` writes Music's ids from
-/// the music player's state (id 0 and 6 change with the track, 1399 and 3487 changes in the
-/// session), and `sub_824EDBE8` writes VU id 0 as a slew-limited level of the audio system's
+/// The player controllers (`40010000`–`40010090`) read, of the globals: Announcer 0, Music 3, 5,
+/// 6, Master 0–6 and 8, CameraMan 0, Reverb 0 and 4, NIS 0–2, 4, 5, 7–10, 13, Pause 0–2, Speech 1,
+/// Bloom 0, VU 0–1, Challenge 1, 4–9, 11, HOM 0, 2–4, Menu 8 and Jitter 0–3 — not Master 9/10 or
+/// Reverb 5/6. Of the ids that vary in the capture, Music 3/6, Reverb 4, VU 0, NIS 9, Pause 0 and
+/// Speech 1 reach them: NIS 9 and Pause 0 are menu/pause states; Reverb 4 (the world's reverb
+/// zone), VU 0 (the output meters) and Speech 1 (61 evaluations, writer not traced) are not ported.
+///
+/// **Music on the player's path.** Music ids 3 and 6 are the combo multiplier, ported as
+/// [`MusicEmphasis`] (see [`multiplier_flags`]). Id 0 is music playback (the music player's
+/// state), and `sub_824EDBE8` writes VU id 0 as a slew-limited level of the audio system's
 /// output meters (`[sys+28]+4 → +16`, five channel levels summed, × 0.2 (the double at
 /// `0x822F8B00`) × a vault gain from the tuning holder's `+100` instance, ×32767). With no retail
-/// music playing, use [`FREE_SKATE_MUSIC_VU`] — the session's most frequent values, **not a
+/// music playing, those use [`FREE_SKATE_MUSIC_VU`] — the session's most frequent values, **not a
 /// derived state**.
 ///
 /// **The state controller's id 11 (G+16).** Its writer was not found: G is
@@ -694,14 +815,13 @@ pub const FREE_SKATE_GLOBALS: &[(u32, u32, u32)] = &[
     (0x4000_0050, 5, 32767),
 ];
 
-/// Music (`40000010`) ids 0, 3, 6 and VU (`400000A0`) ids 0, 1 at their most frequent free-skate
-/// values in the capture (Music 0 in 89%, 3 in 93%, 6 in 66% of evaluations; VU 1 always 0; VU 0
-/// has no dominant value — 32767 in 24%, the rest spread over a level, so its entry is only the
-/// most frequent). A labelled default for a runtime without retail music, not a retail rule.
+/// Music (`40000010`) id 0 and VU (`400000A0`) ids 0, 1 at their most frequent free-skate values
+/// in the capture (Music 0 in 89% of evaluations; VU 1 always 0; VU 0 has no dominant value —
+/// 32767 in 24% of evaluations, the rest spread over a level, so its entry is only the most
+/// frequent). A labelled default for a runtime without retail music, not a retail rule. Music ids
+/// 3 and 6 are not here: [`MusicEmphasis`] writes them every frame.
 pub const FREE_SKATE_MUSIC_VU: &[(u32, u32, u32)] = &[
     (0x4000_0010, 0, 0),
-    (0x4000_0010, 3, 0),
-    (0x4000_0010, 6, 0),
     (0x4000_00A0, 0, 32767),
     (0x4000_00A0, 1, 0),
 ];

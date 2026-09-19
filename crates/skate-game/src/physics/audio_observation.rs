@@ -255,6 +255,7 @@ fn retail_inputs(
         }),
         deck_position: lanes(bodies[BodyId::Deck.index()].rates.position),
         deck_forward: riding.motion.effective_basis.columns[2],
+        combo_multiplier: skater.scoring.session.combo.multiplier,
         ground_normal: triple(physical.ground.vector_80),
         turn: skater.animation_input.fields.turn,
         jump_strength: skater.animation_input.extra.jump_strength,

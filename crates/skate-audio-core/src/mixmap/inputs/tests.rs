@@ -143,6 +143,9 @@ fn the_constants_are_the_images() {
     assert_eq!(read(0x822F_8904), INV_TWO_PI);
     assert_eq!(read(0x8216_DEE0), MINUS_ONE_BITS);
     assert_eq!(read(0x822F_B840), ACOS_ONE_PLUS);
+    assert_eq!(read(0x8206_3B08), TIER_X3);
+    assert_eq!(read(0x8206_0C50), TIER_X2);
+    assert_eq!(read(0x8222_49B4), TIER_X1_5);
     for (base, table) in [(0x822F_9820u32, ACOS_A), (0x822F_9830, ACOS_B), (0x822F_9840, ACOS_C), (0x822F_9850, ACOS_D)] {
         for (i, &w) in table.iter().enumerate() {
             assert_eq!(read(base + 4 * i as u32), w, "{base:#x}+{}", 4 * i);
@@ -329,4 +332,121 @@ fn the_listener_update_takes_camera_rows_and_the_first_record() {
     let (a, b) = rec.emitters();
     assert_eq!(a.position_32, Some(rec.position_0));
     assert_eq!(b.velocity_36, Some(rec.velocity_80));
+}
+
+#[test]
+fn multiplier_tiers_follow_the_published_multiplier() {
+    assert_eq!(multiplier_flags(None), 0, "no score object: all tier bits clear");
+    let cases = [(1.0, 0), (1.49, 0), (1.5, MULTIPLIER_X1_5), (1.99, MULTIPLIER_X1_5), (2.0, MULTIPLIER_X2), (2.5, MULTIPLIER_X2), (3.0, MULTIPLIER_X3), (4.0, MULTIPLIER_X3)];
+    for (m, want) in cases {
+        assert_eq!(multiplier_flags(Some(m)), want, "{m}");
+    }
+    assert_eq!(multiplier_flags(Some(f32::NAN)), MULTIPLIER_X3, "unordered compares fall through");
+    assert!(multiplier_x3(MULTIPLIER_X3, false));
+    assert!(!multiplier_x3(MULTIPLIER_X2, false));
+    assert!(multiplier_x3(0, true));
+}
+
+#[test]
+fn music_emphasis_slews_at_the_vault_rates() {
+    let dt = 1.0 / 60.0;
+    let mut m = MusicEmphasis::default();
+    // Up at fctiwz(3000 × 1/60) = 50 per frame toward the tier's target.
+    assert_eq!(m.process(MULTIPLIER_X2, false, dt), [(3, 0), (6, 50)]);
+    for _ in 0..300 {
+        m.process(MULTIPLIER_X2, false, dt);
+    }
+    assert_eq!(m.value_176, 12000);
+    // x3 raises id 3 at once and keeps slewing id 6.
+    assert_eq!(m.process(MULTIPLIER_X3, false, dt), [(3, 32767), (6, 12050)]);
+    // Down at fctiwz(9000 × 1/60) = 150 per frame, landing on the target.
+    m.value_176 = 5100;
+    assert_eq!(m.process(MULTIPLIER_X1_5, false, dt), [(3, 0), (6, 5000)]);
+    m.value_176 = 5200;
+    assert_eq!(m.process(0, false, dt)[1], (6, 5050));
+    // dt ≤ 0 (or NaN) zeroes the slew.
+    assert_eq!(m.process(MULTIPLIER_X3, false, 0.0), [(3, 32767), (6, 0)]);
+    m.value_176 = 700;
+    m.process(0, false, f32::NAN);
+    assert_eq!(m.value_176, 0);
+}
+
+#[test]
+fn music_emphasis_tuning_is_the_vaults() {
+    let path = std::env::var("SKATE3_ASSETS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets"))
+        .join("private/stock/skater-collections.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("skipped: no vault at {}", path.display());
+        return;
+    };
+    let start = text.find("\"key\": \"Hash_47EC76B4F9FC79F6\"").expect("tuning record");
+    let record = &text[start..start + text[start..].find("\"source\"").unwrap()];
+    assert!(text[..start].ends_with("{\"class\": \"Hash_C1831BDB6CB1B1EA\", "));
+    let field = |hash: &str| -> u32 {
+        let at = record.find(&format!("\"Hash_{hash}\"")).unwrap_or_else(|| panic!("{hash}"));
+        let data = &record[at..];
+        let d = data.find("\"data\": \"").unwrap() + 9;
+        u32::from_str_radix(&data[d..d + 8], 16).unwrap()
+    };
+    assert_eq!(field("6EE4718F1A7EB772") as i32, MUSIC_EMPHASIS_TARGETS[0]);
+    assert_eq!(field("50F6520E2DD3D54C") as i32, MUSIC_EMPHASIS_TARGETS[1]);
+    assert_eq!(field("A6AA0C534DEA29E7") as i32, MUSIC_EMPHASIS_TARGETS[2]);
+    assert_eq!(field("7C44AE016D99A9EE"), MUSIC_EMPHASIS_DOWN);
+    assert_eq!(field("1666A4A45EC309AE"), MUSIC_EMPHASIS_UP);
+}
+
+/// The Flips emphasis (`sub_824CD170`, packet w12: 250/700/1000 for flags 0x8000/0x4000/0x2000)
+/// and Music ids 3/6 read the same flags word: wherever both sit on a target in the capture they
+/// name the same tier, and SkateBoard ids 21/22 take one pair of values per tier.
+#[test]
+fn music_emphasis_tiers_match_the_flips_emphasis_in_the_capture() {
+    let Some(dir) = extract() else { return };
+    let music = inputs(&dir, "4A26A840");
+    let flips = std::fs::read_to_string(dir.join("updates/Class_Flips.tsv")).unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in flips.lines() {
+        let frame: u32 = line.split('\t').next().unwrap().parse().unwrap();
+        let words: Vec<u32> = line.split('|').nth(1).unwrap().split_whitespace().map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
+        let Some(m) = music.get(&frame) else { continue };
+        let tier = |w12: u32, id6: u32| match (w12, id6) {
+            (0, 0) => Some(0),
+            (250, 5000) => Some(MULTIPLIER_X1_5),
+            (700, 12000) => Some(MULTIPLIER_X2),
+            (1000, 32767) => Some(MULTIPLIER_X3),
+            _ => None,
+        };
+        let plateau = [0, 250, 700, 1000].contains(&words[12]) && [0, 5000, 12000, 32767].contains(&m[6]);
+        if plateau {
+            let flags = tier(words[12], m[6]).unwrap_or_else(|| panic!("frame {frame}: w12 {} vs id6 {}", words[12], m[6]));
+            assert_eq!(m[3], if multiplier_x3(flags, false) { 32767 } else { 0 }, "frame {frame}");
+            seen.insert(flags);
+        }
+        if words[12] == 1000 {
+            assert_eq!(m[3], 32767, "frame {frame}: the x3 emphasis raises Music id 3");
+        }
+    }
+    assert_eq!(seen.len(), 4, "every tier appears: {seen:?}");
+
+    // SkateBoard 21/22 per Music (3, 6) plateau.
+    let text = std::fs::read_to_string(dir.join("mixmap/4A26A8A0.tsv")).unwrap();
+    let mut pairs = std::collections::BTreeMap::<(u32, u32), std::collections::BTreeMap<(u32, u32), u32>>::new();
+    for line in text.lines() {
+        let frame: u32 = line.split('\t').next().unwrap().parse().unwrap();
+        let Some(m) = music.get(&frame) else { continue };
+        if ![0, 5000, 12000, 32767].contains(&m[6]) {
+            continue;
+        }
+        let outs: Vec<u32> = line.split('|').nth(3).unwrap().split_whitespace().map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
+        let (id21, id22) = (outs[10] >> 16, outs[11] & 0xFFFF);
+        if id21 != 0 {
+            *pairs.entry((m[3], m[6])).or_default().entry((id21, id22)).or_default() += 1;
+        }
+    }
+    let modal = |k: (u32, u32)| pairs[&k].iter().max_by_key(|(_, n)| **n).map(|(v, _)| *v).unwrap();
+    assert_eq!(modal((0, 0)), (1267, 1835));
+    assert_eq!(modal((0, 5000)), (1287, 1865));
+    assert_eq!(modal((0, 12000)), (1969, 2853));
+    assert_eq!(modal((32767, 32767)), (28343, 32730));
 }
