@@ -9,9 +9,11 @@
 //! | Holder slot | Class | Key | Reader |
 //! |---|---|---|---|
 //! | +24 | `C26949FCB638A2CA` | `default` (`D7EDBD362D7D2152`) | `sub_8279C948` |
+//! | +36 | `6EBA5BCD3E38A98A` | `default` | holder |
 //! | +84 | `C1831BDB6CB1B1EA` | `BA9837A6CF4C26ED` | holder |
 //! | +92 | `C1831BDB6CB1B1EA` | `1ABD2984D7248589` | holder |
 //! | +136 | `A867FBE3454326FF` | `default` | holder |
+//! | +268 | `physics_collision` | `default` | holder (layout +164 read by `sub_82BD60C8`) |
 //!
 //! A missing field is an error, never a default: retail's fallback (`0x820D0850`) is not tuning.
 
@@ -24,6 +26,9 @@ use skate_data::collections::{Collection, Collections};
 /// Holder +24 (`sub_8279C948`): wheel landing tuning.
 const WHEEL_CLASS: &str = "Hash_C26949FCB638A2CA";
 const WHEEL_KEY: &str = "Hash_D7EDBD362D7D2152";
+/// Holder +36: body slide tuning.
+const BODY_SLIDE_CLASS: &str = "Hash_6EBA5BCD3E38A98A";
+const BODY_SLIDE_KEY: &str = "Hash_D7EDBD362D7D2152";
 /// Holder +84: slip tuning.
 const SLIP_CLASS: &str = "Hash_C1831BDB6CB1B1EA";
 const SLIP_KEY: &str = "Hash_BA9837A6CF4C26ED";
@@ -69,6 +74,14 @@ pub(crate) struct AudioTuning {
     /// landing bucket thresholds (2 at or above `high`, 1 at or above `low`).
     pub wheel_bucket_high: f32,
     pub wheel_bucket_low: f32,
+    /// `sub_82BD60C8` f4: layout +164 of `*(0x830CFDA4)`+268 (physics_collision/default,
+    /// field `1430BD50F0A33475`), the ragdoll contact impact scale.
+    pub body_impact_scale: f32,
+    /// Bridge loop loc_824B18A8: holder +36 (class `6EBA5BCD3E38A98A`/default) layout +16 / +48,
+    /// the eight x / y points of `8B164823E008749C` (PointNegGraphData8) that `sub_82481E10`
+    /// evaluates at the previous COM speed to scale +496..+524.
+    pub body_impact_speed_x: [f32; 8],
+    pub body_impact_speed_y: [f32; 8],
     /// Audio trick records by EScorableID (0..332); `None` where the vault has no collection
     /// for that name (the builder then leaves +348/+352 at −1 and +344 clear).
     pub tricks: Vec<Option<AudioTrick>>,
@@ -91,6 +104,9 @@ impl AudioTuning {
                     .into(),
             );
         }
+        let graph = data
+            .words::<20>(BODY_SLIDE_CLASS, BODY_SLIDE_KEY, "Hash_8B164823E008749C")?
+            .map(f32::from_bits);
         let landing = data.float_items(LANDING_CLASS, LANDING_KEY, "Hash_7385078DD3C063BA")?;
         let jump = data.float_items(JUMP_CLASS, JUMP_KEY, "Hash_468752B0BEE65CDB")?;
         let landing_thresholds: [f32; 3] = landing
@@ -109,6 +125,9 @@ impl AudioTuning {
             wheel_impact_divisor: data.float(WHEEL_CLASS, WHEEL_KEY, "Hash_3D399FE04952B425")?,
             wheel_bucket_high: data.float(WHEEL_CLASS, WHEEL_KEY, "Hash_6D3D91A9BA7ADCDC")?,
             wheel_bucket_low: data.float(WHEEL_CLASS, WHEEL_KEY, "Hash_2A70BB8A382574E4")?,
+            body_impact_scale: data.float("physics_collision", "default", "Hash_1430BD50F0A33475")?,
+            body_impact_speed_x: graph[4..12].try_into().unwrap(),
+            body_impact_speed_y: graph[12..20].try_into().unwrap(),
             tricks: audio_tricks(data)?,
         })
     }
@@ -213,6 +232,9 @@ mod tests {
         assert_eq!(tuning.wheel_impact_divisor, 9.0);
         assert_eq!(tuning.wheel_bucket_high, 0.5);
         assert_eq!(tuning.wheel_bucket_low.to_bits(), 0x3E9E_B852);
+        assert_eq!(tuning.body_impact_scale, 10.0);
+        assert_eq!(tuning.body_impact_speed_x[1].to_bits(), 0x3EBB_9F41);
+        assert_eq!(tuning.body_impact_speed_y, [1.0, 1.2, f32::from_bits(0x3FBE_2BE0), f32::from_bits(0x3FF5_0753), f32::from_bits(0x401B_6DB5), 3.6, f32::from_bits(0x4092_4921), 5.0]);
         assert_eq!(tuning.tricks.len(), 332);
         // Doc §4: ollie → 28, kickflip → 0.
         let id = |name: &str| {

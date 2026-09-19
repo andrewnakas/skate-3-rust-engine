@@ -207,7 +207,10 @@ impl PlayerSound {
                 // skater's own controller the emitter is the followed point, so it has no effect.
                 facing_16: [0.0, 1.0, 0.0, 0.0],
                 velocity_32: v4(retail.com_velocity),
-                // UNVERIFIED: B+0 +144 / +128 not traced; the deck position and effective forward.
+                // B+0 +128 is row 2 of the effective deck transform (`82C02A80` stores the
+                // `82C01BF8` result's +32 there): the deck's effective forward, verified.
+                // UNVERIFIED: B+0 +144 is `[[..]+652]+16` of an unnamed body object in
+                // `82C02A80`; the deck position stands in.
                 position_48: v4(retail.deck_position),
                 facing_64: v4(retail.deck_forward),
                 velocity_80: v4(retail.linear_velocity),

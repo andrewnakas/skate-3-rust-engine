@@ -31,8 +31,8 @@
 //!
 //! Engine interface notes (not guesses; the lead wires these):
 //! - Retail writes the Cracks controller's input 0 (vtable `+8`, `Set(0, v)`): 0 at the start of
-//!   every process and 32767 on every hit. The component records the writes; see
-//!   [`Seams::take_controller_inputs`]. [`Controls`] has no write path.
+//!   every process and 32767 on every hit; [`Component::take_owner_inputs`] hands them over in
+//!   order. Create's controller enable (`+60 = 1`) is already set by the MixMap build.
 //! - The owner's active byte `[[this+16]+52]` has no engine equivalent; the component runs
 //!   whenever it is ticked.
 //! - Distance mode (pattern 10 `slats` only) scales by the live global time scale `[*(0x82083C38)
@@ -532,8 +532,6 @@ pub(crate) struct Seams {
     tuning: SeamTuning,
     state: Option<SeamState>,
     handles: [Option<u32>; 4],
-    /// `[[this+12]+12]+60`, set by create.
-    controller_enabled: bool,
 }
 
 impl Seams {
@@ -542,19 +540,7 @@ impl Seams {
             tuning: SeamTuning::load(vault)?,
             state: None,
             handles: [None; 4],
-            controller_enabled: false,
         })
-    }
-
-    /// The Cracks controller writes since the last call: `(input id, value)` in retail order, and
-    /// whether create enabled the controller.
-    pub(crate) fn take_controller_inputs(&mut self) -> (bool, Vec<(u32, u32)>) {
-        let writes = self
-            .state
-            .as_mut()
-            .map(|state| std::mem::take(&mut state.controller_writes))
-            .unwrap_or_default();
-        (self.controller_enabled, writes.into_iter().map(|v| (0, v)).collect())
     }
 
     fn redeliver_all(&self, tick: &mut Tick) -> Result<(), String> {
@@ -569,7 +555,6 @@ impl Seams {
 
     /// Create (slot 7) runs once before the first process.
     fn create(&mut self, tick: &mut Tick) -> Result<(), String> {
-        self.controller_enabled = true;
         let inputs = SeamInputs::from_state(tick.audio);
         let state = SeamState::create(&self.tuning, &inputs);
         for (holder, packet) in self.handles.iter_mut().zip(&state.packets) {
@@ -602,6 +587,12 @@ impl Component for Seams {
             }
         }
         Ok(())
+    }
+
+    /// The Cracks controller's input 0 writes (`Set(0, v)`), in retail order.
+    fn take_owner_inputs(&mut self) -> Vec<(u32, u32)> {
+        let writes = self.state.as_mut().map(|state| std::mem::take(&mut state.controller_writes));
+        writes.unwrap_or_default().into_iter().map(|value| (0, value)).collect()
     }
 }
 

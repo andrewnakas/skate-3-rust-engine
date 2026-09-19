@@ -12,9 +12,7 @@
 //!
 //! Only fields whose native source the engine publishes are here. A family that needs a field
 //! the engine does not compute yet stays off rather than reading an invented value. Not ported:
-//! +324 (listener distance), +328 / +292 / +296 (ragdoll body speeds Skeleton+288/+308/+324),
-//! +368 (B60+12312 spin bucket), +496..+611 (`sub_82773298` body contacts), +672 (Skeleton
-//! +560..+572), +696..+712 / +717 (B60 fields), +740 (`sub_827729B8` needs Skeleton+144/+160),
+//! +324 (listener distance), +368 (B60+12312 spin bucket), +696..+712 / +717 (B60 fields),
 //! +760 / +764 (Air451 / Air+228 handplant).
 
 use skate_core::math::Vector3;
@@ -42,6 +40,10 @@ const SOFT_WHEEL_THRESHOLD: f32 = f32::from_bits(0x3F00_0000);
 const UPSIDE_DOWN: f32 = f32::from_bits(0xBF66_6666);
 const ON_SIDE_HIGH: f32 = f32::from_bits(0x3DCC_CCCD);
 const ON_SIDE_LOW: f32 = f32::from_bits(0xBDCC_CCCD);
+/// `0x821BCD64`: plant height difference that makes a step (`sub_827729B8`).
+const STEP_HEIGHT: f32 = f32::from_bits(0x3D8F_5C29);
+/// `0x82063A48`: floor of an active ragdoll contact impact (`sub_82BD60C8`).
+const BODY_IMPACT_FLOOR: f32 = f32::from_bits(0x3A83_126F);
 /// EScorableID 234 (`hippyjump`), record +152 bit 23 (builder, before loc_827A1FE0).
 const HIPPY_JUMP: i32 = 234;
 
@@ -125,6 +127,30 @@ pub(crate) struct ConditionerOutput {
     /// B40+52..+64 / bytes 68..71 (`sub_82772FD8`): per-wheel touchdown impact and landed latch.
     pub wheel_impact_52: [f32; 4],
     pub wheel_landed_68: [bool; 4],
+    /// B40+92..+207 (`sub_82773298`): Collision+80..+195 with its first eight floats (the
+    /// region impacts) replaced by their maximum over the last four frames.
+    pub body_contacts_92: BodyContactBlock,
+    /// B40 bytes 211..215 (`sub_827729B8`, reset to 0 each frame by the B+40 template
+    /// `sub_82DE3358`): foot physical surface is 8; step up; step down; left / right plant
+    /// edges.
+    pub foot_surface_8_211: bool,
+    pub step_212: bool,
+    pub step_213: bool,
+    pub left_plant_214: bool,
+    pub right_plant_215: bool,
+}
+
+/// Collision+80..+195 (`sub_82BD60C8`), as the conditioner forwards it (audio state +496..+611).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct BodyContactBlock {
+    pub impact: [f32; 8],
+    pub slide: [f32; 8],
+    pub material: [u32; 8],
+    pub specific_current: [bool; 2],
+    pub group_8_force: f32,
+    pub skater_force: f32,
+    pub other_skater: i32,
+    pub group_11_force: f32,
 }
 
 /// The 800-byte PhysOut audio conditioner (vtable `0x82310A74`, built in `sub_82DF2130`, tail
@@ -154,6 +180,21 @@ pub(crate) struct Conditioner {
     /// +772..+784 / +788..+791: wheel impacts and landed latches (zeroed by `sub_82DF2130`).
     wheel_impact_772: [f32; 4],
     wheel_landed_788: [bool; 4],
+    /// +176..+639 / +640: four 116-byte copies of Collision+80..+195 and the ring index; only
+    /// their first eight floats are read back.
+    body_ring_176: [[f32; 8]; 4],
+    body_index_640: i32,
+    /// +704 / +720: Skeleton+144 / +160 at the last left / right plant edge.
+    left_plant_704: [f32; 3],
+    right_plant_720: [f32; 3],
+    /// +736 / +738: last nonzero low halves of OffBoard+52 / +56.
+    foot_surface_736: u16,
+    foot_surface_738: u16,
+    /// +740 / +741 / +742 / +743: OffBoard bytes 306 / 307 this and the previous frame.
+    left_plant_740: bool,
+    left_plant_741: bool,
+    right_plant_742: bool,
+    right_plant_743: bool,
     output: ConditionerOutput,
 }
 
@@ -175,8 +216,22 @@ impl Default for Conditioner {
             slip_average_768: 0.0,
             wheel_impact_772: [0.0; 4],
             wheel_landed_788: [false; 4],
+            body_ring_176: [[0.0; 8]; 4],
+            body_index_640: 0,
+            left_plant_704: [0.0; 3],
+            right_plant_720: [0.0; 3],
+            foot_surface_736: 0,
+            foot_surface_738: 0,
+            left_plant_740: false,
+            left_plant_741: false,
+            right_plant_742: false,
+            right_plant_743: false,
             output: ConditionerOutput {
                 grind_family_28: u32::MAX,
+                body_contacts_92: BodyContactBlock {
+                    other_skater: -1,
+                    ..BodyContactBlock::default()
+                },
                 ..ConditionerOutput::default()
             },
         }
@@ -209,6 +264,7 @@ impl Conditioner {
             rows[row][2].mul_add(w[2], rows[row][1].mul_add(w[1], rows[row][0] * w[0]))
         });
         self.grind(inputs);
+        self.body_contacts(inputs, tuning);
         self.scrape_ring_644[self.scrape_index_660 as usize] = inputs.deck_scrape;
         self.scrape_index_660 = (self.scrape_index_660 + 1) % 4;
         let mut scrape = self.scrape_ring_644[0];
@@ -219,7 +275,87 @@ impl Conditioner {
         }
         self.output.deck_scrape_36 = scrape;
         self.landing(inputs, tuning);
+        self.step(inputs);
         self.jump(inputs, tuning);
+    }
+
+    /// `sub_82773298` over Collision+80..+195. The impact floats are finished here from the
+    /// transported ingredients exactly as `sub_82BD60C8` (loop 82BD68F0) writes Collision+80+4i:
+    /// x = weighted change × K164; fsel(0.001 − x, 0.001, x); fsel(−x, 0, x); fsel(1 − x, x, 1).
+    fn body_contacts(&mut self, inputs: &RetailAudioInputs, tuning: &AudioTuning) {
+        let source = &inputs.body_contacts;
+        let impact: [f32; 8] = std::array::from_fn(|i| {
+            if !source.contact[i] {
+                return 0.0;
+            }
+            let scaled = source.weighted_change[i] * tuning.body_impact_scale;
+            let floored = fsel(BODY_IMPACT_FLOOR - scaled, BODY_IMPACT_FLOOR, scaled);
+            let positive = fsel(-floored, 0.0, floored);
+            fsel(1.0 - positive, positive, 1.0)
+        });
+        self.body_ring_176[self.body_index_640 as usize] = impact;
+        self.body_index_640 = (self.body_index_640 + 1) % 4;
+        let ring = &self.body_ring_176;
+        self.output.body_contacts_92 = BodyContactBlock {
+            impact: std::array::from_fn(|k| {
+                let mut maximum = ring[0][k];
+                for slot in &ring[1..] {
+                    if !(slot[k] <= maximum) {
+                        maximum = slot[k];
+                    }
+                }
+                maximum
+            }),
+            slide: source.slide,
+            material: source.material,
+            specific_current: source.specific_current,
+            group_8_force: source.group_8_force,
+            skater_force: source.skater_force,
+            other_skater: source.other_skater,
+            group_11_force: source.group_11_force,
+        };
+    }
+
+    /// `sub_827729B8`: the step code bytes. OffBoard+52 / +56 both carry Processed+2596.
+    fn step(&mut self, inputs: &RetailAudioInputs) {
+        let surface = inputs.offboard_surface as u16;
+        if surface != 0 {
+            self.foot_surface_738 = surface;
+            self.foot_surface_736 = surface;
+        }
+        self.output.foot_surface_8_211 = (self.foot_surface_736 >> 7) & 31 == 8;
+        self.left_plant_741 = self.left_plant_740;
+        self.right_plant_743 = self.right_plant_742;
+        self.left_plant_740 = inputs.offboard_feet[0];
+        self.right_plant_742 = inputs.offboard_feet[1];
+        let right_edge = self.right_plant_742 && !self.right_plant_743;
+        let left_edge = self.left_plant_740 && !self.left_plant_741;
+        if right_edge {
+            self.right_plant_720 = inputs.toe_positions[1];
+        }
+        if left_edge {
+            self.left_plant_704 = inputs.toe_positions[0];
+        }
+        self.output.right_plant_215 = right_edge;
+        self.output.left_plant_214 = left_edge;
+        self.output.step_212 = false;
+        self.output.step_213 = false;
+        let rise = self.right_plant_720[1] - self.left_plant_704[1];
+        if !(rise.abs() <= STEP_HEIGHT) {
+            if self.right_plant_742 {
+                if rise <= 0.0 {
+                    self.output.step_213 = true;
+                } else {
+                    self.output.step_212 = true;
+                }
+            } else if self.left_plant_740 {
+                if rise <= 0.0 {
+                    self.output.step_212 = true;
+                } else {
+                    self.output.step_213 = true;
+                }
+            }
+        }
     }
 
     /// `sub_82772E18`: slip from the deck's lateral speed, |Motion+80 · deck X|.
@@ -329,6 +465,27 @@ impl Conditioner {
     }
 }
 
+/// `sub_82481E10` with n = 8: below the first x the first y, at or above the last x the last y,
+/// else linear between the bracketing points (the upper y when they share an x).
+fn point_graph(x: f32, xs: &[f32; 8], ys: &[f32; 8]) -> f32 {
+    if x < xs[0] {
+        return ys[0];
+    }
+    if !(x < xs[7]) {
+        return ys[7];
+    }
+    for i in 1..8 {
+        if x < xs[i] {
+            let span = xs[i] - xs[i - 1];
+            if !(span <= 0.0) {
+                return ((ys[i] - ys[i - 1]) / span).mul_add(x - xs[i - 1], ys[i - 1]);
+            }
+            return ys[i];
+        }
+    }
+    ys[0]
+}
+
 /// `sub_824B2268`: a stored air factor's landing bucket.
 fn wheel_bucket(factor: f32, tuning: &AudioTuning) -> u32 {
     if !(factor < tuning.wheel_bucket_high) {
@@ -395,6 +552,10 @@ pub(crate) struct AudioState {
     /// +304 = Skeleton+224/+232, +240/+248).
     pub foot_world_speed_xz_284: f32,
     pub foot_world_speed_xz_288: f32,
+    /// +292 / +296: |Y of Skeleton+320| / |Y of Skeleton+304| (record +316 / +312): the
+    /// angular velocity (body+48) Y of ragdoll parts 16 / 20.
+    pub ragdoll_spin_y_292: f32,
+    pub ragdoll_spin_y_296: f32,
     /// +300: landing bucket 1..4, record `(+156 >> 2) & 7` = B40+44 (`sub_82772B88`); the bridge
     /// forces 1 when (+343 && +348 ≠ 31) or when the previous pass left +720 at 0.
     pub landing_bucket_300: u32,
@@ -413,6 +574,8 @@ pub(crate) struct AudioState {
     pub hold_start_316: f32,
     /// +320: OffBoard byte310 (record +160 bit 0) = Processed2480 bit 8.
     pub offboard_310_320: bool,
+    /// +328: |Skeleton+288| (record +140): the angular speed of ragdoll part 23.
+    pub ragdoll_spin_328: f32,
     /// +332: KnownAir, Air byte438 (record +148 bit 31).
     pub in_known_air_332: bool,
     /// +333: left push foot planted, `P && !338 && 337`.
@@ -459,6 +622,23 @@ pub(crate) struct AudioState {
     pub jump_velocity_468: f32,
     /// +480: deck-local angular velocity, record +272 = B40+0.
     pub deck_angular_velocity_480: [f32; 3],
+    /// +496..+524: ragdoll contact impact per region, the maximum of four conditioner frames
+    /// (B40+92), then scaled by the bridge (loop loc_824B18A8) with the holder +36 graph of the
+    /// previous pass's +212.
+    pub body_impact_496: [f32; 8],
+    /// +528..+556: ragdoll contact tangential (slide) speed per region (Collision+112).
+    pub body_slide_528: [f32; 8],
+    /// +560..+588: ragdoll contact material per region, `tag & 0x7F`, 0 = none (Collision+144).
+    pub body_material_560: [u32; 8],
+    /// +592 / +593: groin / face specific contact current (Collision bytes 176 / 177).
+    pub groin_contact_592: bool,
+    pub face_contact_593: bool,
+    /// +596 / +600 / +604 / +608: maximum group-8 force, maximum skater force, other skater
+    /// (−1 none), maximum group-11 force (Collision+180..+192).
+    pub group_8_force_596: f32,
+    pub skater_force_600: f32,
+    pub other_skater_604: i32,
+    pub group_11_force_608: f32,
     /// +612 / +613 / +614: front truck / back truck / deck contact (record +148 bits 10/9/8 =
     /// Collision bytes 3473/3474/3475).
     pub front_truck_contact_612: bool,
@@ -480,6 +660,9 @@ pub(crate) struct AudioState {
     pub deck_slide_speed_664: f32,
     /// +668: deck scrape, record +484 = B40+36.
     pub deck_scrape_668: f32,
+    /// +672: 0.25 × (((Skeleton+572 + +568) + +564) + +560) (record +144), the mean limb speed
+    /// relative to the COM.
+    pub limb_speed_672: f32,
     /// +676: bail (State59).
     pub bail_676: bool,
     /// +677: end of bail, record +148 bit 4 = Skeleton byte599.
@@ -496,6 +679,9 @@ pub(crate) struct AudioState {
     /// counts down to 0.
     pub offboard_air_718: bool,
     pub offboard_air_countdown_720: i32,
+    /// +712: record +516 = Skeleton+516, the pumping absorption (Pumping+56, −speed × angular
+    /// speed), which the board component's slope inputs (`sub_824CA738`) read.
+    pub pump_absorption_712: f32,
     /// +724 / +725: right and left foot down levels.
     pub foot_down_right_724: bool,
     pub foot_down_left_725: bool,
@@ -506,6 +692,9 @@ pub(crate) struct AudioState {
     /// (Air+224 while Air byte448), 1 when zero.
     pub foot_surface_736: u16,
     pub foot_surface_738: u16,
+    /// +740: step code, record `(+152 >> 25) & 7` from B40 bytes 211..213: 212 ? (211 ? 2 : 4)
+    /// : 213 ? (211 ? 3 : 5) : 1.
+    pub step_code_740: u32,
     /// +768: Air byte448 (record +156 bit 7).
     pub footplant_768: bool,
     /// +780: loose board, record `(+156 >> 5) & 3`: with (+676 or +716), deck contact and deck
@@ -594,6 +783,17 @@ impl AudioState {
         ] = inputs.part_audio_surfaces.map(material);
         self.deck_slide_speed_664 = inputs.deck_slide_speed;
         self.deck_scrape_668 = b40.deck_scrape_36;
+        let [limb_560, limb_564, limb_568, limb_572] = inputs.limb_speeds;
+        self.limb_speed_672 = (((limb_572 + limb_568) + limb_564) + limb_560) * QUARTER;
+        let body = b40.body_contacts_92;
+        self.body_impact_496 = body.impact;
+        self.body_slide_528 = body.slide;
+        self.body_material_560 = body.material;
+        [self.groin_contact_592, self.face_contact_593] = body.specific_current;
+        self.group_8_force_596 = body.group_8_force;
+        self.skater_force_600 = body.skater_force;
+        self.other_skater_604 = body.other_skater;
+        self.group_11_force_608 = body.group_11_force;
         [self.foot_in_deck_box_615, self.foot_in_deck_box_616] = inputs.feet_in_deck_box;
 
         let [local_0, local_1] = inputs.foot_local_velocity;
@@ -604,6 +804,12 @@ impl AudioState {
         self.toe_local_speed_xz_276 = larger_magnitude(local_1[0], local_1[2]);
         self.foot_world_speed_xz_284 = larger_magnitude(world_0[0], world_0[2]);
         self.foot_world_speed_xz_288 = larger_magnitude(world_1[0], world_1[2]);
+        // Builder: +312/+316 are |Y| of Skeleton+304/+320 (vspltw 1, sign cleared), +140 the
+        // length of Skeleton+288.
+        let [spin_288, spin_304, spin_320] = inputs.ragdoll_spin;
+        self.ragdoll_spin_y_292 = spin_320[1].abs();
+        self.ragdoll_spin_y_296 = spin_304[1].abs();
+        self.ragdoll_spin_328 = native_length(spin_288);
 
         self.bridge_landing_bucket(b40.landing_bucket_44);
         self.jump_bucket_304 = b40.jump_bucket_48 & 3;
@@ -616,6 +822,7 @@ impl AudioState {
         self.soft_wheels_684 = u32::from(!(inputs.motion_200 >= SOFT_WHEEL_THRESHOLD));
         self.revert_690 = state_flag(inputs, 66);
         self.grind_material_692 = material(b40.grind_material_40);
+        self.pump_absorption_712 = inputs.pump_absorption;
         self.walking_716 = category(inputs.state) == 500;
         self.bridge_offboard_air(inputs.filtered_state == 7);
         self.foot_down_right_724 = inputs.offboard_feet[1]
@@ -650,7 +857,25 @@ impl AudioState {
         } else {
             0
         };
+        // Builder loc_827A2714..278C (record +152 bits 4..6).
+        self.step_code_740 = if b40.step_212 {
+            if b40.foot_surface_8_211 { 2 } else { 4 }
+        } else if b40.step_213 {
+            if b40.foot_surface_8_211 { 3 } else { 5 }
+        } else {
+            1
+        };
         self.footstep_strength_796 = inputs.footstep_strength;
+        // Bridge loc_824B18A8: +496..+524 scaled by the holder +36 graph at +216, which still
+        // holds the previous pass's +212 here.
+        let scale = point_graph(
+            self.com_speed_216,
+            &tuning.body_impact_speed_x,
+            &tuning.body_impact_speed_y,
+        );
+        for impact in &mut self.body_impact_496 {
+            *impact = scale * *impact;
+        }
         self.com_speed_216 = self.com_speed_212;
     }
 
@@ -789,6 +1014,9 @@ impl AudioState {
             toe_local_speed_xz_280: w.float(280),
             foot_world_speed_xz_284: w.float(284),
             foot_world_speed_xz_288: w.float(288),
+            ragdoll_spin_y_292: w.float(292),
+            ragdoll_spin_y_296: w.float(296),
+            ragdoll_spin_328: w.float(328),
             landing_bucket_300: w.word(300),
             jump_bucket_304: w.word(304),
             board_held_308: w.byte(308),
@@ -831,11 +1059,22 @@ impl AudioState {
             deck_material_660: w.word(660),
             deck_slide_speed_664: w.float(664),
             deck_scrape_668: w.float(668),
+            limb_speed_672: w.float(672),
+            body_impact_496: std::array::from_fn(|i| w.float(496 + 4 * i)),
+            body_slide_528: std::array::from_fn(|i| w.float(528 + 4 * i)),
+            body_material_560: std::array::from_fn(|i| w.word(560 + 4 * i)),
+            groin_contact_592: w.byte(592),
+            face_contact_593: w.byte(593),
+            group_8_force_596: w.float(596),
+            skater_force_600: w.float(600),
+            other_skater_604: w.word(604) as i32,
+            group_11_force_608: w.float(608),
             bail_676: w.byte(676),
             bail_over_677: w.byte(677),
             soft_wheels_684: w.word(684),
             revert_690: w.byte(690),
             grind_material_692: w.word(692),
+            pump_absorption_712: w.float(712),
             walking_716: w.byte(716),
             offboard_air_718: w.byte(718),
             offboard_air_countdown_720: w.word(720) as i32,
@@ -845,6 +1084,7 @@ impl AudioState {
             foot_material_732: w.word(732),
             foot_surface_736: w.half(736),
             foot_surface_738: w.half(738),
+            step_code_740: w.word(740),
             footplant_768: w.byte(768),
             loose_board_780: w.word(780),
             footstep_strength_796: w.float(796),
@@ -900,6 +1140,27 @@ mod tests {
             wheel_impact_divisor: 9.0,
             wheel_bucket_high: 0.5,
             wheel_bucket_low: f32::from_bits(0x3E9E_B852),
+            body_impact_scale: 10.0,
+            body_impact_speed_x: [
+                0.0,
+                f32::from_bits(0x3EBB_9F41),
+                f32::from_bits(0x3EE5_50DE),
+                f32::from_bits(0x3F05_6B91),
+                f32::from_bits(0x3F17_C3F8),
+                f32::from_bits(0x3F3D_B4F8),
+                f32::from_bits(0x3F5C_FA27),
+                f32::from_bits(0x3F72_3DB4),
+            ],
+            body_impact_speed_y: [
+                1.0,
+                1.2,
+                f32::from_bits(0x3FBE_2BE0),
+                f32::from_bits(0x3FF5_0753),
+                f32::from_bits(0x401B_6DB5),
+                3.6,
+                f32::from_bits(0x4092_4921),
+                5.0,
+            ],
             tricks: {
                 let mut tricks = vec![None; 332];
                 tricks[128] = Some(AudioTrick {
@@ -1370,6 +1631,16 @@ mod tests {
         assert_eq!((state.foot_surface_736, state.foot_surface_738), (0xB084, 0x83));
         assert_eq!(state.offboard_air_countdown_720, 20);
         assert_eq!(state.ground_speed_208, 2.5);
+        let mut words = [0u32; CAPTURE_WORDS];
+        words[(740 - 192) / 4] = 4;
+        words[(592 - 192) / 4] = 0x0001_0000; // +593 only
+        words[(604 - 192) / 4] = u32::MAX;
+        words[(560 - 192) / 4 + 7] = 16;
+        let state = AudioState::from_capture(&words);
+        assert_eq!(state.step_code_740, 4);
+        assert!(!state.groin_contact_592 && state.face_contact_593);
+        assert_eq!(state.other_skater_604, -1);
+        assert_eq!(state.body_material_560[7], 16);
     }
 
     /// Replays the bridge steps whose inputs are all in the audio state against consecutive
@@ -1388,6 +1659,18 @@ mod tests {
             assert_eq!(current.grinding_prev_342, previous.grinding_341);
             assert_eq!(current.com_speed_216.to_bits(), current.com_speed_212.to_bits());
             assert!(current.wheel_material_620.iter().all(|&m| m <= 143));
+            assert!((1..=5).contains(&current.step_code_740));
+            // +496..+524 are clamped conditioner impacts (0, or 0.001..1) times the holder +36
+            // graph at the previous +212.
+            let scale = point_graph(
+                previous.com_speed_212,
+                &tuning.body_impact_speed_x,
+                &tuning.body_impact_speed_y,
+            );
+            for impact in current.body_impact_496 {
+                let raw = impact / scale;
+                assert!(impact == 0.0 || (raw >= 0.000_999 && raw <= 1.000_001), "{raw}");
+            }
 
             let mut state = previous.clone();
             state.in_known_air_332 = current.in_known_air_332;
@@ -1434,5 +1717,113 @@ mod tests {
                 (current.foot_material_728, current.foot_material_732)
             );
         }
+    }
+
+    #[test]
+    fn point_graph_clamps_and_interpolates_like_sub_82481e10() {
+        let xs = [0.0, 1.0, 2.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let ys = [1.0, 2.0, 4.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        assert_eq!(point_graph(-1.0, &xs, &ys), 1.0);
+        assert_eq!(point_graph(0.5, &xs, &ys), 1.5);
+        assert_eq!(point_graph(6.0, &xs, &ys), 12.0);
+        assert_eq!(point_graph(9.0, &xs, &ys), 12.0);
+        // x = 2 is at or past the shared pair; the next bracket is (2, 3).
+        assert_eq!(point_graph(2.5, &xs, &ys), 8.5);
+    }
+
+    #[test]
+    fn ragdoll_spins_and_limb_speed_follow_the_builder() {
+        let tuning = tuning();
+        let mut state = AudioState::default();
+        let mut inputs = RetailAudioInputs::default();
+        inputs.ragdoll_spin = [[3.0, 0.0, 4.0], [1.0, -2.5, 0.0], [0.0, -7.0, 9.0]];
+        inputs.limb_speeds = [1.0, 2.0, 3.0, 6.0];
+        state.update(&inputs, &tuning);
+        assert!((state.ragdoll_spin_328 - 5.0).abs() < 1e-5);
+        assert_eq!(state.ragdoll_spin_y_296, 2.5);
+        assert_eq!(state.ragdoll_spin_y_292, 7.0);
+        assert_eq!(state.limb_speed_672, 3.0);
+    }
+
+    #[test]
+    fn step_code_compares_the_plant_heights_of_the_planting_foot() {
+        let tuning = tuning();
+        let mut state = AudioState::default();
+        let mut inputs = RetailAudioInputs::default();
+        state.update(&inputs, &tuning);
+        assert_eq!(state.step_code_740, 1);
+        // Left plant at y 0, then a right plant 0.1 higher: step up (212), surface not 8 → 4.
+        inputs.toe_positions = [[0.0, 0.0, 0.0], [0.0, 0.1, 0.0]];
+        inputs.offboard_feet = [true, false];
+        state.update(&inputs, &tuning);
+        assert!(state.conditioner().left_plant_214);
+        // Only the left foot is down and the right plant (0.0 at construction) is not above
+        // the threshold: nothing.
+        assert_eq!(state.step_code_740, 1);
+        inputs.offboard_feet = [true, true];
+        state.update(&inputs, &tuning);
+        assert!(state.conditioner().right_plant_215 && !state.conditioner().left_plant_214);
+        assert_eq!(state.step_code_740, 4);
+        // Physical surface category 8 (bits 7..11) turns 4 into 2.
+        inputs.offboard_surface = 8 << 7;
+        state.update(&inputs, &tuning);
+        assert_eq!(state.step_code_740, 2);
+        // A zero surface keeps the last nonzero one.
+        inputs.offboard_surface = 0;
+        state.update(&inputs, &tuning);
+        assert_eq!(state.step_code_740, 2);
+        // Right foot lifted: the left foot decides, rise > 0 → 213 → 3 on surface 8.
+        inputs.offboard_feet = [true, false];
+        state.update(&inputs, &tuning);
+        assert_eq!(state.step_code_740, 3);
+        // Neither foot down: no step this frame.
+        inputs.offboard_feet = [false, false];
+        state.update(&inputs, &tuning);
+        assert_eq!(state.step_code_740, 1);
+        // Within 0.07: no step.
+        inputs.toe_positions = [[0.0, 0.0, 0.0], [0.0, 0.05, 0.0]];
+        inputs.offboard_feet = [false, true];
+        state.update(&inputs, &tuning);
+        assert!(state.conditioner().right_plant_215);
+        assert_eq!(state.step_code_740, 1);
+    }
+
+    #[test]
+    fn body_contacts_clamp_hold_four_frames_and_scale_by_the_previous_speed() {
+        let tuning = tuning();
+        let mut state = AudioState::default();
+        let mut inputs = RetailAudioInputs::default();
+        inputs.body_contacts.contact[0] = true;
+        inputs.body_contacts.weighted_change[0] = 0.05;
+        inputs.body_contacts.contact[1] = true;
+        inputs.body_contacts.weighted_change[1] = 0.0;
+        inputs.body_contacts.contact[2] = true;
+        inputs.body_contacts.weighted_change[2] = 7.0;
+        inputs.body_contacts.slide[0] = 2.5;
+        inputs.body_contacts.material[0] = 4;
+        inputs.body_contacts.specific_current = [false, true];
+        state.update(&inputs, &tuning);
+        // Previous +212 is 0: graph y0 = 1.
+        assert_eq!(state.body_impact_496[..4], [0.5, BODY_IMPACT_FLOOR, 1.0, 0.0]);
+        assert_eq!((state.body_slide_528[0], state.body_material_560[0]), (2.5, 4));
+        assert!(!state.groin_contact_592 && state.face_contact_593);
+        assert_eq!(state.other_skater_604, -1);
+        // Contact ends and the COM speed rises past the last graph x: held three more
+        // conditioner frames, scaled by 5 from the next pass on.
+        inputs.body_contacts = crate::skate_audio::BodyContacts {
+            other_skater: -1,
+            ..Default::default()
+        };
+        inputs.com_velocity = [2.0, 0.0, 0.0];
+        state.update(&inputs, &tuning);
+        assert_eq!(state.body_impact_496[0], 0.5);
+        assert_eq!(state.body_slide_528[0], 0.0);
+        assert_eq!(state.body_material_560[0], 0);
+        state.update(&inputs, &tuning);
+        assert_eq!(state.body_impact_496[0], 2.5);
+        state.update(&inputs, &tuning);
+        assert_eq!(state.body_impact_496[2], 5.0);
+        state.update(&inputs, &tuning);
+        assert_eq!(state.body_impact_496, [0.0; 8]);
     }
 }

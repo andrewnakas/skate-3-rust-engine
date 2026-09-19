@@ -1065,21 +1065,12 @@ impl Board {
 
     /// `sub_824CA738`: `+1508`/`+1512` from the state's slope `+712` and inputs 2 and 3.
     pub(crate) fn slope_inputs(&mut self, slope_712: f32) {
-        self.f1508 = 0.0;
-        self.f1512 = 0.0;
         let primary = self.routing.primary;
-        if self.routing.grain_surface[primary] {
-            let key = self.trucks[primary].key.unwrap_or(DEFAULT_KEY);
-            let (down, up) = self.vault.slope(key);
-            if slope_712 < 0.0 {
-                self.f1508 = unit_ratio(slope_712 / down);
-            } else if slope_712 > 0.0 {
-                self.f1512 = unit_ratio(slope_712 / up);
-            }
-        }
-        let a = clamp(fctiwz(self.f1508 * LEVEL), 32_767);
+        let key = self.trucks[primary].key.unwrap_or(DEFAULT_KEY);
+        let levels = slope_levels(slope_712, self.routing.grain_surface[primary], self.vault.slope(key));
+        (self.f1508, self.f1512) = levels;
+        let [a, b] = slope_words(levels);
         self.set_input(2, a);
-        let b = clamp(fctiwz(self.f1512 * LEVEL), 32_767);
         self.set_input(3, b);
     }
 
@@ -1629,6 +1620,28 @@ fn unit_ratio(ratio: f32) -> f32 {
     if 1.0 - clamped >= 0.0 { clamped } else { 1.0 }
 }
 
+/// `sub_824CA738`'s `(+1508, +1512)`: with the primary truck on a grain surface, a downhill
+/// slope (`+712` < 0) gives `clamp01(slope / down)` and an uphill one `clamp01(slope / up)`
+/// (`down`, `up` = `0x57A78D3BE8D47BB3`, `0x8DD4C3FC8DAF4059` of the truck's grain collection:
+/// −10 and 10); otherwise both are 0.
+pub(crate) fn slope_levels(slope: f32, grain_surface: bool, (down, up): (f32, f32)) -> (f32, f32) {
+    if !grain_surface {
+        return (0.0, 0.0);
+    }
+    if slope < 0.0 {
+        (unit_ratio(slope / down), 0.0)
+    } else if slope > 0.0 {
+        (0.0, unit_ratio(slope / up))
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+/// Owner inputs 2 and 3: `fctiwz(level × 32767)` clamped to 0..32767.
+pub(crate) fn slope_words((down, up): (f32, f32)) -> [u32; 2] {
+    [clamp(fctiwz(down * LEVEL), 32_767), clamp(fctiwz(up * LEVEL), 32_767)]
+}
+
 /// `sub_824CBAC0`: owner input 5, the slewed rate of change of `vfunc52(0)` between the last two
 /// updates. `f31 = min(|[1892] − [1896]| / dt, max)`, moved from `previous` (`+1900`) by at most
 /// `step·dt`, then `fctiwz(f31 / max × 32767)` clamped to 0..32767. `max` = `0x780F5C816E00BDFC`
@@ -1662,8 +1675,7 @@ impl Component for Board {
     /// `sub_824C6A78`. Retail gates both ticks on `[[owner+28]+52]`; the host only ticks an
     /// enabled component.
     fn process(&mut self, tick: &mut Tick) -> Result<(), String> {
-        // `+712` is not in the audio state yet (reported); the slope inputs see level ground.
-        self.slope_inputs(0.0);
+        self.slope_inputs(tick.audio.pump_absorption_712);
         self.route_surfaces(tick)?;
         self.push_and_rattle(tick)?;
         self.push_chains(tick)?;
@@ -2009,6 +2021,62 @@ mod tests {
         assert_eq!((f, word), (10_000.0, 32_767));
     }
 
+    /// Rows from the retail recomp capture (2026-09-18, local board): the previous words, the
+    /// updater's controller reads and the audio state one frame earlier, then retail's words.
+    #[test]
+    fn updaters_reproduce_pinned_capture_rows() {
+        let mut s = AudioState::default();
+        // Frame 2907, held layer 3 (sub_824C9948); w6 is sub_824C82A8's surface 2.
+        s.ground_speed_208 = f32::from_bits(0x3B2C_5C40);
+        let mut w = [0x7FFF, 5, 0xFF6, 1, 3, 0, 2, 0, 0, 0x618B, 0x4D, 9];
+        let reads = Fixed(&[(60, 9, 0xC), (52, 0, 3), (56, 8, 0xFF6), (60, 19, 0), (60, 17, 0x618B), (60, 18, 0x4D)]);
+        held_rolling_update(&mut w, &reads, 9, speed_word(s.ground_speed_208, 70.0), Some(2), &s);
+        assert_eq!(w, [0x7FFF, 3, 0xFF6, 1, 3, 0, 2, 0, 0, 0x618B, 0x4D, 0xC]);
+
+        // Frame 3916, rattle (sub_824C80C0).
+        let mut w = [0x7FFF, 0x18D, 0x11C3, 0x1DA4, 3, 0, 1, 0, 0x618B, 0x4D, 0, 8];
+        let reads = Fixed(&[(56, 3, 0x11CB), (60, 6, 0), (52, 0, 0x1D6), (60, 16, 0), (60, 14, 0x618B), (60, 15, 0x4D)]);
+        rattle_update(&mut w, &reads);
+        assert_eq!(w, [0x7FFF, 0x1D6, 0x11CB, 0x1DA4, 3, 0, 1, 0, 0x618B, 0x4D, 0, 8]);
+
+        // Frame 3218, skid (sub_824C7A20), counter 0, skid surface 0.
+        s.ground_speed_208 = f32::from_bits(0x3C30_54B0);
+        s.slip_232 = f32::from_bits(0x3C88_B326);
+        let mut w = [
+            0x7FFF, 0x48, 0xA1E, 0x33, 0xBDB, 0x618B, 0x4D, 8, 0, 0, 1, 0x59D8, 0x7FFF, 0, 1, 1, 0x72D, 5,
+        ];
+        let reads = Fixed(&[
+            (56, 3, 0xBD4),
+            (60, 4, 0x51),
+            (52, 0, 0x33),
+            (60, 13, 0xA1E),
+            (60, 11, 0x618B),
+            (60, 12, 0x4D),
+            (60, 20, 0x72D),
+        ]);
+        skid_update(&mut w, &reads, &s, 0, 0, true);
+        assert_eq!(
+            w,
+            [0x7FFF, 0x51, 0xA1E, 0x33, 0xBD4, 0x618B, 0x4D, 8, 0, 0, 1, 0x59D8, 0x7FFF, 0, 1, 1, 0x72D, 5]
+        );
+
+        // Frame 4946, squeaks (sub_824C7DD0).
+        s.ground_speed_208 = f32::from_bits(0x409F_F2C3);
+        s.deck_angular_velocity_480 = [0.0, 0.0, f32::from_bits(0x3E21_EEEA)];
+        let mut w = [0x7FFF, 0x907, 0, 0x21B, 0xFAE, 0x618B, 0x4D, 0x18F, 0xF, 0x55, 0];
+        let reads = Fixed(&[(56, 3, 0xFC0), (60, 5, 0x907), (60, 11, 0x618B), (60, 12, 0x4D), (52, 0, 0x1ED)]);
+        squeak_update(&mut w, &reads, &s, 1.5);
+        assert_eq!(w, [0x7FFF, 0x907, 0, 0x1ED, 0xFC0, 0x618B, 0x4D, 0x18F, 0xF, 0x69, 0]);
+
+        // Frame 4190, loose-board scrape (sub_824CB4C0), +780 = 2.
+        s.ground_speed_208 = f32::from_bits(0x40BD_1B84);
+        s.loose_board_780 = 2;
+        let mut w = [0, 0, 0x1000, 0, 0x61A8, 0, 0, 0, 7, 0, 1, 0];
+        let reads = Fixed(&[(52, 0, 0x3255), (56, 23, 0xFEA), (60, 25, 0x5A6F), (60, 26, 0x4D), (60, 27, 0xF04), (60, 24, 0x234A)]);
+        board_slide_update(&mut w, &reads, &s, &vault());
+        assert_eq!(w, [0x7FFF, 0x3255, 0xFEA, 0x2710, 0x5A6F, 0x4D, 0xF04, 0x234A, 7, 0, 1, 0x3A98]);
+    }
+
     #[test]
     fn packets_have_the_retail_layouts() {
         assert_eq!(rolling_post(1234, 0, 3), [0, 0, 4096, 1234, 0, 0, 3, 0, 0, 25_000, 0, 32_767]);
@@ -2136,12 +2204,22 @@ mod tests {
         for object in objects {
             all.insert(object, packets(&capture::rows(&root, object)));
         }
-        // The raw vfunc52(0) sub_824C6BD8 reads at its top (lr 0x824C6C14), per frame.
+        // The raw vfunc52(0) sub_824C6BD8 reads at its top (lr 0x824C6C14), per frame, from the
+        // full controller-read log (the attributed rows carry it only when it precedes a packet).
         let mut raw_top: BTreeMap<u32, u32> = BTreeMap::new();
-        for (_, row) in &all[ROLLING].1 {
-            for r in &row.reads {
-                if r.0 == 52 && r.1 == 0 && r.3 == 0x824C_6C14 {
-                    raw_top.insert(row.frame, r.2);
+        {
+            use std::io::BufRead;
+            let file = std::fs::File::open(root.join("vf.tsv")).unwrap();
+            for line in std::io::BufReader::new(file).lines() {
+                let line = line.unwrap();
+                if !line.ends_with("824C6C14") {
+                    continue;
+                }
+                let mut columns = line.split('\t');
+                let frame: u32 = columns.next().unwrap().parse().unwrap();
+                let call: Vec<&str> = columns.nth(1).unwrap().split(' ').collect();
+                if call[0] == "52" && call[2] == LOCAL && call[3] == "0" {
+                    raw_top.insert(frame, u32::from_str_radix(call[4], 16).unwrap());
                 }
             }
         }
@@ -2204,14 +2282,19 @@ mod tests {
             // process(F), state F.
             let a = now;
             let mut set = [None; 7];
+            // sub_824CA738 runs before the routing, on +712 (not an AudioState field yet).
+            let slope = capture::float(&words[&frame], 712);
+            let key = keys[routing.primary].unwrap_or(DEFAULT_KEY);
+            let levels = slope_levels(slope, routing.grain_surface[routing.primary], vault.slope(key));
+            let [down, up] = slope_words(levels);
+            set[2] = Some(down);
+            set[3] = Some(up);
             let mut l = latch;
             let steps = routing.route(true, &mut |truck, primary| {
                 l = grain_board::manual_latch(l, a.balance_340, a.wheel_count_200);
                 truck_surface(&vault, policy, l, primary, a, truck)
             });
             latch = l;
-            set[2] = Some(0);
-            set[3] = Some(0);
             set[0] = Some(0);
             for step in &steps {
                 match *step {
@@ -2473,5 +2556,14 @@ mod tests {
                 println!("  input {id}: {}/{}  bad (frame, retail, ours) {:?}", exact[id], total[id], bad[id]);
             }
         }
+        // Input 5 divides by dt, which the capture does not record: it is recovered from the
+        // bridge clock (+312) difference, exact only to the clock's rounding.
+        let mut spread = BTreeMap::<u32, usize>::new();
+        for (frame, set) in &inputs_ours {
+            if let (Some(v), Some(logged)) = (set[5], inputs_log.get(&(frame + 1))) {
+                *spread.entry(logged[5].abs_diff(v).min(10)).or_default() += 1;
+            }
+        }
+        println!("input 5 |retail − ours| (capped at 10) → frames: {spread:?}");
     }
 }

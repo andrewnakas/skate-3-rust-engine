@@ -11,7 +11,9 @@
 //! state controller's inputs, every component's `process` writes its owner inputs, the MixMap
 //! evaluates, then every component's `update` reads this evaluation's outputs. (The capture's
 //! apparent one-frame lag between the state dump and the updates is only where its frame counter
-//! increments: at the mixer evaluation, between the two halves.)
+//! increments. Retail's update (+40) reads the state from F−1 and its process (+36) reads F; running
+//! bridge → process → evaluate → update each tick is equivalent, with posts landing one tick after
+//! retail's frame label.)
 
 pub(crate) mod board;
 pub(crate) mod clothing;
@@ -98,16 +100,29 @@ impl Controls for ControlSnapshot {
     }
 }
 
+/// `SKATE_AUDIO_POSTS=1` logs every post and release (diagnostics).
+fn trace_posts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SKATE_AUDIO_POSTS").is_some())
+}
+
 /// Release a held message, if any.
 pub(crate) fn release(runtime: &mut AuthoredRuntime, holder: &mut Option<u32>) -> Result<(), String> {
     if let Some(handle) = holder.take() {
+        if trace_posts() {
+            eprintln!("SKATE_PLAYER_AUDIO release handle={handle:#010x}");
+        }
         runtime.release(handle).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
 pub(crate) fn post(runtime: &mut AuthoredRuntime, object: &str, words: &[u32]) -> Result<u32, String> {
-    runtime.post(object, words).map_err(|error| error.to_string())
+    let handle = runtime.post(object, words).map_err(|error| error.to_string())?;
+    if trace_posts() {
+        eprintln!("SKATE_PLAYER_AUDIO post {object} handle={handle:#010x} words={words:x?}");
+    }
+    Ok(handle)
 }
 
 pub(crate) fn redeliver(runtime: &mut AuthoredRuntime, handle: u32, words: &[u32]) -> Result<(), String> {

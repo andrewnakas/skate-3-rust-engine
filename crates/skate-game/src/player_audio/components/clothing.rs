@@ -13,13 +13,10 @@
 //! - c_cloth_falls (`sub_824B72D8`, 44-byte object, 10 words, slot 23 = `0x8302EEE0`): posts
 //!   when `+676` (bail) rises, releases on `+677` (end of bail) or when `+676` clears.
 //!
-//! **Both are inert in the engine today**: they read the ragdoll fields +328 (|Skeleton+288|),
-//! +528..+548 / +560..+580 / +593 (`sub_82773298` body contacts from Collision+80..195) and
-//! +672 (0.25 × Σ Skeleton+560..572), which [`AudioState`] does not carry yet (the engine does
-//! not publish their native sources). [`BodySlideInputs::from_state`] and
-//! [`ClothFallsInputs::from_state`] return `None` until it does, so neither ever posts. The
-//! packet logic below is complete and checked against the retail capture with the captured
-//! state words.
+//! They read the ragdoll fields +328 (|Skeleton+288|), +528..+548 / +560..+580 / +593
+//! (`sub_82773298` body contacts from Collision+80..195, written by `sub_82BD60C8`) and +672
+//! (0.25 × Σ Skeleton+560..572), all carried by [`AudioState`]. The packet logic is checked
+//! against the retail capture with the captured state words.
 //!
 //! Tuning through the audio tuning holder `*(0x830CFDA4)`: +36 = class `6EBA5BCD3E38A98A` /
 //! `default`, +64 = AudioSurfaceMap, +136 = class `A867FBE3454326FF` / `default`, +140 =
@@ -58,10 +55,16 @@ pub(crate) struct BodySlideInputs {
 }
 
 impl BodySlideInputs {
-    /// `None`: [`AudioState`] has no +328, +528..+548, +560..+580 or +593 (not published by the
-    /// engine), so the component stays inert rather than reading invented values.
-    pub(crate) fn from_state(_state: &AudioState) -> Option<Self> {
-        None
+    /// Every field is in [`AudioState`]; `Option` is kept for the call sites.
+    pub(crate) fn from_state(state: &AudioState) -> Option<Self> {
+        Some(Self {
+            com_speed_212: state.com_speed_212,
+            body_speed_328: state.ragdoll_spin_328,
+            slide_528: std::array::from_fn(|i| state.body_slide_528[i]),
+            material_560: std::array::from_fn(|i| state.body_material_560[i] as i32),
+            flag_593: state.face_contact_593,
+            bail_676: state.bail_676,
+        })
     }
 
     #[cfg(test)]
@@ -90,10 +93,14 @@ pub(crate) struct ClothFallsInputs {
 }
 
 impl ClothFallsInputs {
-    /// `None`: [`AudioState`] has no +328 or +672 (ragdoll speeds the engine does not publish),
-    /// so the component stays inert.
-    pub(crate) fn from_state(_state: &AudioState) -> Option<Self> {
-        None
+    /// Every field is in [`AudioState`]; `Option` is kept for the call sites.
+    pub(crate) fn from_state(state: &AudioState) -> Option<Self> {
+        Some(Self {
+            body_speed_328: state.ragdoll_spin_328,
+            limb_speed_672: state.limb_speed_672,
+            bail_676: state.bail_676,
+            bail_over_677: state.bail_over_677,
+        })
     }
 
     #[cfg(test)]
@@ -531,10 +538,19 @@ mod tests {
     }
 
     #[test]
-    fn inert_without_the_ragdoll_fields() {
-        let state = AudioState::default();
-        assert!(BodySlideInputs::from_state(&state).is_none());
-        assert!(ClothFallsInputs::from_state(&state).is_none());
+    fn inputs_read_the_ragdoll_fields_of_the_audio_state() {
+        let mut state = AudioState::default();
+        state.ragdoll_spin_328 = 2.0;
+        state.limb_speed_672 = 3.0;
+        state.body_slide_528[5] = 1.5;
+        state.body_slide_528[6] = 9.0;
+        state.body_material_560[5] = 16;
+        state.face_contact_593 = true;
+        let slide = BodySlideInputs::from_state(&state).unwrap();
+        assert_eq!((slide.body_speed_328, slide.slide_528[5], slide.material_560[5]), (2.0, 1.5, 16));
+        assert!(slide.flag_593);
+        let falls = ClothFallsInputs::from_state(&state).unwrap();
+        assert_eq!((falls.body_speed_328, falls.limb_speed_672), (2.0, 3.0));
     }
 
     fn vault() -> Option<Collections> {

@@ -23,9 +23,9 @@
 //! voice `+448`, `sub_824EBA08`, `sub_824EBB58`). Only the *existence* of the jump voice `+444`
 //! matters to the packets (word 11) and is ported as a latch.
 //!
-//! Not wired: `sub_824E9270` also writes the OffBoard controller *input* id 0 (`[owner+12]`
-//! vfunc `+8`, Set) = `+716 ? 32767 : 0` every processed frame. [`Controls`] has no setter, so it
-//! is exposed as [`FootstepOwner::controller_input_0`] for the MixMap host to apply.
+//! `sub_824E9270` also writes the OffBoard controller *input* id 0 (`[owner+12]` vfunc `+8`,
+//! Set) = `+716 ? 32767 : 0` every processed frame, before the packet logic;
+//! [`Component::take_owner_inputs`] hands those writes to the worker.
 
 use skate_data::collections::Collections;
 
@@ -194,7 +194,8 @@ pub(crate) struct FootstepInputs {
     pub com_speed_212: f32,
     pub foot_world_speed_xz_284: f32,
     pub foot_world_speed_xz_288: f32,
-    /// +292 / +296: |Skeleton+324| / |Skeleton+308|, ragdoll foot vertical speeds.
+    /// +292 / +296: |Skeleton+324| / |Skeleton+308|: |Y| of the angular velocity (body+48) of
+    /// ragdoll parts 16 / 20 (`AudioState::ragdoll_spin_y_*`).
     pub foot_vertical_speed_292: f32,
     pub foot_vertical_speed_296: f32,
     /// +300 landing bucket, compared signed.
@@ -213,20 +214,15 @@ pub(crate) struct FootstepInputs {
 }
 
 impl FootstepInputs {
-    /// `None` while [`AudioState`] lacks a field retail reads; the component then stays inert.
-    /// Missing today: +292 / +296 (ragdoll foot body speeds, Skeleton+324 / +308) and +740
-    /// (`sub_827729B8` step code, needs Skeleton+144/+160).
+    /// Every field retail reads is in [`AudioState`]; `Option` is kept for the call sites.
     pub(crate) fn from_state(state: &AudioState) -> Option<Self> {
-        let foot_vertical_speed_292: Option<f32> = None;
-        let foot_vertical_speed_296: Option<f32> = None;
-        let step_code_740: Option<i32> = None;
         Some(Self {
             com_velocity_y_100: state.com_velocity_96[1],
             com_speed_212: state.com_speed_212,
             foot_world_speed_xz_284: state.foot_world_speed_xz_284,
             foot_world_speed_xz_288: state.foot_world_speed_xz_288,
-            foot_vertical_speed_292: foot_vertical_speed_292?,
-            foot_vertical_speed_296: foot_vertical_speed_296?,
+            foot_vertical_speed_292: state.ragdoll_spin_y_292,
+            foot_vertical_speed_296: state.ragdoll_spin_y_296,
             landing_bucket_300: state.landing_bucket_300 as i32,
             hippy_jump_372: state.hippy_jump_372,
             walking_716: state.walking_716,
@@ -235,7 +231,7 @@ impl FootstepInputs {
             foot_down_left_725: state.foot_down_left_725,
             foot_material_728: state.foot_material_728,
             foot_material_732: state.foot_material_732,
-            step_code_740: step_code_740?,
+            step_code_740: state.step_code_740 as i32,
             footplant_768: state.footplant_768,
             footstep_strength_796: state.footstep_strength_796,
         })
@@ -381,8 +377,6 @@ pub(crate) struct FootstepOwner {
     /// +452 / +405: previous +372 / +718.
     hippy_prev_452: bool,
     offboard_air_prev_405: bool,
-    /// Owner controller input id 0.
-    controller_input_0: u32,
     /// `fctiwz(+796)` and the +300 / +740 reads of the updater, kept from the process pass's
     /// state (both ticks see the same state).
     strength: i32,
@@ -396,7 +390,6 @@ impl FootstepOwner {
     pub(crate) fn process(&mut self, state: &FootstepInputs, tuning: &FootstepTuning) {
         let footplant = state.footplant_768;
         let footplant_ended = !footplant && self.footplant_prev_460;
-        self.controller_input_0 = if state.walking_716 { 32767 } else { 0 };
 
         self.speed_408 = fctiwz(tuning.speed_curve.evaluate(state.com_speed_212));
         self.horizontal_416 = fctiwz(tuning.foot_speed_curve.evaluate(state.foot_world_speed_xz_284));
@@ -464,11 +457,6 @@ impl FootstepOwner {
         self.offboard_air_prev_405 = state.offboard_air_718;
     }
 
-    /// Owner controller input id 0 (`+716 ? 32767 : 0`), written each processed frame.
-    pub(crate) fn controller_input_0(&self) -> u32 {
-        self.controller_input_0
-    }
-
     /// Holder `+36` (`foot == 0`) or `+220` (`foot == 1`).
     pub(crate) fn foot(&self, foot: usize) -> FootUpdate {
         let common = FootUpdate {
@@ -507,6 +495,8 @@ pub(crate) struct Footsteps {
     owner: FootstepOwner,
     holders: [Option<u32>; 2],
     packets: [[u32; WORDS]; 2],
+    /// OffBoard controller writes since the last [`Component::take_owner_inputs`].
+    owner_inputs: Vec<(u32, u32)>,
 }
 
 impl Footsteps {
@@ -518,18 +508,15 @@ impl Footsteps {
             owner: FootstepOwner::default(),
             holders: [None; 2],
             packets,
+            owner_inputs: Vec::new(),
         })
-    }
-
-    pub(crate) fn controller_input_0(&self) -> u32 {
-        self.owner.controller_input_0()
     }
 }
 
 impl Component for Footsteps {
     fn process(&mut self, tick: &mut Tick) -> Result<(), String> {
+        self.owner_inputs.push((0, if tick.audio.walking_716 { 32_767 } else { 0 }));
         let Some(state) = FootstepInputs::from_state(tick.audio) else {
-            // Inert: AudioState lacks +292 / +296 / +740 (see `FootstepInputs::from_state`).
             return Ok(());
         };
         // sub_824E9270 runs the curves and copies before its poster; the poster creates the
@@ -557,6 +544,10 @@ impl Component for Footsteps {
             redeliver(tick.runtime, handle, &self.packets[foot])?;
         }
         Ok(())
+    }
+
+    fn take_owner_inputs(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.owner_inputs)
     }
 }
 

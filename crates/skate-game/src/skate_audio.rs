@@ -242,6 +242,51 @@ pub struct RetailAudioInputs {
     /// PhysOutScoring2 (B+60)+152: the EScorableID `sub_82DAC498` looks up (`sub_82DA5AC8`)
     /// while the score packet carries flag bit 24 or 25, else -1.
     pub scorable_id: i32,
+    /// Skeleton+288 / +304 / +320: body+48 (angular velocity) of ragdoll parts 23 / 20 / 16,
+    /// copied by Skeleton Fill `sub_82BE1AE8` from `[[[SkeletonState+6448]+24]+8]` +2284 /
+    /// +1996 / +1612 (part record +76 → body).
+    pub ragdoll_spin: [[f32; 3]; 3],
+    /// Skeleton+560 / +564 / +568 / +572 (`sub_82BE1AE8`): |physical-record velocity of parts
+    /// 17 / 21 / 4 / 8 (SkeletonState+10368 / +10432 / +10160 / +10224) − the COM velocity
+    /// (SkeletonState+16176 = Reckoning+16)|.
+    pub limb_speeds: [f32; 4],
+    /// Skeleton+144 / +160 (`sub_82BE1AE8`): translations of physical parts 15 / 19
+    /// (SkeletonState+9024 / +9280, the physical pose at +8016).
+    pub toe_positions: [[f32; 3]; 2],
+    /// Collision+80..+195, the ragdoll contact publication `sub_82BD60C8`.
+    pub body_contacts: BodyContacts,
+    /// Skeleton+516 = Pumping+56 absorption (−speed × angular speed), stored by ProcessOutput
+    /// `sub_82DB6EC0` from `[player+1820]+56` right after Skeleton Fill (audio state +712).
+    pub pump_absorption: f32,
+}
+
+/// Collision+80..+195 as the ragdoll contact publisher `sub_82BD60C8` writes them from the
+/// SkeletonCollision object (`[SkeletonState+6448]+160`, updated by `sub_82BD4A30`). Slot i is
+/// contact region i (table `0x820CFCB0`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BodyContacts {
+    /// Region part ≠ −1 (SkeletonCollision+1200+4i).
+    pub contact: [bool; 8],
+    /// |physical-record velocity change of the part (record+4048+16p) · region normal
+    /// (SkeletonCollision+1008+16i)| × part weight (record+4560+4p), 0 without a contact. The
+    /// worker finishes Collision+80+4i = clamp(max(this × K164, 0.001), 0, 1) with the vault's
+    /// physics_collision layout +164 (`sub_82BD60C8` 82BD68F0 loop).
+    pub weighted_change: [f32; 8],
+    /// Collision+112+4i: the region's tangential speed (SkeletonCollision+944+4i), 0 without.
+    pub slide: [f32; 8],
+    /// Collision+144+4i: the region's material, `tag & 0x7F` (SkeletonCollision+976+4i),
+    /// written only with a contact; the PhysOut reset leaves 0 otherwise.
+    pub material: [u32; 8],
+    /// Collision bytes 176 / 177: the groin (part 23) / face (part 1) specific contact is current
+    /// this frame (SkeletonCollision bytes 4008 / 4009).
+    pub specific_current: [bool; 2],
+    /// Collision+180 / +184 / +188 / +192: SkeletonCollision+4056 (maximum group-8 force),
+    /// +4048 (maximum skater force), +4052 (other skater, −1 none), +4060 (maximum group-11
+    /// force).
+    pub group_8_force: f32,
+    pub skater_force: f32,
+    pub other_skater: i32,
+    pub group_11_force: f32,
 }
 
 impl Default for RetailAudioInputs {
@@ -304,6 +349,14 @@ impl Default for RetailAudioInputs {
             turn: 0.0,
             jump_strength: 0.0,
             scorable_id: -1,
+            ragdoll_spin: [[0.0; 3]; 3],
+            limb_speeds: [0.0; 4],
+            toe_positions: [[0.0; 3]; 2],
+            body_contacts: BodyContacts {
+                other_skater: -1,
+                ..BodyContacts::default()
+            },
+            pump_absorption: 0.0,
         }
     }
 }

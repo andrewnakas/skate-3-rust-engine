@@ -114,6 +114,50 @@ fn scorable_id(flags: u32, trick: Option<i32>) -> i32 {
     trick.unwrap_or(-1)
 }
 
+/// Skeleton Fill `sub_82BE1AE8` Skeleton+560/+564/+568/+572: |physical-record velocity of
+/// parts 17, 21, 4 and 8 − the COM velocity| (vsubfp, vmsum3fp, rsqrt with two refinements,
+/// zero selection).
+fn limb_speeds(velocities: &[[f32; 4]], com_velocity: [f32; 3]) -> [f32; 4] {
+    [17, 21, 4, 8].map(|part| {
+        let v = velocities[part];
+        board_motion_output::length(Vector3::new(
+            v[0] - com_velocity[0],
+            v[1] - com_velocity[1],
+            v[2] - com_velocity[2],
+        ))
+    })
+}
+
+/// The per-region part of the ragdoll contact publisher `sub_82BD60C8` (loop 82BD68F0) and its
+/// direct copies (Collision+176..+192), from the engine's SkeletonCollision owner.
+fn body_contacts(
+    feedback: &skate_core::physics::skeleton_body::SkeletonCollisionFeedback,
+    velocity_changes: &[[f32; 4]],
+    part_weights: &[f32; 24],
+) -> crate::skate_audio::BodyContacts {
+    let mut contacts = crate::skate_audio::BodyContacts {
+        specific_current: [feedback.specific[0].current, feedback.specific[1].current],
+        group_8_force: feedback.maximum_group_8_force,
+        skater_force: feedback.maximum_skater_force,
+        other_skater: feedback.other_skater,
+        group_11_force: feedback.maximum_group_11_force,
+        ..Default::default()
+    };
+    for (i, region) in feedback.regions.iter().enumerate() {
+        let Some(part) = region.part else {
+            continue;
+        };
+        let change = velocity_changes[part];
+        let normal = region.normal;
+        let along = (change[0] * normal[0] + change[1] * normal[1] + change[2] * normal[2]).abs();
+        contacts.contact[i] = true;
+        contacts.weighted_change[i] = along * part_weights[part];
+        contacts.slide[i] = region.tangent_speed;
+        contacts.material[i] = region.material_flags;
+    }
+    contacts
+}
+
 /// The native PhysOut fields `sub_827A1B78` packs for the audio-state bridge `sub_824B0DA8`
 /// and the PhysOut audio conditioner `sub_82772748`, read from the engine's published native
 /// records.
@@ -129,6 +173,7 @@ fn retail_inputs(
     let bodies = physics.board.bodies();
     let deck = physics.board.part_transforms()[BodyId::Deck.index()];
     let feet = &skater.foot_physical.output;
+    let skeleton = &skater.skeleton;
     let score = &skater.animation.motion.score_packet;
     let trick = score
         .trick_names
@@ -214,6 +259,21 @@ fn retail_inputs(
         turn: skater.animation_input.fields.turn,
         jump_strength: skater.animation_input.extra.jump_strength,
         scorable_id: scorable_id(score.flags, trick),
+        ragdoll_spin: [23, 20, 16].map(|part| lanes(skeleton.bodies()[part].rates.angular_velocity)),
+        limb_speeds: limb_speeds(
+            &skeleton.record.velocities,
+            triple(physical.reckoning.vector_16),
+        ),
+        toe_positions: [15, 19].map(|part| {
+            let position = skeleton.record.pose[part][3];
+            [position[0], position[1], position[2]]
+        }),
+        body_contacts: body_contacts(
+            &skater.collision_feedback,
+            &skeleton.record.velocity_changes,
+            &skeleton.definition.animation_masses.part_weights,
+        ),
+        pump_absorption: skater.ground.pumping.absorption,
     }
 }
 
@@ -407,5 +467,19 @@ mod tests {
         assert_eq!(scorable_id(0x0100_0000, Some(96)), 96);
         assert_eq!(scorable_id(0x0200_0000, Some(96)), 96);
         assert_eq!(scorable_id(0x0100_0000, None), -1);
+    }
+
+    #[test]
+    fn limb_speeds_are_relative_to_the_com_in_native_part_order() {
+        let mut velocities = [[0.0f32; 4]; 26];
+        velocities[17] = [4.0, 1.0, 3.0, 0.0];
+        velocities[21] = [1.0, 1.0, 1.0, 0.0];
+        velocities[4] = [1.0, -3.0, 1.0, 0.0];
+        velocities[8] = [1.0, 1.0, 1.0, 9.0];
+        let speeds = limb_speeds(&velocities, [1.0, 1.0, 1.0]);
+        assert!((speeds[0] - 3.605_551).abs() < 1e-5);
+        assert_eq!(speeds[1], 0.0);
+        assert!((speeds[2] - 4.0).abs() < 1e-5);
+        assert_eq!(speeds[3], 0.0);
     }
 }

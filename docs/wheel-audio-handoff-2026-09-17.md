@@ -450,3 +450,41 @@ AttribSys vault, then checked headlessly with `wheel_repro` before a playtest.
    wants more than the default surface.
 6. **Separate playback paths** still unresolved: `wheels.big`, `grains.big`, loose board (see the
    implementation plan's M5).
+
+## Addendum — 2026-09-18/19 overnight: the retail player-sound path is integrated
+
+The user's playtest ("rolling sounds looping and variable") led to three findings, all now ported
+and wired into the audio worker (`crates/skate-game/src/player_audio/sound.rs`):
+
+1. **Rolling is a granular bed**, not `Class_rolling`: `SFXObj_SkateBoard` drives two grain
+   players per truck over `grains.big` through a per-player FrequencyShiftSsb/HighShelf chain
+   (`skate-audio-core/src/grain/`). `Class_rolling` layers 0/3 are sparse one-shot texture.
+2. **Every gain/pitch/pan word is an EA MixMap output** (`MixMapSK8.mxb`, now staged by setup):
+   `skate-audio-core/src/mixmap/` matches the retail capture on 99.9991% of 84 M output words;
+   its input writers (`mixmap/inputs.rs`) reproduce the state controller exactly.
+3. **Inputs come from the audio-state bridge** (`player_audio/audio_state.rs`, zero mismatches
+   against 18,553 capture rows) fed by `RetailAudioInputs` from the engine's native records.
+
+Per 60 Hz tick the worker runs retail's order: bridge → state/listener/position/contacts/jitter
+MixMap inputs → every component's process → MixMap tick → every component's update. Components
+(`player_audio/components/`), each capture-replayed: board (every packet word, post and release
+exact), seams, tricks (flips + cloth_trick), treatment, grind, speed (SoS wind/rattle), contacts
+(foot drag), clothing (body slide, cloth falls), footsteps. Full reference:
+`docs/player-audio-retail-drivers.md`. Ground truth: the recomp capture hook
+(`C:\dev\skate3recomp\src\skate3_audio_capture.cpp`, env `SKATE3_AUDIO_CAPTURE`) and
+`tools/audio_capture_extract.py` / `tools/audio_capture_verify.py`.
+
+Headless end-to-end check (the game's own worker path, synthetic roll):
+`cargo test -p skate-game --bin skate3rust --locked -- --ignored headless --nocapture` →
+continuous rolling 2–9 m/s (RMS −26 → −20 dBFS), worst block 2.5–3.7 ms of 5.33 ms.
+
+**Still approximate or open (labelled in code):** default surface 2 for all surfaces (user
+accepted); the G global (treatment w11–13, flips w12 target, state MixMap id 11 bail flag) — writer
+not found; Music/VU inputs held at free-skate capture values (no retail music here); B+0 +144 board
+emitter position and Skeleton+80 skater facing stand-ins (panning); the random sequence (the
+retail generator is shared game-wide); footsteps and body slide/cloth falls pending ragdoll fields
++292/+296/+740/+328/+528..+611/+672 and board slope +712 (in progress); wheel spin (`wheels.big`)
+and the `x_jet_rolling` speed grain not yet ported.
+
+Toolchain gotcha: rustc 1.98.1 at -O miscompiles `if x < LOW { LOW } else { x.min(HIGH) }`; use
+`clamp`.
