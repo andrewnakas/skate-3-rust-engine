@@ -317,10 +317,25 @@ Both questions were unanswerable before this session because `AS` carried no sta
    `vtable[+12]` dispatch (see above). That one subsystem unlocks rail landings *and* the
    continuous material-dependent landing weight in `player-audio-retail-drivers.md` §9. Land the
    `grind_gate_124` re-arm with it.
-4. **The offboard static matching-group question** (the one deliberately failing test,
-   `embedded_static_rwcm_hits_distinct_actor_query_ids`) — needs retail to say whether static
-   registration normalises the packed unit group to -1.
-5. **#4 (ragdoll/loose board)**, **#6 (NaN crash)** and **#8 (renderer race)** — all need a repro
+4. **#4 (ragdoll/loose board)**, **#6 (NaN crash)** and **#8 (renderer race)** — all need a repro
    before they can be chased.
 
-Resolved and needing nothing: **#1**, **#7**.
+Resolved and needing nothing: **#1**, **#7**, and the offboard static matching-group bug below.
+
+## 10. Static geometry was hidden from offboard queries — **fixed 2026-09-20**
+
+Not previously listed; found because two tests contradicted each other. `skate_world.rs` filed the
+RWCM cluster's packed unit group on `QueryMesh::matching_group`. Since the filter is
+`a == -1 || b == -1 || a == b`, that made every offboard ground and line query **reject static
+geometry unless the querying actor's matching id happened to equal the cluster's group**.
+
+Retail writes **-1** there: the mesh-record constructor `sub_8276CB18` takes matchingID in `r8`
+(`stw r8,180`), and every call site passes a constant `li r8,-1` except one pass-through that
+reads an actor/unit object's `+40` — never cluster data. The static path pairs that -1 with the
+`li r7,0` / `li r6,0` this code already reproduced as `geometry: 0` / `rejection_flags: 0`. The
+cluster group is per-*triangle* in retail: `sub_82AC8A68` stores it at triangle+84, beside the
+surface code at +88 that `packed_surfaces` carries. The group is still used to partition clusters
+into meshes; only the misfiling is gone.
+
+Worth a playtest look: anything offboard (walking, bailing, ragdoll) that seemed to pass through
+static world geometry may simply have been unable to see it.
