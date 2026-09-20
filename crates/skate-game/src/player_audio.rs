@@ -41,15 +41,16 @@ const OUTPUT_CHANNELS: u16 = 2;
 const SAMPLE_RATE: u32 = 48_000;
 const QUEUE_FRAMES: usize = 4096;
 const OBSERVATION_QUEUE: usize = 16;
-// Unity: the mix reaches this edge with the MixMap's own levels, so nothing is invented here. The
-// earlier 4.0 trim dated from when the player path was far too quiet; with the retail levels and the
-// Splice contact one-shots it clipped every landing impact by about 12 dB (impacts peak near
-// -3 dBFS on their own, the rolling bed -20 to -24 dBFS).
+// INTERIM host-edge trim, chosen by ear, not recovered: this edge stands in for retail's master/Dac
+// output stage, which is not ported (see `docs/player-audio-retail-drivers.md`). The owner's
+// playtests put the authored path (takeoffs, landings, rolling) at the right level with 4.0 and
+// audibly too quiet at unity, so 4.0 stays until that stage is ported.
 //
-// If the overall level wants raising, the honest fix is the retail master/Dac output stage this host
-// edge still stands in for (`docs/player-audio-retail-drivers.md`, and the downmix below), not a
-// constant here.
-const OUTPUT_GAIN: f32 = 1.0;
+// The mix arrives here at about -20 dBFS peak rolling and -13 dBFS on a landing, so 4.0 leaves ~1 dB
+// of headroom on a landing. Anything new on this path must sit inside that: the Splice contact
+// one-shots currently peak near -3 dBFS on their own and clip here, which is why they are gated off
+// (`SKATE_AUDIO_CONTACT_VOICES`) until their gain chain is corrected.
+const OUTPUT_GAIN: f32 = 4.0;
 
 #[derive(Resource)]
 struct PlayerAudioHost {

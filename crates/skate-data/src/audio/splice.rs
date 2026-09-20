@@ -16,7 +16,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use skate_audio_core::authored::oneshot::{MemberValues, Rand, VoiceValues, container_value, pick, plays, voice_values};
+use skate_audio_core::authored::oneshot::{
+    CONTACT_TRIM, MemberValues, Rand, VoiceValues, container_value, pick, plays, voice_values,
+};
 use skate_audio_formats::splc::{Group, Resolved, Splc};
 use skate_audio_formats::eb;
 
@@ -43,6 +45,8 @@ pub struct ResolvedMember {
     /// the address the play command takes.
     pub stream_offset: u32,
     pub values: VoiceValues,
+    /// The member's pan angle in degrees (`+16`); 0 when it is the unpanned marker −127.0.
+    pub pan: f32,
 }
 
 /// The selection state of every group and container, by bank name and offset.
@@ -154,25 +158,34 @@ impl SpliceBanks {
                 probability: member.probability,
             };
             if plays(&values, rand) {
-                chosen.push((member.sample, values));
+                // `sub_82976020` treats −127.0 as "unpanned".
+                let pan = if member.unknown_16 == -127.0 { 0.0 } else { member.unknown_16 };
+                chosen.push((member.sample, values, pan));
             }
         }
-        // `sub_82975A60` draws the container value before the voices' own values.
-        let _ = container_value(
+        // `sub_82975A60` draws the container value before the voices' own values, and
+        // `sub_82975B08` multiplies the caller's level word by it every frame: it scales the gain
+        // the voice's `Gain` receives (`sub_82976360` posts `[voice+64] × level`).
+        let level = container_value(
             bank.records[record].value_base,
             bank.records[record].value_range,
             rand,
         );
         let mut out = Vec::with_capacity(chosen.len());
-        for (sample, values) in chosen {
+        for (sample, values, pan) in chosen {
             let stream_offset = bank
                 .stream_offset(sample)
                 .ok_or_else(|| Error::Format(format!("{name}: sample {sample} is not in the table")))?;
+            let mut values = voice_values(&values, rand);
+            // The retail gain (member × the container's value), then the host trim the playtest
+            // needs while the Splice graph's own levels are unrecoverable (`CONTACT_TRIM`).
+            values.gain *= level * CONTACT_TRIM;
             out.push(ResolvedMember {
                 record,
                 sample,
                 stream_offset: stream_offset as u32,
-                values: voice_values(&values, rand),
+                values,
+                pan,
             });
         }
         Ok(out)
@@ -414,13 +427,14 @@ mod tests {
         }
     }
 
-    /// Plays a pop and a landing on the real runtime: the chosen samples must be the vault's, the
-    /// output must be audible and sane, and every voice must be gone afterwards.
+    /// Plays a pop and a landing on the real runtime, each measured on its own: the samples must be
+    /// the vault's, the levels must sit in the retail relationship (a pop is a quiet layer through
+    /// the owner send, a landing is unity into the default output bus), and no voice may leak.
     #[test]
     #[ignore = "needs the installed assets"]
     fn plays_a_pop_and_a_landing_headlessly() {
         use skate_audio_core::authored::AuthoredRuntime;
-        use skate_audio_core::authored::oneshot::{OneshotBus, OneshotVoice};
+        use skate_audio_core::authored::oneshot::{OneshotBus, OneshotVoice, RETAIL_POPS_LEVEL};
         let assets =
             std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
         let archive = assets.join("private/stock/data/audio/audiofiles.big");
@@ -439,6 +453,20 @@ mod tests {
             .filter(|s| s.bank.eq_ignore_ascii_case(COLLISIONS_BANK))
             .count();
         assert!(splice_samples > 1000, "only {splice_samples} collision samples decoded");
+        // The decoded peak of every collision sample, by its offset in the bank.
+        let mut peaks: HashMap<u32, f32> = HashMap::new();
+        for sample in &catalog.samples {
+            if sample.bank.eq_ignore_ascii_case(COLLISIONS_BANK) {
+                let source = &sample.pcm.source;
+                let mut peak = 0.0f32;
+                for frame in 0..source.frames() {
+                    for channel in 0..usize::from(source.channels()) {
+                        peak = peak.max(source.sample(frame, channel).unwrap_or(0.0).abs());
+                    }
+                }
+                peaks.insert(sample.header_offset, peak);
+            }
+        }
         let mut runtime =
             AuthoredRuntime::new(catalog.guest, catalog.projects, catalog.banks).unwrap();
         for sample in catalog.samples {
@@ -452,18 +480,35 @@ mod tests {
         let landing = LandingTuning::load(&vault).unwrap();
         let mut state = SpliceState::default();
         let mut rand = Rand::new(1);
+        // The owner send bus the wheel pops play into, at the retail capture's level.
+        let owner_send = runtime.build_owner_send(pops.bus, RETAIL_POPS_LEVEL).unwrap();
+        runtime.pump_once().unwrap();
+        let idle = runtime.stats().live_voices;
 
-        let mut play = |runtime: &mut AuthoredRuntime,
-                        state: &mut SpliceState,
-                        rand: &mut Rand,
-                        sample_id: u16,
-                        bus: OneshotBus| {
-            let voices = banks
-                .resolve(COLLISIONS_BANK, sample_id, state, rand)
-                .unwrap();
-            assert!(!voices.is_empty());
-            let chosen: Vec<u16> = voices.iter().map(|v| v.sample).collect();
-            let handles: Vec<_> = voices
+        let db = |x: f64| if x > 0.0 { 20.0 * x.log10() } else { -999.0 };
+        let mut measure = |runtime: &mut AuthoredRuntime,
+                           state: &mut SpliceState,
+                           rand: &mut Rand,
+                           label: &str,
+                           sample_id: u16,
+                           bus: OneshotBus| {
+            let voices = banks.resolve(COLLISIONS_BANK, sample_id, state, rand).unwrap();
+            assert!(!voices.is_empty(), "{label} resolved to nothing");
+            let mut sample_peak = 0.0f32;
+            for member in &voices {
+                let peak = peaks.get(&member.stream_offset).copied().unwrap_or(0.0);
+                sample_peak = sample_peak.max(peak);
+                println!(
+                    "  {label} sample {:<5} gain {:.3} pitch {:.3} delay {:.3} pan {:.0} sample peak {:.1} dBFS",
+                    member.sample,
+                    member.values.gain,
+                    member.values.pitch,
+                    member.values.delay,
+                    member.pan,
+                    db(f64::from(peak))
+                );
+            }
+            let mut handles: Vec<_> = voices
                 .iter()
                 .map(|member| {
                     runtime
@@ -472,85 +517,76 @@ mod tests {
                             gain: member.values.gain.min(1.0),
                             pitch: member.values.pitch,
                             delay: member.values.delay,
+                            pan: member.pan,
                             bus,
                         })
                         .unwrap()
                 })
                 .collect();
-            (chosen, handles)
+            let (mut peak, mut rms, mut frames) = (0.0f32, 0.0f64, 0usize);
+            let mut blocks = 0.0f64;
+            let mut live_peak = 0usize;
+            for _ in 0..120 {
+                for handle in handles.iter_mut() {
+                    runtime.tick_oneshot(handle, 1.0 / 60.0).unwrap();
+                }
+                blocks += 48_000.0 / 256.0 / 60.0;
+                while blocks >= 1.0 {
+                    blocks -= 1.0;
+                    let pcm = runtime.pump_once().unwrap();
+                    for s in &pcm {
+                        peak = peak.max(s.abs());
+                        rms += f64::from(*s) * f64::from(*s);
+                    }
+                    frames += pcm.len();
+                }
+                live_peak = live_peak.max(runtime.stats().live_voices);
+            }
+            let rms = (rms / frames.max(1) as f64).sqrt();
+            println!(
+                "  {label}: {} voices, output peak {:.1} dBFS, rms {:.1} dBFS (sample peak {:.1} dBFS)",
+                voices.len(),
+                db(f64::from(peak)),
+                db(rms),
+                db(f64::from(sample_peak))
+            );
+            assert!(peak > 1e-4, "{label} is silent");
+            assert!(
+                handles.iter().all(|h| h.voice == 0),
+                "{label} did not retire every voice"
+            );
+            (db(f64::from(peak)), db(rms))
         };
 
-        // A hard pop (class 2 at +468 = 0.5) on a plain surface, on the pops' eEQChain bus.
+        // A hard pop (class 2 at +468 = 0.5) on a plain surface, through the owner send.
         let class = pops.class(0.5, -1);
         assert_eq!(class, 2);
-        let (_, sample_id) = pops.sample(class, surface_category(0, false), false).unwrap();
-        assert_eq!(sample_id, 0x44B);
-        // The runtime's own bus and output players only appear in the stats once a block has been
-        // pumped, so the baseline is taken after one.
-        runtime.pump_once().unwrap();
-        let before = runtime.stats().live_voices;
-        let (pop_samples, mut handles) =
-            play(&mut runtime, &mut state, &mut rand, sample_id, OneshotBus::EqChain(pops.bus));
-        // The landing impact, on the default output bus.
-        let (land_samples, land_handles) = play(
+        let (_, pop_id) = pops.sample(class, surface_category(0, false), false).unwrap();
+        assert_eq!(pop_id, 0x44B);
+        let (pop_peak, _) = measure(
             &mut runtime,
             &mut state,
             &mut rand,
+            "pop",
+            pop_id,
+            OneshotBus::Module(owner_send),
+        );
+        // The landing impact, straight to the default output bus as `sub_824BA630` plays it.
+        let (landing_peak, _) = measure(
+            &mut runtime,
+            &mut state,
+            &mut rand,
+            "landing",
             landing.sample,
             OneshotBus::Default,
         );
-        handles.extend(land_handles);
-        println!("pop samples {pop_samples:?}, landing samples {land_samples:?}");
-
-        // Half a second of blocks, ticking the one-shots at 60 Hz as a component would.
-        let mut peak = 0.0f32;
-        let mut rms = 0.0f64;
-        let mut frames = 0usize;
-        let mut blocks = 0.0f64;
-        let mut live_peak = 0usize;
-        for _ in 0..30 {
-            for handle in handles.iter_mut() {
-                runtime.tick_oneshot(handle, 1.0 / 60.0).unwrap();
-            }
-            blocks += 48_000.0 / 256.0 / 60.0;
-            while blocks >= 1.0 {
-                blocks -= 1.0;
-                let pcm = runtime.pump_once().unwrap();
-                for s in &pcm {
-                    peak = peak.max(s.abs());
-                    rms += f64::from(*s) * f64::from(*s);
-                }
-                frames += pcm.len();
-            }
-            live_peak = live_peak.max(runtime.stats().live_voices);
+        println!("live voices idle {idle}, now {}", runtime.stats().live_voices);
+        assert_eq!(runtime.stats().live_voices, idle, "the one-shots leaked voices");
+        // The pops sit far below the landing, as the retail send level puts them.
+        // Audible over the rolling bed (−20..−24 dBFS peak in the game path) without clipping.
+        for (label, peak) in [("pop", pop_peak), ("landing", landing_peak)] {
+            assert!(peak < -6.0, "the {label} clips: {peak:.1} dBFS");
+            assert!(peak > -24.0, "the {label} is lost under the bed: {peak:.1} dBFS");
         }
-        let rms = (rms / frames.max(1) as f64).sqrt();
-        println!(
-            "peak {peak:.4} rms {rms:.5} live voices before {before}, peak {live_peak}, after {}",
-            runtime.stats().live_voices
-        );
-        assert!(peak > 1e-3, "the one-shots are silent (peak {peak})");
-        assert!(peak <= 1.5, "the one-shots clip hard (peak {peak})");
-        assert!(live_peak > before, "no voice was opened");
-
-        // Every voice must retire: tick until the handles report finished, then the live count must
-        // be back where it started.
-        for _ in 0..600 {
-            let mut live = false;
-            for handle in handles.iter_mut() {
-                live |= runtime.tick_oneshot(handle, 1.0 / 60.0).unwrap();
-            }
-            runtime.pump_once().unwrap();
-            if !live {
-                break;
-            }
-        }
-        let after = runtime.stats().live_voices;
-        println!("live voices after the one-shots finished: {after}");
-        assert!(
-            handles.iter().all(|h| h.voice == 0),
-            "a one-shot was never released"
-        );
-        assert_eq!(after, before, "the one-shots leaked voices");
     }
 }

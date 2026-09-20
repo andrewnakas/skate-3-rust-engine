@@ -160,6 +160,7 @@ impl ContactVoicePlayer {
                     gain: member.values.gain,
                     pitch: member.values.pitch,
                     delay: member.values.delay,
+                    pan: member.pan,
                     bus,
                 }) {
                     Ok(handle) => handles.push(handle),

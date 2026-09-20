@@ -103,7 +103,7 @@ impl ChainConfig {
 }
 
 /// The registry walk `sub_824C8878` repeats for every class: 0 when absent.
-pub(super) fn find(g: &Guest, id: u32) -> Result<u32> {
+pub(crate) fn find(g: &Guest, id: u32) -> Result<u32> {
     let root = g.u32(classes::BUS_ROOT)?;
     let registry = g.u32(root + 12)?;
     let mut link = g.u32(registry)?;
@@ -117,14 +117,14 @@ pub(super) fn find(g: &Guest, id: u32) -> Result<u32> {
     Ok(0)
 }
 
-pub(super) fn descriptor(g: &mut Guest, at: u32, arg: u32, class: u32, channels: u8) -> Result<()> {
+pub(crate) fn descriptor(g: &mut Guest, at: u32, arg: u32, class: u32, channels: u8) -> Result<()> {
     g.set_u32(at, arg)?;
     g.set_u32(at + 4, class)?;
     g.set_u8(at + 8, channels)
 }
 
 /// Point a `Sen0` at `target`: `{TAG_POINTER, target}` through its configure entry.
-pub(super) fn route(g: &mut Guest, block: u32, send: u32, target: u32) -> Result<()> {
+pub(crate) fn route(g: &mut Guest, block: u32, send: u32, target: u32) -> Result<()> {
     g.set_u32(block, TAG_POINTER)?;
     g.set_u32(block + 4, target)?;
     device::configure(g, send, 0, block)
