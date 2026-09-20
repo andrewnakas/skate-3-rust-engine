@@ -10,44 +10,38 @@ once in a playtest and have no repro yet.
 
 ---
 
-## 1. `jump_height_200` under-reports the real apex by ~10x — **measured, diagnosis corrected**
+## 1. Jump height and the landing's weight — **resolved by measurement; no workaround left**
 
-**Symptom.** Every landing sounds like the lightest possible touchdown regardless of the trick.
+**History, because two wrong turns are recorded in the git log.** An earlier session measured
+`jump_height_200` at 0.10–0.13 m against a retail capture's 1.1–2.2 m and concluded the field was
+~10x short, so a 10x was applied to the copy handed to audio. On 2026-09-20 that was moved onto the
+real launch (`ground_jump`'s `remaining` term) on the theory that the jump itself was short; the
+owner playtested it and went into orbit, so the launch was ruled out and the change reverted.
+`ground_jump` is untouched and retail-exact.
 
-**Evidence.** Audio state `+260` is Air+200 = `max_y − start_y` (deck part Y minus the ground
-reference), written by the air Fills `sub_82D36880` / `sub_82D34E90`. Measured per hop:
+**What the trace actually shows.** Measuring Class_Treatment word 9 directly from a playtest
+(`SKATE_AUDIO_TRACE`, 27541 updates, 1559 with a live landing):
 
-| | reported jump height | Treatment word 9 = `trunc(clamp(h × 166.667, 0, 1000))` |
-|---|---|---|
-| Retail capture | 1.1–2.2 m | 183–367 |
-| This engine | 0.10–0.13 m | 16–22 |
+| | word 9 (`trunc(clamp(h × 166.667, 0, 1000))`) |
+|---|---|
+| Retail | 183–367 |
+| This engine **with** the 10x | min 62, **p50 1000, p90 1000** — pegged at the clamp |
 
-**Diagnosis corrected 2026-09-20.** This was first read as the skater physically jumping 10x too
-low, and a 10x was put on the real launch (`ground_jump`'s `remaining` term, which is linear in
-apex height). The owner playtested it and **went into orbit**. That rules the launch out: the
-engine's actual ollie is already near retail height, and it is the *measurement* `max_y − start_y`
-that is ~10x short. The launch change was reverted; `ground_jump` is untouched and retail-exact.
+So the 10x drove word 9 3–5x past retail and into saturation: every landing played at maximum
+weight regardless of the hop, which is what the owner heard as "landings too loud for the height".
+Back-solving the clamp puts the *reported* height at **≥0.6 m**, not the 0.10–0.13 m the original
+measurement claimed — so the field is far less wrong than believed, and word 9 without any scale
+falls around 100–300, inside retail's range.
 
-**Where to look.** `max_y` tracks the **deck rigid body's** Y (`air_phase.rs:202-206`,
-`part_transforms()[6]`), while `start_y` is a **ground reference position** — the lowest wheel
-centre — not the same body's rest Y. Any constant offset between those two references is
-subtracted straight out of every hop, and if the deck body's Y barely moves relative to that
-reference (for instance because the board is driven angular-only in flight while the skater's COM
-does the rising), the difference stays small no matter how high the jump goes. Also note PhysicsAir
-and KnownAir disagree on the reference: PhysicsAir uses `+500` (current ground position,
-`air_phase/input.rs:49`) and KnownAir uses `+480` (previous, `known_air.rs:94`).
+**Resolution.** The scale is removed entirely. No workaround remains in the tree.
 
-**How to confirm.** Log the deck body Y and the skater COM Y through a hop and compare their rise
-with `jump_height_200` for the same hop. Whichever one rises 1–2 m is the quantity retail's field
-is meant to carry.
-
-**Current workaround.** `TEMPORARY_JUMP_HEIGHT_SCALE` = 10.0 in
-`crates/skate-game/src/physics/audio_observation.rs`, applied only to the copy handed to audio, so
-animation and the slow-motion camera still read the native value. It compensates a reporting bug,
-which is why it correctly lives on the audio side.
-
-**Fixed when.** `physical.air.jump_height_200` reports 1.1–2.2 m for an ordinary ollie with no
-scale, and Treatment word 9 lands in 183–367.
+**Residual, low priority.** Reported height (~0.6 m) still sits below retail's 1.1–2.2 m plateau,
+so word 9 may run slightly low on big drops. If that ever matters, the thing to check is that
+`max_y` tracks the deck rigid body (`air_phase.rs:202-206`, `part_transforms()[6]`) while `start_y`
+is a wheel-centre ground reference — a constant offset between two different references is
+subtracted out of every hop. PhysicsAir and KnownAir also disagree on that reference: `+500`
+(current, `air_phase/input.rs:49`) versus `+480` (previous, `known_air.rs:94`). **Do not "fix" this
+at the launch** — that was tried and it sends the skater into orbit.
 
 ## 2. The engine rarely enters KnownAir — **diagnosed from code + capture**
 
@@ -126,11 +120,8 @@ start by narrowing which `capacity` / `deferred_reduction` pair diverges.
 
 ## Suggested order for the next session
 
-1. **#1 (jump height reporting)** — one logging session away from being pinned down, and it
-   removes a temporary hack. Note it is a *reporting* bug: the jump itself is fine, so do not
-   "fix" it by changing the launch.
-2. **#2 (KnownAir)** — unblocks real air timing for everything, not just audio, and lets an
-   audio-side workaround be deleted.
+1. **#2 (KnownAir)** — unblocks real air timing for everything, not just audio, and lets an
+   audio-side workaround be deleted. (#1 is resolved; nothing to do there.)
 3. **#7 (broadphase)** — a reproducible correctness failure in contact generation, and it has a
    one-line repro.
 4. **#3 (powerslide inputs)** — one trace comparison away from being isolated.

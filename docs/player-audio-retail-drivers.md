@@ -588,16 +588,12 @@ Corrections to §1: 615/616 = **Skeleton 600/601** (feet inside the deck box), n
 Recorded 2026-09-19 from playtests of the ported path. These are **physics/engine** gaps, not audio
 ports; audio only shows them up.
 
-1. **Ollie jump height is ~10x too small.** Audio state `+260` is Air+200 = `max_y − start_y`
-   (deck part Y minus Processed+500), written by KnownAir Fill `sub_82D36880` and
-   `sub_82D34E90`. The retail capture plateaus at **1.1–2.2 m** per hop; this engine produces
-   **0.10–0.13 m**. Treatment word 9 is `clamp(trunc(height × 166.667), 0, 1000)`, so retail's
-   landings sit high in that range and ours sit at 16–22.
-   **Corrected 2026-09-20:** this is a *reporting* defect, not a short jump — moving the 10x onto
-   the real launch sent the skater into orbit in a playtest, so the engine's ollie is already near
-   retail height and `max_y − start_y` under-reports it. The scale therefore stays on the audio
-   copy (`TEMPORARY_JUMP_HEIGHT_SCALE` in `audio_observation.rs`); `ground_jump` is untouched.
-   Full analysis and the removal criterion: `docs/engine-defects.md` defect 1.
+1. **Jump height — resolved, no workaround left.** Measuring Class_Treatment word 9 from a
+   playtest trace showed it **pegged at its 1000 clamp** with the old 10x scale applied, against
+   retail's 183–367: the scale was overdriving landings, not rescuing them. Back-solving the clamp
+   puts reported height at ≥0.6 m rather than the 0.10–0.13 m originally measured. The scale is
+   removed; word 9 now lands in retail's range on its own. Full history, including two wrong turns,
+   in `docs/engine-defects.md` defect 1.
 2. **The engine rarely enters KnownAir.** Retail is in KnownAir (state 201) for essentially every
    hop; this engine selects it only while Processed2468 bit 10 (trajectory valid) is published, and
    nothing publishes that bit except transiently, so ordinary ollies run in PhysicsAir (200/202).
