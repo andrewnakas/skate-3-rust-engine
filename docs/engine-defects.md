@@ -10,58 +10,44 @@ once in a playtest and have no repro yet.
 
 ---
 
-## 1. Ollie / pop height is ~10x too small — **measured**
+## 1. `jump_height_200` under-reports the real apex by ~10x — **measured, diagnosis corrected**
 
-**Symptom.** Hops barely leave the ground compared with retail, and every landing sounds like the
-lightest possible touchdown regardless of the trick.
+**Symptom.** Every landing sounds like the lightest possible touchdown regardless of the trick.
 
-**Evidence.** Audio state `+260` is Air+200 = `max_y − start_y` (deck part Y minus Processed+500),
-written by KnownAir Fill `sub_82D36880` / `sub_82D34E90`. Measured per hop:
+**Evidence.** Audio state `+260` is Air+200 = `max_y − start_y` (deck part Y minus the ground
+reference), written by the air Fills `sub_82D36880` / `sub_82D34E90`. Measured per hop:
 
-| | jump height | Treatment word 9 = `trunc(clamp(h × 166.667, 0, 1000))` |
+| | reported jump height | Treatment word 9 = `trunc(clamp(h × 166.667, 0, 1000))` |
 |---|---|---|
 | Retail capture | 1.1–2.2 m | 183–367 |
 | This engine | 0.10–0.13 m | 16–22 |
 
-So the engine sits in the bottom 2% of the range retail uses. The ratio is consistently ~10x, which
-smells like a units or scale mismatch (m vs decimetres, or a settings value read at the wrong
-scale) rather than a tuning difference.
+**Diagnosis corrected 2026-09-20.** This was first read as the skater physically jumping 10x too
+low, and a 10x was put on the real launch (`ground_jump`'s `remaining` term, which is linear in
+apex height). The owner playtested it and **went into orbit**. That rules the launch out: the
+engine's actual ollie is already near retail height, and it is the *measurement* `max_y − start_y`
+that is ~10x short. The launch change was reverted; `ground_jump` is untouched and retail-exact.
 
-**Suspected root cause (2026-09-20).** `ground_jump::calculate`
-(`crates/skate-core/src/air/ground_jump/mod.rs`, lifted `Toolkit_CalcGroundJump` 0x82D93618)
-launches with `remaining = max(height − current_height, 0)`, and since flight is purely ballistic
-the apex rise *is* `remaining`. `current_height` is
-`dot(animation_com_position − ground_reference_position, reference_up)`, wired to
-`reckoning.vector_64` = the skater's full weighted body COM (`render_pose.rs:61-65`) minus the
-lowest wheel centre (`player_input/ground_position.rs:16-41`) — i.e. an **absolute** ~0.85–0.95 m
-standing height. With a ~1.0 m `JumpMaxHeight`, `1.0 − 0.9 = 0.1`: exactly what we measure.
+**Where to look.** `max_y` tracks the **deck rigid body's** Y (`air_phase.rs:202-206`,
+`part_transforms()[6]`), while `start_y` is a **ground reference position** — the lowest wheel
+centre — not the same body's rest Y. Any constant offset between those two references is
+subtracted straight out of every hop, and if the deck body's Y barely moves relative to that
+reference (for instance because the board is driven angular-only in flight while the skater's COM
+does the rising), the difference stays small no matter how high the jump goes. Also note PhysicsAir
+and KnownAir disagree on the reference: PhysicsAir uses `+500` (current ground position,
+`air_phase/input.rs:49`) and KnownAir uses `+480` (previous, `known_air.rs:94`).
 
-Retail's Processed+592 is very likely the **crouch-relative** COM displacement (near zero at
-launch), not the absolute COM height. Check whether `+592` should come from the animation
-target/COM frame rather than `board_frames.centre_of_mass`, or whether `ground_reference_position`
-should be the COM-plane reference instead of the wheel-centre ground point.
+**How to confirm.** Log the deck body Y and the skater COM Y through a hop and compare their rise
+with `jump_height_200` for the same hop. Whichever one rises 1–2 m is the quantity retail's field
+is meant to carry.
 
-Two secondary candidates, in order: (a) the `vertical_response` graph is the only 16-point graph
-read with **no 4-word header** while its siblings in the same collection use one
-(`ground_animation/settings.rs:33-36`) — it multiplies launch speed directly, and
-`response = 1/√10 ≈ 0.316` is exactly a 10x height loss, so dump its x/y and check x[0]≈0,
-x[15]≈1; (b) `clamp_jump_velocity` at `ground_animation.rs:77-80` takes the *direction* of the
-current (near-horizontal) velocity and only the *magnitude* of the jump velocity, which can
-silently delete most of the Y.
+**Current workaround.** `TEMPORARY_JUMP_HEIGHT_SCALE` = 10.0 in
+`crates/skate-game/src/physics/audio_observation.rs`, applied only to the copy handed to audio, so
+animation and the slow-motion camera still read the native value. It compensates a reporting bug,
+which is why it correctly lives on the audio side.
 
-**Cheap confirmation with no code change:** set the trainer `pop` multiplier. It scales `height`
-before the subtraction, so if `pop ≈ 2` reproduces retail heights (rather than the ≈10 you would
-need if the subtraction were innocent), the `current_height` diagnosis is confirmed.
-
-**Current workaround.** `TEMPORARY_POP_HEIGHT_SCALE` = 10.0 in
-`crates/skate-game/src/physics/ground_animation/board.rs`, passed as the non-retail
-`GroundJumpInput::pop_height_scale` and applied to `remaining`. It is applied to the **real
-launch**, so the trajectory, the selector packet, `max_y` and the audio field all agree — it
-replaces an earlier audio-only scale that made landings sound right while the skater barely left
-the ground. `skate-core`'s lifted routine stays retail-exact at `pop_height_scale = 1.0`.
-
-**Fixed when.** An ollie measures 1.1–2.2 m in `physical.air.jump_height_200` with
-`pop_height_scale` removed, and Treatment word 9 lands in 183–367 on an ordinary ollie.
+**Fixed when.** `physical.air.jump_height_200` reports 1.1–2.2 m for an ordinary ollie with no
+scale, and Treatment word 9 lands in 183–367.
 
 ## 2. The engine rarely enters KnownAir — **diagnosed from code + capture**
 
@@ -140,8 +126,9 @@ start by narrowing which `capacity` / `deferred_reduction` pair diverges.
 
 ## Suggested order for the next session
 
-1. **#1 (pop height)** — biggest gameplay-feel defect, most likely a single scale bug, and it
-   removes a temporary hack.
+1. **#1 (jump height reporting)** — one logging session away from being pinned down, and it
+   removes a temporary hack. Note it is a *reporting* bug: the jump itself is fine, so do not
+   "fix" it by changing the launch.
 2. **#2 (KnownAir)** — unblocks real air timing for everything, not just audio, and lets an
    audio-side workaround be deleted.
 3. **#7 (broadphase)** — a reproducible correctness failure in contact generation, and it has a

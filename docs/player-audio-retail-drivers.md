@@ -593,12 +593,11 @@ ports; audio only shows them up.
    `sub_82D34E90`. The retail capture plateaus at **1.1–2.2 m** per hop; this engine produces
    **0.10–0.13 m**. Treatment word 9 is `clamp(trunc(height × 166.667), 0, 1000)`, so retail's
    landings sit high in that range and ours sit at 16–22.
-   **Temporary patch (2026-09-20):** the scale now sits on the **real launch** —
-   `TEMPORARY_POP_HEIGHT_SCALE` = 10 in `physics/ground_animation/board.rs`, passed as
-   `GroundJumpInput::pop_height_scale` — so the trajectory, `max_y` and the audio field agree and
-   the skater actually leaves the ground. It replaces the earlier audio-only scale in
-   `audio_observation.rs`, which is gone. Root-cause analysis and the removal criterion are in
-   `docs/engine-defects.md` defect 1.
+   **Corrected 2026-09-20:** this is a *reporting* defect, not a short jump — moving the 10x onto
+   the real launch sent the skater into orbit in a playtest, so the engine's ollie is already near
+   retail height and `max_y − start_y` under-reports it. The scale therefore stays on the audio
+   copy (`TEMPORARY_JUMP_HEIGHT_SCALE` in `audio_observation.rs`); `ground_jump` is untouched.
+   Full analysis and the removal criterion: `docs/engine-defects.md` defect 1.
 2. **The engine rarely enters KnownAir.** Retail is in KnownAir (state 201) for essentially every
    hop; this engine selects it only while Processed2468 bit 10 (trajectory valid) is published, and
    nothing publishes that bit except transiently, so ordinary ollies run in PhysicsAir (200/202).

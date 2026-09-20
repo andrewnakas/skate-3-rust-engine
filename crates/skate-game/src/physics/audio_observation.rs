@@ -188,6 +188,25 @@ struct AirTimingInputs {
 /// PhysicsAir: the audio state then saw +236 = 0 and +240 = 4.0 and the Treatment packet's air
 /// words stopped moving. Each branch below reads the same quantity from the native fields of the
 /// state that owns it.
+/// **TEMPORARY, SOUND ONLY — for downstream developers.** Audio state `+260` is Air+200, the hop's
+/// jump height (`max_y − start_y`, written by both air Fills). A retail capture plateaus at
+/// 1.1–2.2 m per ollie; this field reports 0.10–0.13 m, so the Treatment patch's word 9
+/// (`height × 166.667`, clamped to 1000) sits at 16–22 where retail sits at 183–367 and every
+/// landing sounds like the lightest possible touchdown.
+///
+/// **The defect is in this field, not in the jump.** A playtest with the 10x moved onto the real
+/// launch (`ground_jump`'s `remaining` term) sent the skater into orbit, which means the engine's
+/// actual ollie is already near retail height and it is `max_y − start_y` that under-reports it by
+/// roughly 10x. So the scale belongs here, compensating a reporting bug, until that reporting is
+/// fixed — see `docs/engine-defects.md` defect 1 for the suspects (`max_y` tracking the deck body
+/// while `start_y` is a wheel-centre ground reference, and PhysicsAir/KnownAir disagreeing over
+/// `+480` vs `+500`).
+///
+/// This multiplies ONLY the copy handed to audio: the native record keeps its own value, because
+/// animation (`remaining_air_time`, `time_to_land`) and the slow-motion camera read those fields.
+/// **Remove this once `jump_height_200` reports the real apex.**
+const TEMPORARY_JUMP_HEIGHT_SCALE: f32 = 10.0;
+
 fn air_timing(inputs: AirTimingInputs) -> (f32, f32) {
     match inputs.state {
         201 => (inputs.published_176, inputs.published_184),
@@ -254,7 +273,7 @@ fn retail_inputs(
         wheel_count: physical.collision.wheel_count_0 & 7,
         air_time_in_state: air_time.0,
         air_time_until_landing: air_time.1,
-        air_jump_height: physical.air.jump_height_200,
+        air_jump_height: physical.air.jump_height_200 * TEMPORARY_JUMP_HEIGHT_SCALE,
         state_flags: skater.player_state.state_flags,
         offboard_feet: physical.off_board.flags_306_307.map(|flag| flag != 0),
         footplant: [
