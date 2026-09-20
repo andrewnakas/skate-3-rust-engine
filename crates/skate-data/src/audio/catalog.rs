@@ -41,7 +41,13 @@ pub const PLAYER_BANKS: &[&str] = &[
 /// `DLC_Cartoon_Collisions.bnk` is the pops' DLC variant and is absent from a base installation,
 /// so it is loaded only when the archive holds it.
 pub const SPLICE_BANKS: &[&str] = &["Skate_Collisions.bnk"];
-pub const OPTIONAL_SPLICE_BANKS: &[&str] = &["DLC_Cartoon_Collisions.bnk"];
+/// `Skate_Metal.bnk` and `HOM_Set_1.bnk` are the other two banks the collision materials name:
+/// `sub_824967F8` picks a material's sample out of the field family its kind word selects, and an
+/// AttribSys field's type name is its bank (`Skate_Metal` -> `Skate_Metal.bnk`). A metal rail
+/// resolves into `Skate_Metal.bnk`, which is why a rail grind does not sound like concrete. Both
+/// are optional so a trimmed installation still boots.
+pub const OPTIONAL_SPLICE_BANKS: &[&str] =
+    &["DLC_Cartoon_Collisions.bnk", "Skate_Metal.bnk", "HOM_Set_1.bnk"];
 
 /// Where the installer stages the MixMap under `assets`.
 pub const MIXMAP_PATH: &str = "private/stock/data/audio/MixMapSK8.mxb";
@@ -132,13 +138,24 @@ impl PlayerAudioCatalog {
                     self.cache_hits += decoded.len();
                     decoded
                 }
-                None => {
-                    let decoded = decode_ranges(name, bytes, &ranges)?;
-                    if let Some(path) = path.as_deref() {
-                        let _ = write_cache(path, bytes, &decoded);
+                None => match decode_ranges(name, bytes, &ranges) {
+                    Ok(decoded) => {
+                        if let Some(path) = path.as_deref() {
+                            let _ = write_cache(path, bytes, &decoded);
+                        }
+                        decoded
                     }
-                    decoded
-                }
+                    // An optional bank must never take the whole player-sound path down. Some of
+                    // them use a container that needs ffmpeg, which is not present everywhere, and
+                    // before these banks were listed that only cost the contacts they carry. Skip
+                    // the bank and say so once; a material whose sample lives here then resolves
+                    // to silence exactly as an uninstalled bank already does.
+                    Err(error) if !required => {
+                        eprintln!("SKATE_PLAYER_AUDIO optional sound bank {name} not decoded: {error}");
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                },
             };
             for (index, (offset, header, samples)) in decoded.into_iter().enumerate() {
                 let mut source = PcmSource::new(Arc::from(samples), header.channels())

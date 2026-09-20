@@ -29,13 +29,24 @@
 //!   controller's own outputs — `sub_824D20E8` and `sub_824D22B8` pick *which output id* from the
 //!   material's category. See [`CollisionMaterials`].
 //!
-//! **What is not here yet.** `sub_824965D0` → `sub_824967F8` turn (material, other material,
-//! tier) into the actual sample id, and that pair is a further undecoded layer. Everything in
-//! this module is the control plane around it, so the seam is explicit: [`Slot::started`] records
-//! the conditions retail checks *before* it calls the chooser, and the chooser's own `-1` is not
-//! modelled. Nothing here invents a sample.
+//! **The sample choice** is `sub_824965D0` → `sub_824967F8`, and it is a table, not code. The
+//! image table at `0x8302D6E8` gives each material a *kind* word and the AttribSys key of its
+//! record; the kind selects which family of fields on that record the sample comes from, and an
+//! AttribSys field's retail type name **is** its bank — `Skate_Collisions` ->
+//! `Skate_Collisions.bnk`, `Skate_Metal` -> `Skate_Metal.bnk`, `HOM_Set_1` -> `HOM_Set_1.bnk`.
+//! Within a family, `(tier, the paired material's class)` picks the field. See [`KindFields`] and
+//! [`CollisionMaterials::sample`].
+//!
+//! That is why a rail grind is two sounds and not one: the board's family base resolves out of
+//! `Skate_Collisions.bnk` while the rail's own material resolves out of `Skate_Metal.bnk`.
+//!
+//! **One hole is left deliberately.** Kind 2's `tier == 0` against paired class 0 goes through
+//! `sub_824825D0`, a different accessor that is not decoded, so that one combination resolves to
+//! no sample rather than to a guess. Nothing here invents a sample.
 
 use skate_data::collections::Collections;
+
+use super::components::contacts::SurfaceMap;
 
 use super::collision_materials::{MATERIAL_COUNT, MATERIAL_SOUND_ID, MATERIAL_VAULT_KEY};
 
@@ -155,6 +166,23 @@ pub(crate) fn contact_weight(tier_a: i32, tier_b: i32) -> u32 {
 /// owner's vault.
 pub(crate) struct CollisionMaterials {
     category: [u8; MATERIAL_COUNT],
+    /// Everything `sub_824967F8` would read off the material's record, resolved once at load
+    /// instead of per contact. Retail does the vault lookup on every message; the values are
+    /// static, so the table is the same.
+    entries: Vec<MaterialEntry>,
+}
+
+/// One material's row: the seven samples `sub_824967F8` can pick between, plus its level.
+#[derive(Clone, Copy, Debug, Default)]
+struct MaterialEntry {
+    /// `[record+52]`, clamped as the original clamps it.
+    level: u32,
+    /// `tier == 2`.
+    tier_two: u16,
+    /// `tier == 0`, by the paired material's class.
+    tier_zero: [u16; 3],
+    /// Any other tier, by the paired material's class.
+    tier_other: [u16; 3],
 }
 
 impl CollisionMaterials {
@@ -174,13 +202,75 @@ impl CollisionMaterials {
                 Err(_) => unresolved += 1,
             }
         }
-        (Self { category }, unresolved)
+        let entries = (0..MATERIAL_COUNT)
+            .map(|material| Self::entry(vault, material))
+            .collect();
+        (Self { category, entries }, unresolved)
+    }
+
+    /// Read one material's row: `sub_824967F8`'s seven candidate fields and `sub_824965D0`'s level.
+    fn entry(vault: &Collections, material: usize) -> MaterialEntry {
+        let Some(fields) = kind_fields(MATERIAL_SOUND_ID[material]) else {
+            return MaterialEntry::default();
+        };
+        let key = format!("Hash_{:016X}", MATERIAL_VAULT_KEY[material]);
+        let word = |name: &str| -> u32 {
+            if name.is_empty() {
+                return 0;
+            }
+            vault
+                .field(MATERIAL_CLASS, &key, name)
+                .ok()
+                .and_then(|field| u32::from_str_radix(field.data.trim(), 16).ok())
+                .unwrap_or(0)
+        };
+        // The original clamps the level into `0..=32767` before it reaches the voice record.
+        let level = word(MATERIAL_LEVEL_FIELD).min(FULL_SCALE);
+        let sample = |name: &str| u16::try_from(word(name)).unwrap_or(0);
+        MaterialEntry {
+            level,
+            tier_two: sample(fields.tier_two),
+            tier_zero: fields.tier_zero.map(sample),
+            tier_other: fields.tier_other.map(sample),
+        }
     }
 
     /// For tests and for callers that already know the table.
     #[cfg(test)]
     pub(crate) fn from_categories(category: [u8; MATERIAL_COUNT]) -> Self {
-        Self { category }
+        Self { category, entries: vec![MaterialEntry::default(); MATERIAL_COUNT] }
+    }
+
+    /// `sub_824965D0` + `sub_824967F8`: what this material plays against `other` at `tier`.
+    ///
+    /// `None` is retail's own "no sound": a material outside the table, the one whose kind word is
+    /// `-1`, a paired class the kind has no field for, or a sample of 0.
+    pub(crate) fn sample(&self, material: i32, other: i32, tier: i32) -> Option<CollisionSample> {
+        if !(0..MATERIAL_COUNT as i32).contains(&material) {
+            return None;
+        }
+        let fields = kind_fields(self.kind(material))?;
+        let entry = self.entries.get(material as usize)?;
+        let class = usize::try_from(other).ok()?;
+        let sample = match tier {
+            2 => entry.tier_two,
+            0 => *entry.tier_zero.get(class)?,
+            _ => *entry.tier_other.get(class)?,
+        };
+        // Retail leaves its output word at 0 when the field holds nothing, and the caller reads
+        // that as "no voice".
+        (sample != 0).then_some(CollisionSample { bank: fields.bank, sample, level: entry.level })
+    }
+
+    /// `sub_82497910`: the paired material's class, `0..=2`. Materials 95..=113 answer from
+    /// retail's own jump table; everything else reads the `AudioSurfaceMap` word at `+28`, which
+    /// clamps out-of-range materials to element 94 exactly as `SurfaceMap::lookup` does.
+    pub(crate) fn other_class(&self, material: i32, surfaces: &SurfaceMap) -> i32 {
+        if material == NO_MATERIAL {
+            // `sub_824965D0` never calls the classifier for "no material"; it passes 0.
+            return 0;
+        }
+        special_other_class(material).unwrap_or_else(|| surfaces.lookup(material, 28) as i32)
     }
 
     /// `sub_82496FD0`.
@@ -194,9 +284,10 @@ impl CollisionMaterials {
             .unwrap_or(DEFAULT_CATEGORY)
     }
 
-    /// The collision sound id at `+0` of the material's entry. `-1` means the material is silent,
-    /// and `sub_824965D0` returns "no sound" without consulting the chooser at all.
-    pub(crate) fn sound_id(&self, material: i32) -> i32 {
+    /// The kind word at `+0` of the material's entry: which family of fields — and so which bank —
+    /// the material's samples come from. `-1` means the material is silent, and `sub_824965D0`
+    /// returns "no sound" without consulting the chooser at all.
+    pub(crate) fn kind(&self, material: i32) -> i32 {
         if !(0..MATERIAL_COUNT as i32).contains(&material) {
             return -1;
         }
@@ -225,6 +316,99 @@ impl CollisionMaterials {
             PITCH_OUTPUT_OTHER
         }
     }
+}
+
+/// `sub_824967F8`'s field table for one material kind.
+///
+/// The kind is the `+0` word of the material's entry in the image table, and it selects which
+/// *family* of fields on the material record the sample is read from — which in AttribSys is the
+/// same thing as which bank, because the field's retail type name **is** the bank's file name
+/// (`Skate_Collisions` → `Skate_Collisions.bnk`, and so on).
+///
+/// Within a kind, `(tier, other class)` picks the field. `tier == 2` ignores the other class
+/// entirely; `tier == 0` and everything else take one of three fields by the paired material's
+/// class. The offsets in the comments are the ones the lifted code uses, and they come straight
+/// out of the AttribSys class layout in `skaterschema.vlt` — retail's own field order.
+struct KindFields {
+    bank: &'static str,
+    /// `tier == 2`.
+    tier_two: &'static str,
+    /// `tier == 0`, by other class 0/1/2.
+    tier_zero: [&'static str; 3],
+    /// Any other tier, by other class 0/1/2.
+    tier_other: [&'static str; 3],
+}
+
+/// Kind 0 — the `Skate_Collisions` fields, offsets `+112`, `+64`/`+108`/`+120`, `+60`/`+104`/`+116`.
+const COLLISION_FIELDS: KindFields = KindFields {
+    bank: skate_data::audio::splice::COLLISIONS_BANK,
+    tier_two: "Hash_9203DF6FD029B377",
+    tier_zero: ["Hash_BFABF634D2B1E45A", "Hash_9ABFC64574AB2F9F", "Hash_BCD5E888294F7B15"],
+    tier_other: ["Hash_EF9BD81F9CFF725F", "Hash_A3ADCA7B19287B5D", "Hash_C676C87F862C0490"],
+};
+
+/// Kind 1 — the `Skate_Metal` fields, offsets `+92`, `+80`/`+88`/`+100`, `+76`/`+84`/`+96`. This is
+/// the set a metal rail lands on, which is why a rail grind does not sound like concrete.
+const METAL_FIELDS: KindFields = KindFields {
+    bank: METAL_BANK,
+    tier_two: "Hash_F54277A83E0170FD",
+    tier_zero: ["Hash_66A95889604DED36", "Hash_595537EBA0196BE7", "Hash_79DD0E6659793D0E"],
+    tier_other: ["Hash_B722B88FE44B046E", "Hash_1411108A7E9CC74A", "Hash_50796F92F3DE449B"],
+};
+
+/// Kind 2 — the `HOM_Set_1` fields, materials 102..=106.
+///
+/// These are the only fields retail looks up **by hash** (`sub_82B72420`) rather than by offset,
+/// and the class layout says exactly why: they are the ones with no static offset at all. The one
+/// hole is `tier == 0` with other class 0, which goes through `sub_824825D0` — a different
+/// accessor that is not decoded, so that combination resolves to no sample rather than a guess.
+const HOM_FIELDS: KindFields = KindFields {
+    bank: HOM_BANK,
+    tier_two: "Hash_3EA2579C2F3BB23B",
+    tier_zero: ["", "Hash_2A2830137430BB02", "Hash_79BDE00B04DF51B9"],
+    tier_other: ["Hash_5432B35224E4B1C1", "Hash_3FCBE0407F833721", "Hash_53311C6761F135A1"],
+};
+
+/// The two banks beside `Skate_Collisions.bnk` the collision materials name. Both are in a stock
+/// `audiofiles.big`.
+pub(crate) const METAL_BANK: &str = "Skate_Metal.bnk";
+pub(crate) const HOM_BANK: &str = "HOM_Set_1.bnk";
+
+/// `sub_824965D0`'s per-material level, `[record+52]` — clamped to `0..=32767` by the original.
+const MATERIAL_LEVEL_FIELD: &str = "Hash_875BA75341DC8391";
+
+/// `sub_824967F8`'s three-way switch on the material's kind word. Anything other than 1 or 2 takes
+/// the `Skate_Collisions` arm, which is the original's `default:`; `-1` is the silent material and
+/// never reaches here.
+fn kind_fields(kind: i32) -> Option<&'static KindFields> {
+    match kind {
+        -1 => None,
+        1 => Some(&METAL_FIELDS),
+        2 => Some(&HOM_FIELDS),
+        _ => Some(&COLLISION_FIELDS),
+    }
+}
+
+/// The paired material's class, `sub_82497910`, for the materials it answers from its own jump
+/// table at `0x82497944` instead of the surface map. Materials 110..=112 fall through to the
+/// surface-map path with everything else, so they are absent here.
+fn special_other_class(material: i32) -> Option<i32> {
+    Some(match material {
+        96 => 2,
+        98 | 103 | 107 | 108 | 109 => 0,
+        95 | 97 | 99..=102 | 104..=106 | 113 => 1,
+        _ => return None,
+    })
+}
+
+/// What one material contributes to a contact: which bank, which sample, and at what level.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CollisionSample {
+    pub bank: &'static str,
+    /// The Splice sample index. Retail treats 0 as "no sample", so this is never 0.
+    pub sample: u16,
+    /// `[record+52]`, `0..=32767`.
+    pub level: u32,
 }
 
 /// One `CSTATE_Collision` slot and the `SFXObj_Collision` hanging off it.
@@ -284,7 +468,7 @@ impl CollisionStates {
             let material = message.material(record);
             state.started[record] = material != NO_MATERIAL
                 && message.tier(record) != NO_TIER
-                && materials.sound_id(material) != -1;
+                && materials.kind(material) != -1;
         }
         // `sub_824D2318`'s tail: a component that started nothing deactivates its state again.
         if !state.started.iter().any(|started| *started) {
@@ -391,10 +575,10 @@ mod tests {
     fn material_ninety_four_is_the_silent_one() {
         let m = materials();
         // The only `-1` in the retail table, and the same slot `SurfaceMap` clamps to.
-        assert_eq!(m.sound_id(94), -1);
-        assert_ne!(m.sound_id(0), -1);
-        assert_eq!(m.sound_id(NO_MATERIAL), -1);
-        assert_eq!(m.sound_id(-1), -1);
+        assert_eq!(m.kind(94), -1);
+        assert_ne!(m.kind(0), -1);
+        assert_eq!(m.kind(NO_MATERIAL), -1);
+        assert_eq!(m.kind(-1), -1);
     }
 
     #[test]
@@ -478,7 +662,7 @@ mod tests {
         // records — 77, 87, 92, 97, 98 — but the vault itself has them, which is why this test
         // reads the vault and not the export.)
         assert_eq!(unresolved, 1, "unexpected number of materials without a vault record");
-        assert_eq!(materials.sound_id(94), -1);
+        assert_eq!(materials.kind(94), -1);
         let mut seen = [0usize; 10];
         for material in 0..MATERIAL_COUNT as i32 {
             let category = materials.category(material);
@@ -488,6 +672,64 @@ mod tests {
         // Every category is used, so the whole jump table is reachable from real data.
         assert!(seen.iter().all(|count| *count > 0), "unused categories: {seen:?}");
         println!("category histogram {seen:?}, {unresolved} materials without a record");
+    }
+
+    /// The chooser against the real vault: the banks a material's kind selects, the holes retail
+    /// leaves, and what a rail grind actually resolves to.
+    ///
+    ///     cargo test -p skate-game --bin skate3rust -- --ignored the_chooser --nocapture
+    #[test]
+    #[ignore = "needs the owner's assets"]
+    fn the_chooser_picks_real_samples_out_of_the_right_banks() {
+        let assets = std::path::Path::new(
+            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets",
+        );
+        let vault = Collections::load(assets).expect("vault");
+        let (m, _) = CollisionMaterials::load(&vault);
+        let surfaces = SurfaceMap::load(&vault).expect("surface map");
+
+        // Material 94 is the silent one and never reaches the chooser.
+        assert_eq!(m.sample(94, 0, 0), None);
+        assert_eq!(m.sample(NO_MATERIAL, 0, 0), None);
+
+        // Kind 1 is the Skate_Metal family — the reason a metal rail does not sound like concrete.
+        let metal = m.sample(8, 1, 1).expect("material 8 is kind 1");
+        assert_eq!(metal.bank, METAL_BANK);
+        // Kind 0 is the Skate_Collisions family.
+        let concrete = m.sample(0, 1, 1).expect("material 0 is kind 0");
+        assert_eq!(concrete.bank, skate_data::audio::splice::COLLISIONS_BANK);
+        // Kind 2 (materials 102..=106) is HOM_Set_1, and its one undecoded combination —
+        // `tier == 0` against class 0, which goes through `sub_824825D0` — stays silent.
+        assert_eq!(m.sample(104, 0, 0), None);
+        let hom = m.sample(104, 1, 0).expect("material 104 is kind 2");
+        assert_eq!(hom.bank, HOM_BANK);
+
+        // The paired-material classifier: the grind family bases answer from retail's jump table.
+        assert_eq!(m.other_class(95, &surfaces), 1);
+        assert_eq!(m.other_class(96, &surfaces), 2);
+        assert_eq!(m.other_class(98, &surfaces), 0);
+        // Everything else comes off the surface map, and must stay inside the 0..=2 the chooser
+        // indexes with — otherwise the material would silently resolve to nothing.
+        for material in 0..NO_MATERIAL {
+            let class = m.other_class(material, &surfaces);
+            assert!((0..=2).contains(&class), "material {material} has paired class {class}");
+        }
+
+        // What a rail grind actually posts: family base 95/96 as one material, the grind material
+        // (143 → 10) as the other, and the same tier on both.
+        for family_base in [95, 96] {
+            let grind_material = 10;
+            let first = m.sample(family_base, m.other_class(grind_material, &surfaces), 1);
+            let second = m.sample(grind_material, m.other_class(family_base, &surfaces), 1);
+            println!("family {family_base}: {first:?} / {second:?}");
+            let (first, second) = (first.expect("board side"), second.expect("rail side"));
+            // The claim this whole subsystem rests on: a rail grind is *two* voices out of *two*
+            // banks — the board's family base from Skate_Collisions, the rail from Skate_Metal.
+            assert_eq!(first.bank, skate_data::audio::splice::COLLISIONS_BANK);
+            assert_eq!(second.bank, METAL_BANK);
+            assert_ne!(first.sample, 0);
+            assert_ne!(second.sample, 0);
+        }
     }
 
     #[test]

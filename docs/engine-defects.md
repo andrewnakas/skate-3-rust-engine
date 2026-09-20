@@ -472,17 +472,56 @@ that it is more likely a clear exists through a pointer the lifter obscures, so 
 deliberately **does not write the gate**: implementing it as written would silence the very sound
 this work is adding. The read at `contacts.rs:667` stays harmless while the field stays 0.
 
-**Still not ported, and now the only thing between this and audible rail landings:** the sample
-chooser. `sub_824D1F68` (the voice starter, two records, one per material, each skipped when its
-material is 143 or its tier is 3) calls `sub_824965D0`, which early-outs to "no sound" when the
-material's table id is `-1` and otherwise delegates to **`sub_824967F8`** (228 lines, undecoded)
-for the actual sample, alongside `sub_82497910` (64 lines) for the paired material and
-`sub_82496B88` for the special materials 97–100. `sub_824D2318` then keeps the two voices'
-properties updated through `sub_82975B08`.
+### The sample chooser is ported, and a rail grind resolves (2026-09-20, last)
 
-**One more gap that must land with the sample layer:** the two `+0x20`/`+0x24` levels in the
-message are still zero here. They come from `sub_82496C58`'s interpolation (decoded above but not
-ported); nothing in the control plane reads them, but the chooser does.
+`sub_824965D0` -> `sub_824967F8` is a **table, not code**, and the last piece needed to read it was
+the AttribSys *class layout*, which `skaterschema.vlt` carries as a per-field offset
+(`tools/asset_pipeline/vlt.py`'s `fkey, typ, offset, ...`). With it, every offset the lifted code
+uses resolves to a named field:
+
+* The image table at `0x8302D6E8` gives each material a **kind word** (`+0`) and its record key
+  (`+8`). The kind selects which *family* of fields the sample comes from -- and an AttribSys
+  field's retail **type name is its bank**: `Skate_Collisions` -> `Skate_Collisions.bnk`,
+  `Skate_Metal` -> `Skate_Metal.bnk`, `HOM_Set_1` -> `HOM_Set_1.bnk`. All three are in a stock
+  `audiofiles.big`. Kind 0 covers 88 materials, kind 1 (metal) 49, kind 2 five (102..=106), and
+  `-1` the single silent material 94.
+* Within a family, `(tier, the paired material's class)` picks one of seven fields -- `tier == 2`
+  ignores the pair; `tier == 0` and everything else take one of three by class.
+* The paired class is `sub_82497910`: materials 95..=113 answer from a jump table at `0x82497944`
+  (96 -> 2, `98/103/107/108/109` -> 0, the rest -> 1, and 110..=112 fall through), and everything
+  else reads the `AudioSurfaceMap` word at `+28`, whose out-of-range clamp to element 94 is the one
+  `SurfaceMap::lookup` already implements.
+
+**Kind 2 is the tell that this reading is right.** It is the only family retail looks up *by hash*
+(`sub_82B72420`) instead of by offset -- and the class layout says exactly why: those are the only
+fields with no static offset at all. Its one hole, `tier == 0` against class 0, goes through
+`sub_824825D0`, an accessor that is not decoded, so the port leaves that combination silent rather
+than guessing.
+
+**What a rail grind now resolves to**, measured against the owner's vault:
+
+```
+family 95: Skate_Collisions.bnk #879 level 28000  /  Skate_Metal.bnk #399 level 20000
+family 96: Skate_Collisions.bnk #883 level 27000  /  Skate_Metal.bnk #401 level 20000
+```
+
+Two voices, one per material, each chosen against the *other* material's class -- the board's
+family base out of the collisions bank and the rail out of the metal bank. That is why a rail
+grind was never going to be one sound.
+
+`Skate_Metal.bnk` and `HOM_Set_1.bnk` are now in `OPTIONAL_SPLICE_BANKS`. They need ffmpeg to
+decode, which is not present everywhere, so a decode failure on an *optional* bank now logs and
+skips instead of taking the whole player-sound path down -- without that, listing them turned a
+missing ffmpeg into "no player audio at all".
+
+**Still approximated, and worth revisiting:** retail opens these voices through `sub_82975700` and
+keeps their properties current under `sub_824D2318` / `sub_82975A60`; the port uses the same Splice
+one-shot path the pops and the landing already use, with the material record's `+52` level as the
+voice gain. The spatialisation and the per-frame property updates are not ported.
+
+**One more gap that must land with the rest:** the two `+0x20`/`+0x24` levels in the message are
+still zero. They come from `sub_82496C58`'s interpolation (decoded above but not ported); nothing
+the port reads uses them.
 
 As of this commit the two dropped sounds also **report themselves once per run** through the
 existing `SKATE_PLAYER_AUDIO contact_voice_unavailable` channel instead of disappearing silently.

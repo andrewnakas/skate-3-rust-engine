@@ -7,11 +7,15 @@
 //! opened as a one-shot voice (`AuthoredRuntime::play_oneshot`). One retail voice is therefore a
 //! set of handles, held and freed together the way `sub_824836B8` frees the container's children.
 //!
-//! Not routed here: `ContactSound::GrindOnset` and `ContactSound::PopRoll`. Grind onset and the
-//! rolling/scrape contacts are a different subsystem (`sub_82496C58`'s material-pair gain and
-//! `sub_82486EF0`'s request to the contact-sound manager at `[manager+668]`), and the pop-roll
-//! layer's bank is not resolved by the ported selection. Both are dropped with a label rather
-//! than played from an invented sample.
+//! `ContactSound::GrindOnset` takes a different route. Retail's `sub_824BB0E0` does not start a
+//! bank voice at all: it posts a 48-byte message to the contact-sound manager at `[manager+668]`,
+//! which is `CSTATEMGR_Collision`. That subsystem is [`super::collision_states`], and
+//! [`ContactVoicePlayer::post_grind_onset`] drives it — the message resolves to up to two voices,
+//! one per material, each chosen against the *other* material's class.
+//!
+//! Still not routed here: `ContactSound::PopRoll`. The rolling/scrape contacts are
+//! `sub_824BC188`'s own path and the pop-roll layer's bank is not resolved by the ported
+//! selection, so it is dropped with a label rather than played from an invented sample.
 
 use skate_audio_core::authored::{
     AuthoredRuntime,
@@ -21,7 +25,7 @@ use skate_data::audio::splice::{LandingTuning, PopsTuning, SpliceBanks, SpliceSt
 use skate_data::collections::Collections;
 
 use super::audio_state::AudioState;
-use super::collision_states::{CollisionMaterials, CollisionStates, ContactMessage};
+use super::collision_states::{CollisionMaterials, CollisionSample, CollisionStates, ContactMessage};
 use super::components::contacts::{ContactSound, ContactVoices, SurfaceMap, VoiceRequest};
 
 /// Contacts controller output 15 at landing class 2, measured from the real MixMap under the
@@ -125,9 +129,13 @@ impl ContactVoicePlayer {
             banks: SpliceBanks::load(
                 &assets.join("private/stock/data/audio/audiofiles.big"),
                 // The DLC bank is absent from a stock installation; only the stock one is required.
+                // `Skate_Metal.bnk` and `HOM_Set_1.bnk` are the other two families the collision
+                // materials' kind word selects between (`sub_824967F8`).
                 &[
                     skate_data::audio::splice::COLLISIONS_BANK,
                     skate_data::audio::splice::DLC_COLLISIONS_BANK,
+                    super::collision_states::METAL_BANK,
+                    super::collision_states::HOM_BANK,
                 ],
                 &[skate_data::audio::splice::COLLISIONS_BANK],
             )
@@ -172,7 +180,7 @@ impl ContactVoicePlayer {
             // `sub_824BB0E0`'s tail posts to the contact-sound manager rather than starting a
             // bank voice, so the grind onset leaves this path here.
             if matches!(play.sound, ContactSound::GrindOnset) {
-                self.post_grind_onset(&play.request);
+                self.post_grind_onset(runtime, &play.request)?;
                 continue;
             }
             let Some((bank, sample, mut bus)) = self.selection(&play, audio) else {
@@ -264,19 +272,27 @@ impl ContactVoicePlayer {
         Ok(())
     }
 
-    /// `sub_824BB0E0`'s tail: build the 48-byte message and hand it to `CSTATEMGR_Collision`.
+    /// `sub_824BB0E0`'s tail: build the 48-byte message, hand it to `CSTATEMGR_Collision`, and
+    /// start the voices the slot's two records resolve to.
     ///
     /// The argument order is the lifted one — `sub_82486EF0(this, family_base, material, tier,
     /// tier, &position, level_a, level_b, flags…)` — and note the grind onset passes **the same
-    /// tier word twice** (`mr r6,r30` / `mr r7,r30`), so `contact_weight` sees a matched pair and
-    /// the onset lands on the 10000/20000 step rather than the 32767 one.
+    /// tier word twice** (`mr r6,r30` / `mr r7,r30`), so `contact_weight` sees a matched pair.
     ///
-    /// Two message fields are deliberately left at zero, and neither is read by anything ported
-    /// here: the `+0x10` world position (audio state `+48`, which only the spatialisation in the
-    /// unported voice layer consumes) and the two `+0x20`/`+0x24` levels, which come from
-    /// `sub_82496C58`'s per-material interpolation — decoded in `docs/engine-defects.md` #9 but
-    /// not ported, and read only by the sample chooser.
-    fn post_grind_onset(&mut self, request: &VoiceRequest) {
+    /// `sub_824D1F68` then starts one voice per material, each against the *other* material's
+    /// class: that is what makes a rail grind two sounds rather than one — the board's family base
+    /// out of `Skate_Collisions.bnk` and the rail's own material out of `Skate_Metal.bnk`.
+    ///
+    /// Two message fields stay zero here, and neither is read by anything this resolves: the
+    /// `+0x10` world position (audio state `+48`, consumed only by the spatialisation in
+    /// `sub_82975A60`, which is not ported) and the two `+0x20`/`+0x24` levels from
+    /// `sub_82496C58`. The per-voice level below is the material record's own `+52`, which is the
+    /// one `sub_824965D0` writes into the voice record.
+    fn post_grind_onset(
+        &mut self,
+        runtime: &mut AuthoredRuntime,
+        request: &VoiceRequest,
+    ) -> Result<(), String> {
         let tier = request.tier.unwrap_or(0);
         let message = ContactMessage {
             material_a: request.family_base.unwrap_or(0) as i32,
@@ -285,14 +301,56 @@ impl ContactVoicePlayer {
             tier_b: tier,
             ..ContactMessage::default()
         };
-        self.collision.post(message, &self.collision_materials);
-        // Until `sub_824965D0` → `sub_824967F8` are ported the slot drives its controller but
-        // starts no sample, so the onset is still inaudible. Say so once rather than let a rail
-        // landing look like it was never requested.
-        self.report(
-            "GrindOnset posts to CSTATEMGR_Collision, but the sample chooser \
-             (`sub_824965D0` -> `sub_824967F8`) is not ported, so no voice starts yet",
-        );
+        let slot = self.collision.post(message, &self.collision_materials);
+        let started = self.collision.slots()[slot].started;
+        for record in 0..2 {
+            if !started[record] {
+                continue;
+            }
+            // `sub_824D1F68` passes the *other* record's material, which `sub_824965D0` runs
+            // through `sub_82497910` to get its class.
+            let other = self
+                .collision_materials
+                .other_class(message.material(1 - record), &self.surfaces);
+            let Some(sample) =
+                self.collision_materials
+                    .sample(message.material(record), other, message.tier(record))
+            else {
+                continue;
+            };
+            self.play_collision(runtime, &sample);
+        }
+        Ok(())
+    }
+
+    /// Start one collision voice. Retail opens these through `sub_82975700` and keeps them live
+    /// under `sub_824D2318`; this uses the same Splice one-shot path the pops and the landing
+    /// already use, with the material record's level as the voice's gain.
+    fn play_collision(&mut self, runtime: &mut AuthoredRuntime, sample: &CollisionSample) {
+        let members = match self.banks.resolve(sample.bank, sample.sample, &mut self.state, &mut self.rand) {
+            Ok(members) => members,
+            Err(error) => {
+                self.report(&format!("{} sample {:#x}: {error}", sample.bank, sample.sample));
+                return;
+            }
+        };
+        let Some(base) = runtime.bank_base(sample.bank) else {
+            self.report(&format!("Splice bank {} is not installed", sample.bank));
+            return;
+        };
+        let gain = sample.level as f32 / 32_767.0;
+        for member in members {
+            if let Err(error) = runtime.play_oneshot(&OneshotVoice {
+                sample: base + member.stream_offset,
+                gain: member.values.gain * gain,
+                pitch: member.values.pitch,
+                delay: member.values.delay,
+                pan: member.pan,
+                bus: OneshotBus::Default,
+            }) {
+                self.report(&format!("{} sample {:#x} member: {error}", sample.bank, sample.sample));
+            }
+        }
     }
 
     /// Report a contact-sound failure once per distinct message (they would otherwise repeat every
