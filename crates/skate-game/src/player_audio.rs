@@ -27,6 +27,8 @@ mod tuning;
 mod audio_state;
 #[path = "player_audio/components/mod.rs"]
 mod components;
+#[path = "player_audio/contact_voices.rs"]
+mod contact_voices;
 #[path = "player_audio/sound.rs"]
 mod sound;
 #[path = "player_audio/trace.rs"]
@@ -214,7 +216,15 @@ pub(crate) struct Prepared {
 }
 
 pub(crate) fn prepare(assets: &std::path::Path) -> Result<Prepared, String> {
-    let catalog = PlayerAudioCatalog::from_assets(assets, cache_directory().as_deref())
+    let mut catalog = PlayerAudioCatalog::from_assets(assets, cache_directory().as_deref())
+        .map_err(|error| error.to_string())?;
+    // The Splice collision banks (`Skate_Collisions.bnk`) hold the wheel pops and the landing
+    // impact one-shots; they install exactly like the patch banks' samples.
+    catalog
+        .load_splice_banks(
+            &assets.join("private/stock/data/audio/audiofiles.big"),
+            cache_directory().as_deref(),
+        )
         .map_err(|error| error.to_string())?;
     let sample_count = catalog.samples.len();
     let cache_hits = catalog.cache_hits;

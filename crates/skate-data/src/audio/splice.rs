@@ -413,4 +413,144 @@ mod tests {
             println!("  {id:#x} -> samples {samples:?}");
         }
     }
+
+    /// Plays a pop and a landing on the real runtime: the chosen samples must be the vault's, the
+    /// output must be audible and sane, and every voice must be gone afterwards.
+    #[test]
+    #[ignore = "needs the installed assets"]
+    fn plays_a_pop_and_a_landing_headlessly() {
+        use skate_audio_core::authored::AuthoredRuntime;
+        use skate_audio_core::authored::oneshot::{OneshotBus, OneshotVoice};
+        let assets =
+            std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+        let archive = assets.join("private/stock/data/audio/audiofiles.big");
+        if !archive.exists() {
+            return;
+        }
+        let cache = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .map(|p| p.join("Skate3RustEngine/audio-pcm-cache"));
+        let mut catalog =
+            super::super::catalog::PlayerAudioCatalog::from_assets(&assets, cache.as_deref()).unwrap();
+        catalog.load_splice_banks(&archive, cache.as_deref()).unwrap();
+        let splice_samples = catalog
+            .samples
+            .iter()
+            .filter(|s| s.bank.eq_ignore_ascii_case(COLLISIONS_BANK))
+            .count();
+        assert!(splice_samples > 1000, "only {splice_samples} collision samples decoded");
+        let mut runtime =
+            AuthoredRuntime::new(catalog.guest, catalog.projects, catalog.banks).unwrap();
+        for sample in catalog.samples {
+            let base = runtime.bank_base(&sample.bank).unwrap();
+            runtime.insert_pcm(base + sample.header_offset, sample.pcm).unwrap();
+        }
+        let base = runtime.bank_base(COLLISIONS_BANK).unwrap();
+        let banks = SpliceBanks::load(&archive, &[COLLISIONS_BANK], &[COLLISIONS_BANK]).unwrap();
+        let vault = Collections::load(&assets).unwrap();
+        let pops = PopsTuning::load(&vault).unwrap();
+        let landing = LandingTuning::load(&vault).unwrap();
+        let mut state = SpliceState::default();
+        let mut rand = Rand::new(1);
+
+        let mut play = |runtime: &mut AuthoredRuntime,
+                        state: &mut SpliceState,
+                        rand: &mut Rand,
+                        sample_id: u16,
+                        bus: OneshotBus| {
+            let voices = banks
+                .resolve(COLLISIONS_BANK, sample_id, state, rand)
+                .unwrap();
+            assert!(!voices.is_empty());
+            let chosen: Vec<u16> = voices.iter().map(|v| v.sample).collect();
+            let handles: Vec<_> = voices
+                .iter()
+                .map(|member| {
+                    runtime
+                        .play_oneshot(&OneshotVoice {
+                            sample: base + member.stream_offset,
+                            gain: member.values.gain.min(1.0),
+                            pitch: member.values.pitch,
+                            delay: member.values.delay,
+                            bus,
+                        })
+                        .unwrap()
+                })
+                .collect();
+            (chosen, handles)
+        };
+
+        // A hard pop (class 2 at +468 = 0.5) on a plain surface, on the pops' eEQChain bus.
+        let class = pops.class(0.5, -1);
+        assert_eq!(class, 2);
+        let (_, sample_id) = pops.sample(class, surface_category(0, false), false).unwrap();
+        assert_eq!(sample_id, 0x44B);
+        // The runtime's own bus and output players only appear in the stats once a block has been
+        // pumped, so the baseline is taken after one.
+        runtime.pump_once().unwrap();
+        let before = runtime.stats().live_voices;
+        let (pop_samples, mut handles) =
+            play(&mut runtime, &mut state, &mut rand, sample_id, OneshotBus::EqChain(pops.bus));
+        // The landing impact, on the default output bus.
+        let (land_samples, land_handles) = play(
+            &mut runtime,
+            &mut state,
+            &mut rand,
+            landing.sample,
+            OneshotBus::Default,
+        );
+        handles.extend(land_handles);
+        println!("pop samples {pop_samples:?}, landing samples {land_samples:?}");
+
+        // Half a second of blocks, ticking the one-shots at 60 Hz as a component would.
+        let mut peak = 0.0f32;
+        let mut rms = 0.0f64;
+        let mut frames = 0usize;
+        let mut blocks = 0.0f64;
+        let mut live_peak = 0usize;
+        for _ in 0..30 {
+            for handle in handles.iter_mut() {
+                runtime.tick_oneshot(handle, 1.0 / 60.0).unwrap();
+            }
+            blocks += 48_000.0 / 256.0 / 60.0;
+            while blocks >= 1.0 {
+                blocks -= 1.0;
+                let pcm = runtime.pump_once().unwrap();
+                for s in &pcm {
+                    peak = peak.max(s.abs());
+                    rms += f64::from(*s) * f64::from(*s);
+                }
+                frames += pcm.len();
+            }
+            live_peak = live_peak.max(runtime.stats().live_voices);
+        }
+        let rms = (rms / frames.max(1) as f64).sqrt();
+        println!(
+            "peak {peak:.4} rms {rms:.5} live voices before {before}, peak {live_peak}, after {}",
+            runtime.stats().live_voices
+        );
+        assert!(peak > 1e-3, "the one-shots are silent (peak {peak})");
+        assert!(peak <= 1.5, "the one-shots clip hard (peak {peak})");
+        assert!(live_peak > before, "no voice was opened");
+
+        // Every voice must retire: tick until the handles report finished, then the live count must
+        // be back where it started.
+        for _ in 0..600 {
+            let mut live = false;
+            for handle in handles.iter_mut() {
+                live |= runtime.tick_oneshot(handle, 1.0 / 60.0).unwrap();
+            }
+            runtime.pump_once().unwrap();
+            if !live {
+                break;
+            }
+        }
+        let after = runtime.stats().live_voices;
+        println!("live voices after the one-shots finished: {after}");
+        assert!(
+            handles.iter().all(|h| h.voice == 0),
+            "a one-shot was never released"
+        );
+        assert_eq!(after, before, "the one-shots leaked voices");
+    }
 }

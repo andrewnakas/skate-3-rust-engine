@@ -225,8 +225,16 @@ impl AuthoredRuntime {
         }
         let mut installed = HashMap::new();
         for (name, bytes) in banks {
+            // `SPLC` sound banks (the one-shot voices' banks) are not patch banks: the retail
+            // loader takes its other branch for them (`sub_828DC660`'s `[resource+4] == 2`, which
+            // registers their sound table instead of installing patches), so `load_bank`'s `.abk`
+            // fixups must not run over one. They are placed as they are and addressed by
+            // `bank_base` + the sample's offset.
+            let splice = bytes.get(..4) == Some(b"SPLC");
             let at = place(&mut guest, bytes)?;
-            patch::load_bank(&mut guest, at, STACK)?;
+            if !splice {
+                patch::load_bank(&mut guest, at, STACK)?;
+            }
             installed.insert(name, at);
         }
         let mut device = AuthoredDevice {

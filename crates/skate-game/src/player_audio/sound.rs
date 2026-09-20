@@ -15,6 +15,7 @@ use skate_audio_core::mixmap::{self, inputs};
 
 use super::audio_state::AudioState;
 use super::components::{Component, ControlSnapshot, Tick};
+use super::contact_voices::{ContactVoicePlayer, SharedContactVoices};
 use super::tuning::AudioTuning;
 use crate::skate_audio::PlayerAudioObservation;
 
@@ -64,6 +65,8 @@ pub(crate) struct PlayerSound {
     listener: inputs::Listener,
     positions: [(u32, inputs::ObjPos); 2],
     entries: Vec<Entry>,
+    /// The Contacts component's recorded one-shot plays and the player that opens them.
+    contact_voices: Option<(SharedContactVoices, ContactVoicePlayer)>,
     tick: u64,
 }
 
@@ -79,6 +82,7 @@ impl PlayerSound {
         runtime: &mut AuthoredRuntime,
         tuning: AudioTuning,
         entries: Vec<Entry>,
+        contact_voices: Option<(SharedContactVoices, ContactVoicePlayer)>,
     ) -> Result<Self, String> {
         if !runtime.has_mixmap() {
             return Err("the MixMap is not loaded; player sound needs MixMapSK8.mxb".into());
@@ -120,6 +124,7 @@ impl PlayerSound {
                 ),
             ],
             entries,
+            contact_voices,
             tick: 0,
         })
     }
@@ -286,6 +291,12 @@ impl PlayerSound {
             set(runtime, entry.controller, &owner)?;
         }
 
+        // The Contacts component recorded its one-shot plays during its process; open them now,
+        // before the evaluation, as retail's process does.
+        if let Some((shared, player)) = &mut self.contact_voices {
+            player.drain(runtime, shared, &self.audio, FRAME_SECONDS)?;
+        }
+
         // 3. Evaluate.
         runtime
             .mixmap_tick(FRAME_SECONDS)
@@ -329,7 +340,7 @@ pub(crate) fn build(
     use super::components::{
         board::{Board, BoardConfig, BoardVault},
         clothing::Clothing,
-        contacts::FootDrag,
+        contacts::{ContactsOwner, FootDrag},
         footsteps::Footsteps,
         grind::Grind,
         seams::Seams,
@@ -379,7 +390,17 @@ pub(crate) fn build(
     let ctrl = |runtime: &AuthoredRuntime, object: u32, name: &str| {
         controller(runtime, object_key(object), name)
     };
+    // `sub_824B90D8` runs inside the Contacts process before the foot-drag trigger
+    // (`sub_824BB540`), so the owner ticks first and shares the Contacts controller.
+    let voices = SharedContactVoices::default();
+    let contacts_owner = ContactsOwner::new(&vault, true, Box::new(voices.clone()))?;
+    let contact_player = ContactVoicePlayer::new(assets, cache)?;
     let entries = vec![
+        Entry::new(
+            "ContactsOwner",
+            ctrl(runtime, 1, "Contacts")?,
+            Box::new(contacts_owner),
+        ),
         Entry::new("SkateBoard", ctrl(runtime, 0, "SkateBoard")?, Box::new(board)),
         Entry::new("Contacts", ctrl(runtime, 1, "Contacts")?, Box::new(FootDrag::new(&vault)?)),
         Entry::new("Wheels", ctrl(runtime, 2, "Wheels")?, Box::new(wheels_component)),
@@ -395,5 +416,5 @@ pub(crate) fn build(
         ),
         Entry::new("OffBoard", ctrl(runtime, 9, "OffBoard")?, Box::new(Footsteps::new(&vault)?)),
     ];
-    PlayerSound::new(runtime, tuning, entries)
+    PlayerSound::new(runtime, tuning, entries, Some((voices, contact_player)))
 }

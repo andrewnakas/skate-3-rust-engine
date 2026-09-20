@@ -12,7 +12,7 @@
 //! | `sub_829757D0`'s per-member probability | [`plays`] |
 //! | `sub_82975A60`, the container's `+88` value | [`container_value`] |
 //! | `sub_82975700`'s id → record/container resolution | `skate_audio_formats::splc::Splc::resolve` |
-//! | `sub_824836B8`, free the children then the container | [`AuthoredRuntime::release_oneshot`], [`AuthoredRuntime::tick_oneshots`] |
+//! | `sub_824836B8`, free the children then the container | [`AuthoredRuntime::release_oneshot`], [`AuthoredRuntime::tick_oneshot`] |
 //!
 //! The bank side (the `SPLC` records, groups, members, containers and sample table) is decoded in
 //! `skate_audio_formats::splc`, and `skate_data::audio::splice` resolves a sample id into the
@@ -33,7 +33,7 @@
 //! Also not ported, and not needed by a synchronous host: the bank runtime's 40-entry request
 //! queue, its 60-slot voice table and the priority sort (`sub_82975668`, `sub_82975290`,
 //! `sub_82975090`) that hand a queued voice to the audio thread. A member's start delay is kept
-//! and counted down by [`AuthoredRuntime::tick_oneshots`] instead.
+//! and counted down by [`AuthoredRuntime::tick_oneshot`] instead.
 
 use crate::authored::AuthoredRuntime;
 use crate::voice::{OpenRequest, VoiceDevice};
@@ -294,17 +294,32 @@ impl AuthoredRuntime {
         Ok(opened)
     }
 
-    /// Whether a held one-shot has finished playing (its graph is gone, as `[graph+71] == 2` marks
-    /// in retail).
-    pub fn oneshot_finished(&self, handle: &OneshotHandle) -> Result<bool> {
+    /// Whether a held one-shot has finished playing.
+    ///
+    /// The voice's own query (`vtable+20`, what the patch runtime asks) answers it: its first word
+    /// is zero once the voice has ended, and its second is the milliseconds left. Retail's Splice
+    /// manager instead watches `[graph+71] == 2`, which its audio thread sets when the player
+    /// retires; the ported device only sets that on release, so the query is the equivalent test
+    /// here.
+    pub fn oneshot_finished(&mut self, handle: &OneshotHandle) -> Result<bool> {
         if handle.voice == 0 {
             return Ok(false);
         }
-        let player = self.guest.u32(handle.voice + 4)?;
-        if player == 0 {
-            return Ok(true);
+        let out = self.oneshot_query(handle)?;
+        // The remaining milliseconds are `fctiwz((duration − elapsed) × 1000)`, so a sample that has
+        // run out saturates negative rather than reaching zero exactly.
+        Ok(out[0] == 0 || (out[1] as i32) <= 0)
+    }
+
+    /// The voice's query words: `[0]` is zero once it has ended, `[1]` the milliseconds left and
+    /// `[2]` those elapsed (voice `vtable+20`).
+    pub fn oneshot_query(&mut self, handle: &OneshotHandle) -> Result<[u32; 11]> {
+        let mut out = [0u32; 11];
+        if handle.voice != 0 {
+            let Self { guest, owner, .. } = self;
+            owner.device.query(guest, handle.voice, &mut out)?;
         }
-        Ok(self.guest.u8(player + 71)? == 2)
+        Ok(out)
     }
 
     /// `sub_824836B8`: free a held one-shot.
