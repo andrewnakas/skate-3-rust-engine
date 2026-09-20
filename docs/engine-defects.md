@@ -116,6 +116,27 @@ disagreement with the reference scan is a correctness bug in contact generation,
 failing test. The assertion dump is large; the first divergence is in the retention records, so
 start by narrowing which `capacity` / `deferred_reduction` pair diverges.
 
+## 8. Renderer crash on surface teardown — **seen once, did not reproduce**
+
+`wgpu_hal::vulkan` panics with `Trying to destroy a SurfaceAcquireSemaphores that is still in use
+by a SurfaceTexture` (`instance.rs:194`), taking the process down with exit code 0xC0000409.
+Observed once at +24.8 s on 2026-09-20 (crash report
+`report-1789928798791616000-15424.txt`); an immediate relaunch of the same binary ran fine, and the
+four launches before it never hit it. Audio was up and healthy at the time (`player_sound ready`,
+241 Treatment packets traced), so it is a renderer-side race on surface destruction, not audio.
+Intermittent, so it needs repeated launches or a GPU-validation run to pin down.
+
+## 9. Rail / grind landing sounds are not driven — **known gap, needs engine inputs**
+
+Landing *onto* a rail makes no grind-onset sound. `ContactSound::GrindOnset` and
+`ContactSound::PopRoll` are deliberately dropped in `player_audio/contact_voices.rs` rather than
+played from an invented sample: retail routes them through a different subsystem — the
+contact-sound manager at `[manager+668]`, fed by `sub_82496C58`'s per-material level interpolation
+and `sub_82486EF0`'s 48-byte message. That path is also what carries retail's *continuous*
+per-material impact level (see `docs/player-audio-retail-drivers.md` §9), so porting it fixes rail
+landings and adds material-dependent landing weight at the same time. `sub_82486EF0`'s sink was
+traced as far as `[g[0x830CFDC4]+668]->vfunc12`; the handler beyond that is not yet followed.
+
 ---
 
 ## Suggested order for the next session
@@ -126,4 +147,7 @@ start by narrowing which `capacity` / `deferred_reduction` pair diverges.
    one-line repro.
 4. **#3 (powerslide inputs)** — one trace comparison away from being isolated.
 5. **#5 (surfaces)** — large, but the audio side is already ported and waiting.
-6. **#4 (ragdoll/loose board)** and **#6 (NaN crash, once reproduced)**.
+6. **#9 (rail/grind landings)** — one subsystem unlocks rail landings *and* continuous
+   material-dependent landing weight.
+7. **#4 (ragdoll/loose board)**, **#6 (NaN crash)** and **#8 (renderer race)** — all need a repro
+   before they can be chased.
