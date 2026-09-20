@@ -193,7 +193,20 @@ fn retail_collision_world(
                 local_to_world: RetailAffineTransform::IDENTITY,
                 world_to_local: RetailAffineTransform::IDENTITY,
                 local_bounds: bounds,
-                matching_group: i32::from(group),
+                // Static registration `sub_82776B58` hands the mesh-record ctor
+                // `sub_8276CB18` a hardcoded `li r8,-1` for matchingID (+180),
+                // alongside the `li r7,0` / `li r6,0` for the rejection mask and
+                // support identity that the two fields above already reproduce.
+                // Every call site of that ctor passes a constant -1 except one,
+                // and that one reads its id from a registered actor/unit object
+                // (+40) -- never from cluster data. The cluster's packed unit
+                // group is a *per-triangle* attribute in retail: `sub_82AC8A68`
+                // stores it at triangle+84, right next to the surface code at
+                // +88 that `packed_surfaces` above carries. Filing it on the
+                // mesh made `matches()` reject every actor whose id was not the
+                // cluster's, silently hiding static geometry from offboard
+                // ground and line queries.
+                matching_group: -1,
                 pool: QueryPool::Ground,
             });
         }
@@ -1273,7 +1286,12 @@ mod tests {
         assert_eq!(world.triangles().len(), 3);
         let metadata = world.query_metadata().unwrap();
         assert_eq!(metadata.meshes.len(), 3);
-        assert_eq!(metadata.meshes[1].matching_group, 0x1234);
+        // The cluster group still partitions the clusters into meshes (three
+        // here), but it must not land on the mesh's matchingID: retail's static
+        // registration writes -1 there. See the comment at the construction
+        // site. This is what `embedded_static_rwcm_hits_distinct_actor_query_ids`
+        // depends on, and the two tests disagreed until 2026-09-20.
+        assert!(metadata.meshes.iter().all(|m| m.matching_group == -1));
         assert_eq!(metadata.packed_surfaces, vec![0x4321; 3]);
         assert_eq!(world.triangles()[1].triangle.vertices[0].x, 10.);
     }
