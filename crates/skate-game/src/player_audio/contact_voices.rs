@@ -237,6 +237,37 @@ impl ContactVoicePlayer {
             ContactSound::Landing => {
                 Some((self.landing.bank(), self.landing.sample, OneshotBus::Default))
             }
+            // `sub_824B8D48` via `sub_824BA3F0`: index `3 × kind + class` with `kind = 0` for a
+            // landing, and the mode is the surface category only for a class-2 landing.
+            //
+            // The class is the largest `+448` bucket over the wheels that are in contact
+            // (`+464`), exactly as `sub_824BA630`'s tail computes it for MixMap input 2. Retail
+            // derives those buckets from time in air, thresholded at 0.62 s and 1.00 s.
+            ContactSound::LandingClass => {
+                let (mut class, mut landed) = (0, false);
+                for wheel in 0..4 {
+                    if audio.wheel_landed_464[wheel] {
+                        landed = true;
+                        class = class.max(audio.wheel_landing_bucket_448[wheel]);
+                    }
+                }
+                if !landed {
+                    return None;
+                }
+                let material = audio.wheel_material_620[0];
+                let lane = if material >= 143 {
+                    0
+                } else {
+                    self.surfaces.lookup(material as i32, 8) as u32
+                };
+                let category = surface_category(lane, audio.soft_wheels_684 != 0);
+                let sample = self.landing.class_sample(0, class, category)?;
+                // APPROXIMATION: retail routes this voice through the owner's send bus, whose
+                // level is the Contacts controller's output 15 (`sub_824B8D48` @ 0x824B8E88 →
+                // `sub_82488DD0`). That send is an environment level worth about ±3 dB and is not
+                // ported, so the dry voice goes to the default bus here.
+                Some((self.landing.bank(), sample, OneshotBus::Default))
+            }
             // Pops off (see `pops_enabled`), and the two paths that are a different subsystem.
             ContactSound::Pop | ContactSound::PopRoll | ContactSound::GrindOnset => None,
         }

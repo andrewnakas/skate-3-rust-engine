@@ -208,11 +208,28 @@ pub struct PopsTuning {
     pub bus: u32,
 }
 
-/// The vault value the landing impact reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The vault values the landing impact reads.
+#[derive(Clone, Debug, PartialEq)]
 pub struct LandingTuning {
-    /// `0x633FA94E39C1AE8F` — `Skate_Collisions` sample `0x447`.
+    /// `0x633FA94E39C1AE8F` — `Skate_Collisions` sample `0x447`. The impact itself, opened on the
+    /// default output bus at a fixed level: retail passes `block[1] = 1.0`, and `sub_82975B08`
+    /// (which would re-scale a voice by its container value each frame) is never called for a
+    /// Contacts voice, so this one-shot's gain really is just its member gain. A landing is *not*
+    /// made louder by being harder — see [`Self::ladder_sample`].
     pub sample: u16,
+    /// `sub_824BA630` @ 0x824BAC54's second landing voice: a 2×2 ladder over the deck material
+    /// test and time in air, which is how retail makes a hard landing *sound* different rather
+    /// than louder. Indexed `[material_test][hard]`:
+    /// `0x35C`/`0x35D` when the test is 0 (`0xF262042EAA295711` / `0x3A2F1C788E21D92D`),
+    /// `0x35E`/`0x35F` otherwise (`0x1E86469556ACD80A` / `0xBF22DD8BC69DDE53`).
+    pub ladder: [[u16; 2]; 2],
+    /// `0x224B06562D9D5E0E` = 0.75 s — the time-in-air split between the soft and hard columns.
+    pub ladder_seconds: f32,
+    /// `sub_824BA3F0`'s four sample arrays, one per mode: `0x5A93802D11B00173`,
+    /// `0xA0F86FEEA9C2412F`, `0x797EC34502499EC3`, `0xAB0D92058B4293A7` (13 ids each). This is the
+    /// voice `sub_824B8D48` opens, and it is what actually makes one landing sound unlike another:
+    /// the *level* is fixed, the *sample* changes. See [`Self::class_sample`].
+    pub class_modes: [Vec<u16>; 4],
 }
 
 fn ids(vault: &Collections, class: &str, name: &str) -> Result<Vec<u16>, Error> {
@@ -289,13 +306,59 @@ impl PopsTuning {
     }
 }
 
+/// One `Skate_Collisions` id from the Contacts collection.
+fn word(vault: &Collections, name: &str) -> Result<u16, Error> {
+    Ok(vault
+        .words::<1>(CONTACTS_CLASS, "default", name)
+        .map_err(Error::Format)?[0] as u16)
+}
+
 impl LandingTuning {
     pub fn load(vault: &Collections) -> Result<Self, Error> {
         Ok(Self {
             sample: vault
                 .words::<1>(CONTACTS_CLASS, "default", "Hash_633FA94E39C1AE8F")
                 .map_err(Error::Format)?[0] as u16,
+            ladder: [
+                [
+                    word(vault, "Hash_F262042EAA295711")?,
+                    word(vault, "Hash_3A2F1C788E21D92D")?,
+                ],
+                [
+                    word(vault, "Hash_1E86469556ACD80A")?,
+                    word(vault, "Hash_BF22DD8BC69DDE53")?,
+                ],
+            ],
+            ladder_seconds: f32::from_bits(
+                vault
+                    .words::<1>(CONTACTS_CLASS, "default", "Hash_224B06562D9D5E0E")
+                    .map_err(Error::Format)?[0],
+            ),
+            class_modes: [
+                ids(vault, CONTACTS_CLASS, "Hash_5A93802D11B00173")?,
+                ids(vault, CONTACTS_CLASS, "Hash_A0F86FEEA9C2412F")?,
+                ids(vault, CONTACTS_CLASS, "Hash_797EC34502499EC3")?,
+                ids(vault, CONTACTS_CLASS, "Hash_AB0D92058B4293A7")?,
+            ],
         })
+    }
+
+    /// `sub_824BA3F0`: the sample for the `sub_824B8D48` voice.
+    ///
+    /// The index is `3 × kind + class`, and the mode is the surface category
+    /// ([`surface_category`]) — but only for a class-2 landing: `sub_824BA3F0` masks the mode with
+    /// `class >= 2`, so a light or medium landing always reads mode 0. A landing calls
+    /// `sub_824B8D48(this, 0, max_class, 0)`, i.e. `kind = 0`.
+    pub fn class_sample(&self, kind: u32, class: u32, category: u8) -> Option<u16> {
+        let mode = if class >= 2 { usize::from(category) } else { 0 };
+        let index = 3 * kind as usize + class as usize;
+        self.class_modes.get(mode)?.get(index).copied()
+    }
+
+    /// The ladder sample for a landing: `test` is `sub_82494D78` of the deck material (0 or not),
+    /// `air_seconds` the latched audio-state `+236`.
+    pub fn ladder_sample(&self, test: bool, air_seconds: f32) -> u16 {
+        self.ladder[usize::from(test)][usize::from(air_seconds >= self.ladder_seconds)]
     }
 
     /// The landing impact plays on the default output bus (`sub_824BA630` passes

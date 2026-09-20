@@ -361,6 +361,10 @@ pub(crate) enum ContactSound {
     PopRoll,
     /// `sub_824BA630` first voice, held at `+56`.
     Landing,
+    /// `sub_824BA630`'s companion `sub_824B8D48(this, 0, max_class, 0)`, held at `+52`. Its sample
+    /// is chosen by the landing class (`sub_824BA3F0`), which is how retail makes a hard landing
+    /// sound unlike a soft one — the levels of both voices are fixed.
+    LandingClass,
     /// `sub_824BB0E0`.
     GrindOnset,
 }
@@ -555,6 +559,8 @@ pub(crate) struct ContactsOwner {
     held_pop_60: Option<u32>,
     held_roll_96: Option<u32>,
     held_landing_56: Option<u32>,
+    /// `sub_824B8D48`'s voice, retail slot `+52`.
+    held_landing_class_52: Option<u32>,
     voices: Box<dyn ContactVoices>,
 }
 
@@ -573,6 +579,7 @@ impl ContactsOwner {
             held_pop_60: None,
             held_roll_96: None,
             held_landing_56: None,
+            held_landing_class_52: None,
             voices,
         })
     }
@@ -644,6 +651,15 @@ impl ContactsOwner {
             ..VoiceRequest::default()
         };
         self.held_landing_56 = self.voices.play(ContactSound::Landing, &request);
+        // `sub_824BA630` @ 0x824BB074 then calls `sub_824B8D48(this, 0, max_class, 0)`. Its sample
+        // is picked from the landing class, so it — not the fixed-level impact above — is what
+        // makes a heavy landing sound different from a light one. The sink resolves the class and
+        // the surface category from the audio state, the way it already does for the pops.
+        if let Some(handle) = self.held_landing_class_52.take() {
+            self.voices.free(handle);
+        }
+        self.held_landing_class_52 =
+            self.voices.play(ContactSound::LandingClass, &VoiceRequest::default());
     }
 
     /// `sub_824BB0E0`.
@@ -1125,6 +1141,7 @@ mod owner_tests {
             held_pop_60: None,
             held_roll_96: None,
             held_landing_56: None,
+            held_landing_class_52: None,
             voices: Box::new(sink.clone()),
         };
         (owner, sink)
@@ -1228,7 +1245,10 @@ mod owner_tests {
         o.step(&ContactsInputs::default());
         o.step(&ContactsInputs::default());
         o.step(&air(5));
-        assert_eq!(sink.kinds(), vec![ContactSound::Landing, ContactSound::Pop]);
+        assert_eq!(
+            sink.kinds(),
+            vec![ContactSound::Landing, ContactSound::LandingClass, ContactSound::Pop]
+        );
         assert_eq!(sink.freed(), vec![1]);
     }
 
@@ -1242,7 +1262,7 @@ mod owner_tests {
         sink.take();
         o.step(&ContactsInputs::default());
         o.step(&air(5));
-        assert_eq!(sink.kinds(), vec![ContactSound::Landing]);
+        assert_eq!(sink.kinds(), vec![ContactSound::Landing, ContactSound::LandingClass]);
     }
 
     #[test]
@@ -1253,10 +1273,12 @@ mod owner_tests {
         // Falling edge, not grinding: the landing voice, and the frame counter resets.
         o.step(&ContactsInputs::default());
         let played = sink.take();
-        assert_eq!(played.len(), 1);
+        // The impact and `sub_824B8D48`'s class voice, in retail's order.
+        assert_eq!(played.len(), 2);
         assert_eq!(played[0].0, ContactSound::Landing);
         assert_eq!(played[0].1.sample, Some(1095));
         assert_eq!(played[0].1.eq_chain, Some(1));
+        assert_eq!(played[1].0, ContactSound::LandingClass);
         assert_eq!(o.latches().frames_424, 0);
 
         // Landing into a grind plays no landing voice; the grind onset takes over.
@@ -1355,6 +1377,7 @@ mod owner_tests {
             held_pop_60: None,
             held_roll_96: None,
             held_landing_56: None,
+            held_landing_class_52: None,
             voices: Box::new(sink.clone()),
         };
         let mut frames: Vec<(u32, ContactSound)> = Vec::new();
@@ -1386,7 +1409,9 @@ mod owner_tests {
                     assert!(now.in_known_air_332 && !previous.in_known_air_332, "frame {frame}");
                     assert!(now.trick_active_343, "frame {frame}");
                 }
-                ContactSound::Landing => {
+                // `sub_824B8D48`'s voice is played from the same `sub_824BA630` call as the
+                // impact, so it sits on the same landing edge of the captured state.
+                ContactSound::Landing | ContactSound::LandingClass => {
                     assert!(!now.in_known_air_332 && previous.in_known_air_332, "frame {frame}");
                     assert!(!now.grinding_341, "frame {frame}");
                 }
