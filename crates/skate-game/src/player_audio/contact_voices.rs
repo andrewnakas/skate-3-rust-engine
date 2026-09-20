@@ -144,6 +144,16 @@ impl ContactVoicePlayer {
         }
         for play in queued {
             let Some((bank, sample, mut bus)) = self.selection(&play, audio) else {
+                // The two unported subsystem paths dropped silently, which made a
+                // rail landing look like nothing had even been requested. Say so
+                // once per run; the other `None`s are ordinary (pops disabled, or
+                // a landing with no wheel actually down).
+                if matches!(play.sound, ContactSound::PopRoll | ContactSound::GrindOnset) {
+                    self.report(&format!(
+                        "{:?} needs the contact-sound manager ([manager+668], `sub_82486EF0`); not ported, so this contact is silent",
+                        play.sound
+                    ));
+                }
                 continue;
             };
             // `sub_824B9CC8` routes the pops through the owner's own send bus, whose first send

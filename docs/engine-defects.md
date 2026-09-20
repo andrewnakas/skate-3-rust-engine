@@ -61,18 +61,34 @@ values.
 **Fixed when.** An ordinary ollie runs in state 201, and `air_timing` can be deleted in favour of
 reading Air+176/+184 directly.
 
-## 3. Powerslide squeaks never fire — **reproduced, root cause not isolated**
+## 3. Powerslide squeaks — **the "never fires" premise was wrong (corrected 2026-09-20)**
 
-**Symptom.** No powerslide squeak sound, ever.
+**Symptom as originally recorded.** No powerslide squeak sound, ever.
 
-**Evidence.** Retail's gate is: both feet inside the deck box (`+615`/`+616`), more than one wheel
-down, and `|deck tilt +264| × 114.5916 ≥ 15` (retail's slides sit at 0.14–0.28 rad). In a Rust
-playtest the squeak never posts, so at least one of those inputs does not reach retail's values
-during PhysicsSlideGround (state 101). Which one is not yet isolated.
+**That premise does not survive the traces.** Retail's gate is: both feet inside the deck box
+(`+615`/`+616`), more than one wheel down, and `|deck tilt +264| × 114.5916 ≥ 15` (the threshold is
+vault-loaded, `Hash_A129B33B4A2C7961`). Counting over the existing `logs/audio-trace-*.log`, the
+gate passes on thousands of frames per session and `Class_Squeaks` **is posted**: 85 posts in
+`audio-trace-20260920-122739.log`, 70 in `...-111039.log`, with thousands of `UP` redeliveries.
+`|tilt264|` reaches 0.38–0.64 rad, comfortably past retail's 0.14–0.28 band, so the tilt input is
+not short either. The gate and its four inputs are fine.
 
-**How to isolate.** Run with `SKATE_AUDIO_TRACE=<file>`, powerslide, and compare the `AS` lines
-(they carry `tilt264`, `feet615`, `feet616`, `wheels200`) against the retail capture's `state.tsv`
-for the same manoeuvre. The mismatching field is the defect.
+**What is actually unknown.** `tilt264` is the *steering* tilt (an exponential blend in
+`TruckSteeringState::update`), not a slide-specific angle, so a passing gate does not prove the
+squeak fired *during* PhysicsSlideGround. The `AS` trace line carried no state id, so the logs
+could not answer it. That is now fixed: `AS` carries `st=` (State+16) and `cat=` (State+12) as of
+this commit.
+
+**How to finish it.** Play, powerslide, and filter the new trace for `st=101`:
+`grep "AS st=101" <trace>` — then check whether those frames pass the gate and whether a
+`Class_Squeaks` `PO` sits on the same frame number. If they do, the squeak is firing and the
+remaining question is its rendered level (the posted speed word runs as low as 19/1000 at slide
+onset while the turn word saturates at 1000); if they do not, compare the four fields on those
+frames against the retail capture's `state.tsv`.
+
+**Note for whoever picks this up:** the `DirectMixer` block in `player_audio.rs` also references
+`Brd_Squeaks.abk` on a different gate, but it is dead code — the struct is never constructed. It
+is not a confound.
 
 ## 4. Bail / ragdoll native outputs are absent — **known gap**
 
@@ -101,7 +117,26 @@ A playtest crashed on a landing with a NaN torque in the physics solver. It is u
 and has not been reproduced since; no current log carries it. Listed so it is not forgotten, but it
 needs a repro before it can be chased. Treat the diagnosis as unconfirmed.
 
-## 7. Broadphase disagrees with a full scan — **reproducible test failure**
+## 7. Broadphase disagrees with a full scan — **resolved 2026-09-20: the test was wrong**
+
+The engine is correct; the oracle was not. `tiled()` lays all 1024 fixture faces in the plane
+`y=0` and the probe volumes sit at `y=0.25`. The recovered candidate producer `82ACEA30` offers
+only the triangle's own face normal for point/segment/triangle volumes — no edge or vertex axes —
+so a coplanar tile 10 km away in x still projects to a ~0.05 separation and survives `82ACE968`'s
+`separation > fat + limit` gate. The linear reference therefore handed the narrow phase 1024 tiles
+it would never see natively and collected 1025 contacts for a sphere that touches two triangles;
+the hierarchy returned the correct 2. The mismatch only surfaced once `capacity = 100` truncated
+the bogus set, which is why it looked like a retention bug.
+
+That is native behaviour, not a defect: the native narrow phase is only ever reached through a
+broadphase that has already rejected laterally, and **every in-game `BoardWorld` is built with
+`with_query_metadata`**, so the per-triangle bounds cull is always active. `BoardWorld::new`
+without metadata is test-only. Staggering the distant tiles in Y — separating them along the one
+axis the SAT does test — makes the full scan a valid oracle again; linear and accelerated then
+agree at 2/4/8/6 contacts for the sphere, capsule, rounded box and triangle. Fixed in the commit
+that added this paragraph; 606 `skate-core` tests pass.
+
+*Original entry, kept because the wrong diagnosis is instructive:*
 
 `physics::board_world::broadphase_tests::predictive_contacts_and_retention_match_full_scan_for_every_primitive`
 (`crates/skate-core/src/physics/board_world/tests.rs:232`) fails deterministically:

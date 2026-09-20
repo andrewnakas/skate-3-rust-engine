@@ -157,7 +157,7 @@ impl PlayerSound {
         // 1. Bridge, then `sub_824B19C8`.
         super::trace::frame(self.tick);
         self.audio.update(&observation.retail, &self.tuning);
-        super::trace::state(&self.audio);
+        super::trace::state(&self.audio, &observation.retail);
         let audio = &self.audio;
         let fields = inputs::StateFields {
             wheel_count_200: audio.wheel_count_200,

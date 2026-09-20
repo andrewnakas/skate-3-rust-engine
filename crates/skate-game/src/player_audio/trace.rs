@@ -7,7 +7,8 @@
 //! * `PO <slot> <index> <name> <payload> 0 | 28 words | handle=<handle>` — a post;
 //! * `UP <node> <name> <payload> | 28 words` — a redelivery;
 //! * `RL <node> <name>` — a release;
-//! * `AS <field>=<value> …` — the audio-state fields the families' triggers read;
+//! * `AS st=<state> cat=<category> <field>=<value> …` — the physical state id and the
+//!   audio-state fields the families' triggers read;
 //! * `OUT <p0..p5> | rms <r> frames <n> ch <c>` — one per rendered block, in the retail capture's
 //!   own format (the six native channels before the host downmix), so the two can be compared
 //!   directly; `DEV <peak> <rms>` follows it with the stereo the host actually receives.
@@ -18,6 +19,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use super::audio_state::AudioState;
+use crate::skate_audio::RetailAudioInputs;
 
 struct Trace {
     out: std::io::BufWriter<std::fs::File>,
@@ -123,10 +125,16 @@ pub(crate) fn output(native: &[f32], channels: usize, stereo: &[f32]) {
     });
 }
 
-pub(crate) fn state(a: &AudioState) {
+/// The physical state id travels alongside the audio state because several
+/// gates (the squeak's especially) only mean anything while their owning state
+/// is running: `tilt264` is the steering tilt, not a slide-specific angle, so a
+/// passing gate proves nothing on its own. `st` is State+16, `cat` is State+12.
+pub(crate) fn state(a: &AudioState, inputs: &RetailAudioInputs) {
     with(|t| {
         t.line(format_args!(
-            "AS v208={:.3} wheels200={} tilt264={:.4} air332={} grind341={} feet615={} feet616={} slip232={:.4} trick348={} bail676={} walk716={} down724={} down725={} land448={:?} landed464={:?}",
+            "AS st={} cat={} v208={:.3} wheels200={} tilt264={:.4} air332={} grind341={} feet615={} feet616={} slip232={:.4} trick348={} bail676={} walk716={} down724={} down725={} land448={:?} landed464={:?}",
+            inputs.state,
+            inputs.state_category,
             a.ground_speed_208,
             a.wheel_count_200,
             a.deck_tilt_264,
