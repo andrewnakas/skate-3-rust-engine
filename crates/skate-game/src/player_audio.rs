@@ -29,6 +29,10 @@ mod audio_state;
 mod components;
 #[path = "player_audio/contact_voices.rs"]
 mod contact_voices;
+#[path = "player_audio/collision_materials.rs"]
+mod collision_materials;
+#[path = "player_audio/collision_states.rs"]
+mod collision_states;
 #[path = "player_audio/sound.rs"]
 mod sound;
 #[path = "player_audio/trace.rs"]

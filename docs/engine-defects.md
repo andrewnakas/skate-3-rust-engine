@@ -432,12 +432,57 @@ The remaining unread piece is the body of `sub_824D2318` past the resolver calls
 that turns the four indices plus the two 0…32767 levels into the two voice records — and
 `sub_824AF240` / `sub_824C5910`, which turn an index into an actual bank entry.
 
-**One confirmed, independent port gap while you are in there.** `ContactLatches::grind_gate_124` is
-read at `contacts.rs:667` but **never written anywhere in the tree**. Retail writes it at
-`sub_824BB0E0`'s tail from the constant at `0x8209975C` — verified directly in the lifted asm
-(`lfs f0,124(r3)` at the head, `stfs f0,124(r25)` at the tail). That is the onset's cooldown /
-re-arm; without it, once the onset *is* driven it will retrigger on every grind edge with no
-spacing. Fixing this now is pointless while the sound is silent, but it must land with the sink.
+### The control plane is ported (2026-09-20, later still)
+
+`player_audio/collision_states.rs` + `collision_materials.rs` now hold the manager, and
+`contact_voices.rs` posts the grind onset to it instead of dropping it. 10 unit tests, plus an
+`--ignored` test that resolves all 143 material categories against the owner's real vault.
+What the port covers, and the three things the port itself established:
+
+**The indices are MixMap controller outputs, not bank entries.** `SFXObj_Collision::vtable[+60]`
+(`sub_824AF240`) and `vtable[+56]` (`sub_824C5910`) are the *same* two accessors the other
+components already use — `[[this+12]+12]` indexed as packed 16-bit words, the first masked to 15
+bits, the second sign-extended and scaled by `0x822F889C` = **4096.0**. So `sub_824D20E8` /
+`sub_824D22B8` choose *which output id* a material reads, nothing more.
+
+That predicts the ten Collision controllers are `0x40030000 + 0x800·slot`, because
+`sub_828DEA00` packs a component key as `0x40000000 | category<<16 | index<<11 | kind<<4`.
+**The retail MixMap confirms it exactly** (`cargo run -p skate-audio-core --example mixmap_dump`):
+ten `SFXObj_Collision` controllers, `40030000` … `40034800`, whose outputs run `0..=22` with
+**precisely 1 and 22 typed `t1`** — the signed/scaled type `sub_824C5910` reads — and the rest
+`t0`. An independent source agreeing with the vtable walk end to end.
+
+**The material category is a vault lookup, not a table.** `sub_82496FD0(material)` reads the
+material's 64-bit AttribSys key from a 16-byte-stride table at `0x8302D6E8` (`+0` the material's
+collision sound id, `-1` = silent; `+8` the key), looks the record up under class
+`D40CB4C0FFE45676`, and returns the field `D5EF686287A57AFE` — retail type
+`Sk8::Audio::eMaterialNicotineType`, exactly ten values, which is what the `0..=9` jump table
+indexes. Over the owner's vault the histogram is `[12, 49, 2, 7, 11, 11, 3, 9, 34, 5]` = 143, so
+every arm of the table is reachable from real data. Only material **94** has no record — its key
+is all zeroes and its sound id is the table's only `-1`, the same slot `SurfaceMap` clamps to.
+(Worth noting: the `skater-collections.json` export is missing five further material records that
+the vault itself has. Read the vault, not the export.)
+
+**Correction to the `grind_gate_124` note below: it is not a cooldown.** Across every lifted
+function, `+124` on `SFXObj_Contacts` is written in exactly two places — zeroed by the constructor
+`sub_824B7CA8`, and set to `0.5` (`0x8209975C`) at `sub_824BB0E0`'s tail. **Nothing ever clears
+it**, including `sub_824BB330` and the `sub_82489058` reset (which only touches `[p+0]`). Read
+literally, retail plays the grind onset at most *once per component lifetime*. That is odd enough
+that it is more likely a clear exists through a pointer the lifter obscures, so the port
+deliberately **does not write the gate**: implementing it as written would silence the very sound
+this work is adding. The read at `contacts.rs:667` stays harmless while the field stays 0.
+
+**Still not ported, and now the only thing between this and audible rail landings:** the sample
+chooser. `sub_824D1F68` (the voice starter, two records, one per material, each skipped when its
+material is 143 or its tier is 3) calls `sub_824965D0`, which early-outs to "no sound" when the
+material's table id is `-1` and otherwise delegates to **`sub_824967F8`** (228 lines, undecoded)
+for the actual sample, alongside `sub_82497910` (64 lines) for the paired material and
+`sub_82496B88` for the special materials 97–100. `sub_824D2318` then keeps the two voices'
+properties updated through `sub_82975B08`.
+
+**One more gap that must land with the sample layer:** the two `+0x20`/`+0x24` levels in the
+message are still zero here. They come from `sub_82496C58`'s interpolation (decoded above but not
+ported); nothing in the control plane reads them, but the chooser does.
 
 As of this commit the two dropped sounds also **report themselves once per run** through the
 existing `SKATE_PLAYER_AUDIO contact_voice_unavailable` channel instead of disappearing silently.

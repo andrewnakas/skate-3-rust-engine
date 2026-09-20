@@ -21,6 +21,7 @@ use skate_data::audio::splice::{LandingTuning, PopsTuning, SpliceBanks, SpliceSt
 use skate_data::collections::Collections;
 
 use super::audio_state::AudioState;
+use super::collision_states::{CollisionMaterials, CollisionStates, ContactMessage};
 use super::components::contacts::{ContactSound, ContactVoices, SurfaceMap, VoiceRequest};
 
 /// Contacts controller output 15 at landing class 2, measured from the real MixMap under the
@@ -100,12 +101,27 @@ pub(crate) struct ContactVoicePlayer {
     pops_enabled: bool,
     /// The pops' owner-local six-channel send bus (`sub_82488DD0`), built on first use.
     pops_send: Option<u32>,
+    /// `CSTATEMGR_Collision` and its per-material table: the subsystem the grind onset posts to.
+    collision: CollisionStates,
+    collision_materials: CollisionMaterials,
 }
 
 impl ContactVoicePlayer {
     pub(crate) fn new(assets: &std::path::Path, cache: Option<&std::path::Path>) -> Result<Self, String> {
         let vault = Collections::load(assets)?;
+        // `sub_82496FD0` resolves a material's category through the vault one lookup at a time;
+        // doing all 143 once here is the same table. Only material 94 — the silent slot, whose
+        // key is all zeroes — is expected to be missing, so anything else is worth saying.
+        let (collision_materials, unresolved) = CollisionMaterials::load(&vault);
+        if unresolved > 1 {
+            eprintln!(
+                "SKATE_PLAYER_AUDIO contact_voice_unavailable {unresolved} collision materials \
+                 have no vault record; their category falls back to retail's default record"
+            );
+        }
         Ok(Self {
+            collision: CollisionStates::new(),
+            collision_materials,
             banks: SpliceBanks::load(
                 &assets.join("private/stock/data/audio/audiofiles.big"),
                 // The DLC bank is absent from a stock installation; only the stock one is required.
@@ -153,12 +169,18 @@ impl ContactVoicePlayer {
             }
         }
         for play in queued {
+            // `sub_824BB0E0`'s tail posts to the contact-sound manager rather than starting a
+            // bank voice, so the grind onset leaves this path here.
+            if matches!(play.sound, ContactSound::GrindOnset) {
+                self.post_grind_onset(&play.request);
+                continue;
+            }
             let Some((bank, sample, mut bus)) = self.selection(&play, audio) else {
                 // The two unported subsystem paths dropped silently, which made a
                 // rail landing look like nothing had even been requested. Say so
                 // once per run; the other `None`s are ordinary (pops disabled, or
                 // a landing with no wheel actually down).
-                if matches!(play.sound, ContactSound::PopRoll | ContactSound::GrindOnset) {
+                if matches!(play.sound, ContactSound::PopRoll) {
                     self.report(&format!(
                         "{:?} needs the contact-sound manager ([manager+668], `sub_82486EF0`); not ported, so this contact is silent",
                         play.sound
@@ -227,6 +249,11 @@ impl ContactVoicePlayer {
             }
             self.live.push(Live { id: play.id, handles });
         }
+        // `sub_824D1E00` runs on every `SFXObj_Collision` every frame, whether or not anything was
+        // posted this one: it rewrites both inputs from zero and only then decides to raise them.
+        for (key, id, value) in self.collision.drive() {
+            runtime.mixmap_apply(key, &[(id, value)]).map_err(|e| e.to_string())?;
+        }
         for live in &mut self.live {
             for handle in &mut live.handles {
                 runtime.tick_oneshot(handle, dt).map_err(|e| e.to_string())?;
@@ -235,6 +262,37 @@ impl ContactVoicePlayer {
         // A play whose voices have all finished keeps no handles; retail's slot still holds its
         // container until the component frees it, so the entry stays until `free`.
         Ok(())
+    }
+
+    /// `sub_824BB0E0`'s tail: build the 48-byte message and hand it to `CSTATEMGR_Collision`.
+    ///
+    /// The argument order is the lifted one — `sub_82486EF0(this, family_base, material, tier,
+    /// tier, &position, level_a, level_b, flags…)` — and note the grind onset passes **the same
+    /// tier word twice** (`mr r6,r30` / `mr r7,r30`), so `contact_weight` sees a matched pair and
+    /// the onset lands on the 10000/20000 step rather than the 32767 one.
+    ///
+    /// Two message fields are deliberately left at zero, and neither is read by anything ported
+    /// here: the `+0x10` world position (audio state `+48`, which only the spatialisation in the
+    /// unported voice layer consumes) and the two `+0x20`/`+0x24` levels, which come from
+    /// `sub_82496C58`'s per-material interpolation — decoded in `docs/engine-defects.md` #9 but
+    /// not ported, and read only by the sample chooser.
+    fn post_grind_onset(&mut self, request: &VoiceRequest) {
+        let tier = request.tier.unwrap_or(0);
+        let message = ContactMessage {
+            material_a: request.family_base.unwrap_or(0) as i32,
+            material_b: request.material.unwrap_or(0) as i32,
+            tier_a: tier,
+            tier_b: tier,
+            ..ContactMessage::default()
+        };
+        self.collision.post(message, &self.collision_materials);
+        // Until `sub_824965D0` → `sub_824967F8` are ported the slot drives its controller but
+        // starts no sample, so the onset is still inaudible. Say so once rather than let a rail
+        // landing look like it was never requested.
+        self.report(
+            "GrindOnset posts to CSTATEMGR_Collision, but the sample chooser \
+             (`sub_824965D0` -> `sub_824967F8`) is not ported, so no voice starts yet",
+        );
     }
 
     /// Report a contact-sound failure once per distinct message (they would otherwise repeat every
