@@ -7,7 +7,10 @@
 //! * `PO <slot> <index> <name> <payload> 0 | 28 words | handle=<handle>` — a post;
 //! * `UP <node> <name> <payload> | 28 words` — a redelivery;
 //! * `RL <node> <name>` — a release;
-//! * `AS <field>=<value> …` — the audio-state fields the families' triggers read.
+//! * `AS <field>=<value> …` — the audio-state fields the families' triggers read;
+//! * `OUT <p0..p5> | rms <r> frames <n> ch <c>` — one per rendered block, in the retail capture's
+//!   own format (the six native channels before the host downmix), so the two can be compared
+//!   directly; `DEV <peak> <rms>` follows it with the stereo the host actually receives.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -88,6 +91,35 @@ pub(crate) fn release(handle: u32) {
     with(|t| {
         let name = t.names.remove(&handle).unwrap_or_else(|| "(unknown)".into());
         t.line(format_args!("RL {handle:08X} {name}"));
+    });
+}
+
+/// One rendered block: the six native channels (as retail's output pass logs them) and then the
+/// stereo the host receives after the downmix and the interim trim.
+pub(crate) fn output(native: &[f32], channels: usize, stereo: &[f32]) {
+    with(|t| {
+        let frames = native.len() / channels.max(1);
+        let mut line = String::from("OUT");
+        let mut energy = 0.0f64;
+        for channel in 0..channels {
+            let mut peak = 0.0f32;
+            for frame in 0..frames {
+                let sample = native[frame * channels + channel];
+                if sample.is_finite() {
+                    peak = peak.max(sample.abs());
+                    energy += f64::from(sample) * f64::from(sample);
+                }
+            }
+            line += &format!(" {peak:.6}");
+        }
+        let rms = (energy / native.len().max(1) as f64).sqrt();
+        line += &format!(" | rms {rms:.6} frames {frames} ch {channels}");
+        t.line(format_args!("{line}"));
+        let device_peak = stereo.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+        let device_rms = (stereo.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+            / stereo.len().max(1) as f64)
+            .sqrt();
+        t.line(format_args!("DEV {device_peak:.6} {device_rms:.6}"));
     });
 }
 

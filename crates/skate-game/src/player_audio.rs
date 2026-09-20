@@ -352,6 +352,7 @@ fn run(
         // selector, pitch, envelope, filter, layer, and bus controls and therefore cannot be
         // considered a Skate 3 match.
         let stereo = downmix(&native);
+        trace::output(&native, usize::from(PCM_CHANNELS), &stereo);
         window_peak = native.iter().fold(window_peak, |peak, sample| peak.max(sample.abs()));
         window_blocks += 1;
         if trace && window_blocks as u64 * u64::from(PCM_FRAMES_PER_BLOCK) >= u64::from(SAMPLE_RATE) {
