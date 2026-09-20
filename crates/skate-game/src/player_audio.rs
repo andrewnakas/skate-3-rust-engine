@@ -41,9 +41,15 @@ const OUTPUT_CHANNELS: u16 = 2;
 const SAMPLE_RATE: u32 = 48_000;
 const QUEUE_FRAMES: usize = 4096;
 const OBSERVATION_QUEUE: usize = 16;
-// The retail trace-correct grind payload produces roughly 0.10 peak before the final stereo fold.
-// A modest output trim brings that to normal gameplay level without exposing quantization noise.
-const OUTPUT_GAIN: f32 = 4.0;
+// Unity: the mix reaches this edge with the MixMap's own levels, so nothing is invented here. The
+// earlier 4.0 trim dated from when the player path was far too quiet; with the retail levels and the
+// Splice contact one-shots it clipped every landing impact by about 12 dB (impacts peak near
+// -3 dBFS on their own, the rolling bed -20 to -24 dBFS).
+//
+// If the overall level wants raising, the honest fix is the retail master/Dac output stage this host
+// edge still stands in for (`docs/player-audio-retail-drivers.md`, and the downmix below), not a
+// constant here.
+const OUTPUT_GAIN: f32 = 1.0;
 
 #[derive(Resource)]
 struct PlayerAudioHost {

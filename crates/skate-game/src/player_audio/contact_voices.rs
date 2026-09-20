@@ -82,6 +82,7 @@ pub(crate) struct ContactVoicePlayer {
     state: SpliceState,
     rand: Rand,
     live: Vec<Live>,
+    reported: std::collections::HashSet<String>,
 }
 
 impl ContactVoicePlayer {
@@ -90,7 +91,11 @@ impl ContactVoicePlayer {
         Ok(Self {
             banks: SpliceBanks::load(
                 &assets.join("private/stock/data/audio/audiofiles.big"),
-                &[],
+                // The DLC bank is absent from a stock installation; only the stock one is required.
+                &[
+                    skate_data::audio::splice::COLLISIONS_BANK,
+                    skate_data::audio::splice::DLC_COLLISIONS_BANK,
+                ],
                 &[skate_data::audio::splice::COLLISIONS_BANK],
             )
             .map_err(|error| error.to_string())?,
@@ -100,6 +105,7 @@ impl ContactVoicePlayer {
             state: SpliceState::default(),
             rand: Rand::new(cache.map_or(1, |_| 1)),
             live: Vec::new(),
+            reported: std::collections::HashSet::new(),
         })
     }
 
@@ -110,6 +116,9 @@ impl ContactVoicePlayer {
         runtime: &mut AuthoredRuntime,
         shared: &SharedContactVoices,
         audio: &AudioState,
+        // `owner_gain`: the owner's level reader id 14 over 32767 — `sub_824B9CC8` and
+        // `sub_824BA630` scale every member by it (vtable slot 15 is the shared level reader).
+        owner_gain: f32,
         dt: f32,
     ) -> Result<(), String> {
         let (queued, freed) = {
@@ -131,25 +140,31 @@ impl ContactVoicePlayer {
             let Some((bank, sample, bus)) = self.selection(&play, audio) else {
                 continue;
             };
-            let members = self
-                .banks
-                .resolve(bank, sample, &mut self.state, &mut self.rand)
-                .map_err(|e| e.to_string())?;
+            // A contact sound that cannot resolve or play must not take the whole player-sound
+            // worker down with it: report it once and carry on with the rest of the mix.
+            let members = match self.banks.resolve(bank, sample, &mut self.state, &mut self.rand) {
+                Ok(members) => members,
+                Err(error) => {
+                    self.report(&format!("{bank} sample {sample:#x}: {error}"));
+                    continue;
+                }
+            };
             let Some(base) = runtime.bank_base(bank) else {
-                return Err(format!("Splice bank {bank} is not installed"));
+                self.report(&format!("Splice bank {bank} is not installed"));
+                continue;
             };
             let mut handles = Vec::with_capacity(members.len());
             for member in members {
-                let handle = runtime
-                    .play_oneshot(&OneshotVoice {
-                        sample: base + member.stream_offset,
-                        gain: member.values.gain,
-                        pitch: member.values.pitch,
-                        delay: member.values.delay,
-                        bus,
-                    })
-                    .map_err(|e| e.to_string())?;
-                handles.push(handle);
+                match runtime.play_oneshot(&OneshotVoice {
+                    sample: base + member.stream_offset,
+                    gain: member.values.gain,
+                    pitch: member.values.pitch,
+                    delay: member.values.delay,
+                    bus,
+                }) {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => self.report(&format!("{bank} sample {sample:#x} member: {error}")),
+                }
             }
             self.live.push(Live { id: play.id, handles });
         }
@@ -161,6 +176,14 @@ impl ContactVoicePlayer {
         // A play whose voices have all finished keeps no handles; retail's slot still holds its
         // container until the component frees it, so the entry stays until `free`.
         Ok(())
+    }
+
+    /// Report a contact-sound failure once per distinct message (they would otherwise repeat every
+    /// landing).
+    fn report(&mut self, message: &str) {
+        if self.reported.insert(message.to_owned()) {
+            eprintln!("SKATE_PLAYER_AUDIO contact_voice_unavailable {message}");
+        }
     }
 
     /// `sub_824B9CC8`'s and `sub_824BA630`'s sample choice.

@@ -150,6 +150,79 @@ fn headless_rolling_through_the_retail_path() {
     }
 }
 
+/// Airborne: no wheels down, in the air state, with a hop's air timing.
+fn airborne(tick: u64, speed: f32, elapsed: f32, jump_height: f32) -> PlayerAudioObservation {
+    let mut observation = rolling(tick, speed);
+    observation.state = 201;
+    observation.grounded = false;
+    observation.contact_count = 0;
+    observation.retail.state = 201;
+    observation.retail.state_category = 200;
+    observation.retail.wheel_count = 0;
+    observation.retail.wheel_contacts = [false; 4];
+    observation.retail.truck_contacts = [false; 2];
+    observation.retail.in_known_air = true;
+    observation.retail.air_time_in_state = elapsed;
+    observation.retail.air_time_until_landing = (0.7 - elapsed).max(0.0);
+    observation.retail.air_jump_height = jump_height;
+    observation
+}
+
+/// A hop and its landing must make the contact one-shots (`sub_824B9CC8` pops, `sub_824BA630`
+/// landing impact) audible: they are bank voices from `Skate_Collisions.bnk`, not authored patches.
+#[test]
+#[ignore = "needs the owner's assets; run explicitly"]
+fn headless_landing_impact_is_audible() {
+    use skate_audio_core::authored::{PCM_CHANNELS, PCM_FRAMES_PER_BLOCK};
+    let assets = std::env::var_os("SKATE_ASSETS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| DEFAULT_ASSETS.into());
+    let super::Prepared { mut runtime, mut sound, .. } =
+        super::prepare(&assets).expect("prepare the retail player-sound worker");
+    let mut tick = 0u64;
+    let mut blocks_owed = 0.0f64;
+    let blocks_per_frame = 48_000.0 / f64::from(PCM_FRAMES_PER_BLOCK) / 60.0;
+    // Roll, hop for 0.7 s, then land on all four and roll on.
+    let script: Vec<PlayerAudioObservation> = (0..60)
+        .map(|i| rolling(i, 5.0))
+        .chain((0..42).map(|i| airborne(60 + i, 5.0, i as f32 / 60.0, 1.2)))
+        .chain((0..120).map(|i| rolling(102 + i, 5.0)))
+        .collect();
+    let mut peaks = Vec::new();
+    for observation in script {
+        sound
+            .frame(&mut runtime, &observation)
+            .expect("player-sound frame");
+        tick += 1;
+        blocks_owed += blocks_per_frame;
+        let mut frame_peak = 0.0f32;
+        while blocks_owed >= 1.0 {
+            blocks_owed -= 1.0;
+            let native = runtime.pump_once().expect("render one block");
+            assert_eq!(
+                native.len(),
+                PCM_FRAMES_PER_BLOCK as usize * usize::from(PCM_CHANNELS)
+            );
+            frame_peak = super::downmix(&native)
+                .iter()
+                .fold(frame_peak, |peak, sample| peak.max(sample.abs()));
+        }
+        peaks.push((tick, frame_peak));
+    }
+    // The airborne stretch is frames 61..102; the landing lands at 103.
+    let air = peaks[70..100].iter().fold(0f32, |p, (_, v)| p.max(*v));
+    let landing = peaks[102..130].iter().fold(0f32, |p, (_, v)| p.max(*v));
+    eprintln!(
+        "air peak {:.1} dBFS, landing peak {:.1} dBFS",
+        20.0 * air.max(1e-9).log10(),
+        20.0 * landing.max(1e-9).log10()
+    );
+    assert!(
+        landing > air * 1.5,
+        "the landing impact must be clearly louder than the airborne stretch: {landing} vs {air}"
+    );
+}
+
 fn write_wav(path: &std::path::Path, stereo: &[f32]) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);

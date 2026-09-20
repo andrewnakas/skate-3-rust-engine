@@ -14,7 +14,7 @@ use skate_audio_core::authored::AuthoredRuntime;
 use skate_audio_core::mixmap::{self, inputs};
 
 use super::audio_state::AudioState;
-use super::components::{Component, ControlSnapshot, Tick};
+use super::components::{Component, ControlSnapshot, Controls, Tick};
 use super::contact_voices::{ContactVoicePlayer, SharedContactVoices};
 use super::tuning::AudioTuning;
 use crate::skate_audio::PlayerAudioObservation;
@@ -294,7 +294,13 @@ impl PlayerSound {
         // The Contacts component recorded its one-shot plays during its process; open them now,
         // before the evaluation, as retail's process does.
         if let Some((shared, player)) = &mut self.contact_voices {
-            player.drain(runtime, shared, &self.audio, FRAME_SECONDS)?;
+            // Retail scales every contact member by the owner's level id 14 (`sub_824AF240`).
+            let gain = self
+                .entries
+                .iter()
+                .find(|entry| entry.name == "ContactsOwner")
+                .map_or(0.0, |entry| entry.last.level(14) as f32 / 32767.0);
+            player.drain(runtime, shared, &self.audio, gain, FRAME_SECONDS)?;
         }
 
         // 3. Evaluate.
