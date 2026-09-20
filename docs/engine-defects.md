@@ -307,7 +307,9 @@ With it, the three reads are done:
    (`lis r9,-32208; addi r8,r9,-11012; stw r8,0(r3)` = `0x82300000 − 0x2B04`) rather than from an
    inherited table, which had it 0x10000 too high. Slots: +0 `824F1B70`, +4 `828DE848`,
    +8 `824F17B8`, **+12 `824F1818`**, +16 `828DEE58`, +20 `828DEED8`, +24 `828DEF38`,
-   +28 `824F16B0`, +32 `824F16C0`, +36 `824F88A8`.
+   +28 `824F16B0`, +32 `824F16C0`. (**Correction 2026-09-20:** an earlier revision of this section
+   listed a tenth slot `+36 824F88A8`. That was an over-read — the manager vtable ends at `+32`,
+   and `0x822FD520` is already the *next* class's vtable. See below.)
 
 **`sub_824F1818` (hop 1) is a voice-slot router, not the voice starter.** It walks the linked list
 at `[this+16]` through `[node+4]`, keeps the node with the lowest signed `[node+64]` (a priority or
@@ -315,10 +317,120 @@ age), calls `[node->vtable+28](node)` on the winner and returns it. `sub_82486EF
 the 48-byte message to *that node's* `vtable[+12]` — hop 2, which is where the material pair and
 the two levels finally choose a sound.
 
-**Next step, and it is now ordinary work rather than a dead end:** find what populates
-`[manager+16]`, take a node's vtable out of the dumped image the same way, and read its `+12`.
-Everything upstream is pinned, and `sub_824F16D0` shows the object is 28 bytes with `+12`, `+16`,
-`+20` zeroed, `+4`/`+8` set to the `0x82165A10` float (0.0) and `+24` a zeroed byte.
+### The chain is closed: the sink is a state machine, and the sound choice is a table (2026-09-20)
+
+`[manager+16]` is populated, the node class is read, and the chain runs all the way to the material
+→ sound-index tables. **There is no single "handler" — the sink is a generic data-driven audio
+state machine, and what the material pair and the levels actually pick is a small set of integer
+indices plus two controller parameters.** Every address below was read from the dumped image or
+the lifted asm, not inferred.
+
+**There are two parallel registries, not one.** The one already documented (12-byte descriptors,
+vector at `0x830BBE00`, looked up by `sub_828DED90`) holds the 14 `CSTATEMGR_*` managers. Two more
+sit beside it: 16-byte descriptors at `0x8302CE1C + 16n` (vector `0x830BBE20`, pushed by
+`sub_828DE8C0`) holding the 14 matching `CSTATE_*` **state** classes, and descriptors at
+`0x8302CF70…0x8302D3A0` (vector `0x830BBE10`, pushed by `sub_828DE928`, 46 of them) holding the
+`SFXObj_*` / `SFXCTL_*` **component** classes. Descriptor word 0 packs `category<<16 | kind<<4 |
+ctor-arg`; `+4` is the class-name string, `+12` the create function. Dumping all three tables gives
+the whole audio object model by name — `SFXObj_Contacts`, `SFXObj_Wheels`, `SFXObj_Rail`,
+`SFXObj_Treatments`, `SFXObj_Tricks`, `SFXObj_OffBoard` and so on are all in there, which is worth
+revisiting for defects 4 and 5. **All three tables are written out in
+`docs/audio-object-registry.md`.**
+
+**`[manager+12]` is the manager's own registry id, read not derived.** `sub_828DED90` calls
+`obj->vtable[+4](obj, id)` right after construction, and `CSTATEMGR_Collision::vtable[+4]` is
+`sub_828DE848`, whose entire body is `stw r4,12(r3)`. So `[manager+12] = 3`, and 3 is what selects
+every `*_Collision` class out of the two other registries.
+
+**The nodes on `[manager+16]` are `CSTATE_Collision`.** `CSTATEMGR_Collision::vtable[+8]`
+(`sub_824F17B8`) loops **exactly 10 times** calling `sub_828DEC20(manager)`, then sets `[mgr+24]=1`.
+`sub_828DEC20` picks the descriptor whose category equals `[manager+12]` — descriptor `0x8302CE1C`,
+name `CSTATE_Collision`, create fn `sub_824F8808` — makes the node, and links it: `[node+12]=manager`,
+`[node+16]=[manager+20]` (its index), `[node+20]=[manager+12]`, `[node+24]=0`, appended through
+`[node+4]` (next) / `[node+8]` (prev) with the head at `[manager+16]`, and `[manager+20]++`.
+So the list is **10 LRU voice slots**, built once at manager init.
+
+**`CSTATE_Collision` is 80 bytes, vtable `0x822FD520`** (from `sub_824F8808`'s own
+`lis r9,-32208; addi r8,r9,-10976`). Slots: +0 `824F88A8`, +4 `828DF098`, +8 `82B61BB8` (a bare
+`blr`), **+12 `824F8990`**, +16 `828DF4C8`, +20 `824F8B50`, +24 `828DF518`, +28 `824F8B58`,
++32 `828DF648`, +36 `824F87E8`, +40 `824F87F8`.
+
+**Hop 2 is `sub_824F8990`, and it is five instructions.** It does *not* choose a sound:
+
+```
+[node+64] = [[0x830CFD94] + 16]     ; a global frame/time stamp
+[node+68] = msg                     ; park the 48-byte message on the slot
+tail -> sub_828DF6F0(node, msg)     ; activate the state
+```
+
+That closes the loop on the router: `[node+64]` is a **timestamp**, so `sub_824F1818` picking the
+lowest signed `[node+64]` is picking the **least-recently-used** of the 10 slots. Before returning
+the winner it calls `vtable[+28]` (`sub_824F8B58`), which frees that slot's previous message through
+the default allocator and nulls `[node+68]` — i.e. it *evicts* before reuse.
+
+**Activation reaches exactly one component.** `sub_828DF6F0` sets `[node+28]=msg`, `[node+52]=1`
+(active), walks the `[node+32]` child list calling `vtable[+28]`, then calls
+`[node->vtable+16]` = `sub_828DF4C8`, which walks the `[node+36]` child list calling `vtable[+24]`.
+The children come from `sub_828DF098(state, mask)` — called with **mask = 1** by `sub_824F17B8` — so
+bit 0 only: one child of kind 0, built by `sub_828DEA00(manager, index, 0)` and appended to
+`[state+36]`. For category 3 / kind 0 that descriptor is `0x8302D160`, name **`SFXObj_Collision`**,
+create fn `sub_824D1B48`.
+
+**`SFXObj_Collision` is 104 bytes, vtable `0x822FC890`** (from ctor `sub_824D1BD8`:
+`lis r9,-32208; addi r6,r9,-14192`). Its tail is **two 32-byte voice records** at `+40` and `+72`,
+each initialised `{0, 0, 4096, 0, 0, -1, -1, -1}`. `sub_824F1468` (vt+20) binds the owner:
+`[child+16] = [child+32] = state`.
+
+Its `vtable[+24]` is `sub_82E1F0A8`, a thunk straight to `vtable[+28]` = **`sub_824D1DB8`**, which
+is what actually receives the activation:
+
+```
+[[this+12]+12]->+60 = 1
+msg = [ [this+32] + 68 ]            ; the message off the owning state
+[this+36] = msg
+tail -> [this+28]->vtable[+56]( [this+28], msg+16 )   ; msg+16 is the vec4 world position
+```
+
+**The material pair picks a sound in `sub_824D2318`** (`SFXObj_Collision::vtable[+40]`, the voice
+starter, reached from the state update). It runs both material words through two resolvers and
+drives the two voice records:
+
+- **`sub_824D20E8(this, material)`** — if `material >= 143` the category is forced to 8; otherwise
+  `cat = sub_82496FD0(material)`, *the same material-category function `sub_82496C58` uses for the
+  levels*. Then a jump table at `0x824D212C` maps **cat → index: 0→13, 1→14, 2→15, 3→16, 4→17,
+  5→18, 6→12, 7→19, 8→20, 9→21**, and any `cat > 9` also lands on 20. The index goes to
+  `this->vtable[+60]` (`sub_824AF240`).
+- **`sub_824D22B8(this, material)`** — `cat == 9` (or `material >= 143`) → **22**, everything else
+  → **1**. That index goes to `this->vtable[+56]` (`sub_824C5910`).
+
+So each of the two materials yields a pair of small integer ids, and those four ids (locals at
+`r1+80…92`) are what the voice records are started from, together with float constants at
+`0x824D0664`, `0x824D078C`, `0x824D1664` and `0x8232520C`.
+
+**The continuous landing weight is `sub_824D1E00`** (`vtable[+36]`, the per-frame update called from
+`sub_828DF568`). This is the piece §9 of `player-audio-retail-drivers.md` wanted, and it is tiny:
+
+```
+param0 = 0 ; param1 = 0                        ; via [this+12]->vtable[+8](index, value)
+if ![state+52]                       -> done   ; state not active
+if [this+40] == 0 && [this+72] == 0  -> done   ; both voice records idle
+param0 = 32767                                 ; gate on
+sel = msg[+0x08], msg[+0x0C] with 3 as a "none" sentinel:
+        msg[+0x08] == 3 -> sel = msg[+0x0C]
+        msg[+0x0C] == 3 -> sel = msg[+0x08]
+        otherwise       -> sel = max(msg[+0x08], msg[+0x0C])
+param1 = 20000 if sel == 1, 32767 if sel == 2, else 10000   ; clamped to [0, 32767]
+```
+
+`[this+12]` is the controller block and `vtable[+8]` is `set(index, 0…32767)`. Note both parameters
+are **rewritten from zero every frame**, so this is a continuously driven pair, not a one-shot.
+
+**What this means for the port.** `ContactSound::GrindOnset` / `PopRoll` do not need an invented
+sample: they need the ten-slot LRU, the message park, and the two controller parameters above, with
+the sound identity coming from the cat→index tables rather than from anything in `contact_voices.rs`.
+The remaining unread piece is the body of `sub_824D2318` past the resolver calls — the float math
+that turns the four indices plus the two 0…32767 levels into the two voice records — and
+`sub_824AF240` / `sub_824C5910`, which turn an index into an actual bank entry.
 
 **One confirmed, independent port gap while you are in there.** `ContactLatches::grind_gate_124` is
 read at `contacts.rs:667` but **never written anywhere in the tree**. Retail writes it at
