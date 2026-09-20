@@ -384,6 +384,8 @@ pub(crate) struct VoiceRequest {
     pub family_base: Option<u32>,
     /// `sub_824BB0E0`: 1 once the impact passes the first vault threshold.
     pub tier: Option<i32>,
+    /// Contacts controller output 15, the landing voice's owner send level.
+    pub send_level: Option<u32>,
 }
 
 /// The one-shot bank-voice sink. Implemented by the `skate-audio-core` bank-voice port; the
@@ -477,6 +479,11 @@ pub(crate) struct ContactsInputs {
     pub jump_velocity_468: f32,
     pub bail_676: bool,
     pub grind_material_692: u32,
+    /// Contacts controller output 15, the owner send the landing voice rides.
+    /// Input 2 (the landing class) drives it: probing the real MixMap with the
+    /// retail pre-roll gives 2584 / 3103 / 3650 for classes 0 / 1 / 2, a 3.0 dB
+    /// spread. `Component::process` fills it; `from_state` alone cannot.
+    pub landing_send_level_15: u32,
 }
 
 impl ContactsInputs {
@@ -493,6 +500,7 @@ impl ContactsInputs {
             jump_velocity_468: state.jump_velocity_468,
             bail_676: state.bail_676,
             grind_material_692: state.grind_material_692,
+            landing_send_level_15: 0,
         }
     }
 
@@ -514,6 +522,9 @@ impl ContactsInputs {
             jump_velocity_468: float(468),
             bail_676: byte(676),
             grind_material_692: word(692),
+            // The capture carries audio-state words, not controller outputs; the
+            // send level is supplied by `Component::process` at runtime.
+            landing_send_level_15: 0,
         }
     }
 }
@@ -635,7 +646,7 @@ impl ContactsOwner {
     }
 
     /// `sub_824BA630`.
-    fn landing(&mut self, _inputs: &ContactsInputs) {
+    fn landing(&mut self, inputs: &ContactsInputs) {
         // Retail resets the frame counter and raises controller input 1 (the MixMap port owns
         // the input) before its voices.
         self.latches.frames_424 = 0;
@@ -658,8 +669,13 @@ impl ContactsOwner {
         if let Some(handle) = self.held_landing_class_52.take() {
             self.voices.free(handle);
         }
-        self.held_landing_class_52 =
-            self.voices.play(ContactSound::LandingClass, &VoiceRequest::default());
+        self.held_landing_class_52 = self.voices.play(
+            ContactSound::LandingClass,
+            &VoiceRequest {
+                send_level: Some(inputs.landing_send_level_15),
+                ..VoiceRequest::default()
+            },
+        );
     }
 
     /// `sub_824BB0E0`.
@@ -722,7 +738,8 @@ impl ContactsOwner {
 
 impl Component for ContactsOwner {
     fn process(&mut self, tick: &mut Tick) -> Result<(), String> {
-        let inputs = ContactsInputs::from_state(tick.audio);
+        let mut inputs = ContactsInputs::from_state(tick.audio);
+        inputs.landing_send_level_15 = tick.controls.level(15);
         self.step(&inputs);
         Ok(())
     }

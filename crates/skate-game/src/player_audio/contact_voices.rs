@@ -23,6 +23,16 @@ use skate_data::collections::Collections;
 use super::audio_state::AudioState;
 use super::components::contacts::{ContactSound, ContactVoices, SurfaceMap, VoiceRequest};
 
+/// Contacts controller output 15 at landing class 2, measured from the real MixMap under the
+/// retail pre-roll (`skate-audio-core` example `contacts_input_probe`): classes 0/1/2 give
+/// 2584/3103/3650, a 3.0 dB spread. Class 2 is the reference so the loudest landing keeps the
+/// level `player-audio-retail-drivers.md` §8 measured against the recomp.
+const LANDING_SEND_MAXIMUM: f32 = 3650.0;
+/// The send is an environment level as well as a class level, so it can legitimately sit low.
+/// Retail's own class-0 reading is 0.708 of the maximum; this floor keeps an unusual environment
+/// from muting a landing outright while still letting the class spread through.
+const LANDING_SEND_FLOOR: f32 = 0.5;
+
 /// One recorded play, in the order `ContactsOwner` made it.
 struct Queued {
     id: u32,
@@ -192,11 +202,20 @@ impl ContactVoicePlayer {
                 self.report(&format!("Splice bank {bank} is not installed"));
                 continue;
             };
+            // Retail's landing level rides the owner send (Contacts output 15); see
+            // `selection`. Taken relative to the class-2 maximum so the loudest landing keeps
+            // the level §8 measured and the lighter classes drop by retail's own ratios.
+            let send_scale = match play.request.send_level {
+                Some(level) if matches!(play.sound, ContactSound::LandingClass) => {
+                    (level as f32 / LANDING_SEND_MAXIMUM).clamp(LANDING_SEND_FLOOR, 1.0)
+                }
+                _ => 1.0,
+            };
             let mut handles = Vec::with_capacity(members.len());
             for member in members {
                 match runtime.play_oneshot(&OneshotVoice {
                     sample: base + member.stream_offset,
-                    gain: member.values.gain,
+                    gain: member.values.gain * send_scale,
                     pitch: member.values.pitch,
                     delay: member.values.delay,
                     pan: member.pan,
@@ -272,10 +291,23 @@ impl ContactVoicePlayer {
                 };
                 let category = surface_category(lane, audio.soft_wheels_684 != 0);
                 let sample = self.landing.class_sample(0, class, category)?;
-                // APPROXIMATION: retail routes this voice through the owner's send bus, whose
-                // level is the Contacts controller's output 15 (`sub_824B8D48` @ 0x824B8E88 →
-                // `sub_82488DD0`). That send is an environment level worth about ±3 dB and is not
-                // ported, so the dry voice goes to the default bus here.
+                // Retail routes this voice through the owner's send bus, whose level is the
+                // Contacts controller's output 15 (`sub_824B8D48` @ 0x824B8E88 →
+                // `sub_82488DD0`). Output 15 is driven by controller input 2, which
+                // `ContactsInputs::process` already writes from the landing class — so retail's
+                // landing level really does vary with the drop, and this engine was throwing that
+                // away by sending the dry voice to the default bus.
+                //
+                // Probing the real MixMap under the retail pre-roll
+                // (`skate-audio-core` example `contacts_input_probe`) gives output 15 =
+                // 2584 / 3103 / 3650 for classes 0 / 1 / 2: a 3.0 dB spread, class 0 to class 2.
+                //
+                // The absolute level is left where §8 measured it. `CONTACT_TRIM` was calibrated
+                // with the send absent, so re-applying the raw send level would drop every landing
+                // ~19 dB. Instead the level is taken relative to its class-2 maximum, which keeps
+                // the loudest landing exactly where it measures today and lets the lighter classes
+                // fall back by retail's own ratios. That is the part the owner could hear missing:
+                // every landing arriving at the same level.
                 Some((self.landing.bank(), sample, OneshotBus::Default))
             }
             // Pops off (see `pops_enabled`), and the two paths that are a different subsystem.
