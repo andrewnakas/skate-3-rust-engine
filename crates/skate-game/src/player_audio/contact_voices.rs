@@ -38,6 +38,13 @@ const LANDING_SEND_MAXIMUM: f32 = 3650.0;
 /// from muting a landing outright while still letting the class spread through.
 const LANDING_SEND_FLOOR: f32 = 0.5;
 
+/// The Contacts tuning class (`sub_824BA630` reads its landing fields off it) and the three fields
+/// the landing's contact-sound message needs. The owner's vault holds 95, 0.1 and 0.3.
+const CONTACTS_TUNING_CLASS: &str = "Hash_C26949FCB638A2CA";
+const LANDING_MATERIAL_FIELD: &str = "Hash_85FDC8BF696BCA5C";
+const LANDING_THRESHOLD_FIELD: &str = "Hash_3462CBB16DCA696E";
+const LANDING_CEILING_FIELD: &str = "Hash_590495E420B399E5";
+
 /// One recorded play, in the order `ContactsOwner` made it.
 struct Queued {
     id: u32,
@@ -105,9 +112,19 @@ pub(crate) struct ContactVoicePlayer {
     pops_enabled: bool,
     /// The pops' owner-local six-channel send bus (`sub_82488DD0`), built on first use.
     pops_send: Option<u32>,
+    /// `sub_824BA630`'s landing window, read from the Contacts tuning class: the board material it
+    /// pairs the surface with (95), and the two air-time thresholds the level interpolates over.
+    landing_material: i32,
+    landing_threshold: f32,
+    landing_ceiling: f32,
     /// `CSTATEMGR_Collision` and its per-material table: the subsystem the grind onset posts to.
     collision: CollisionStates,
     collision_materials: CollisionMaterials,
+    /// The collision voices in flight. Unlike the pops and the landing, `sub_824BB0E0` keeps no
+    /// slot the component reads back ("this routine does not hold its voice"), so these are owned
+    /// here and freed when they finish. They must be ticked: `tick_oneshot` is what *opens* a
+    /// voice whose Splice member carries a delay, and what releases one that has run out.
+    collision_live: Vec<OneshotHandle>,
 }
 
 impl ContactVoicePlayer {
@@ -123,9 +140,23 @@ impl ContactVoicePlayer {
                  have no vault record; their category falls back to retail's default record"
             );
         }
+        // `sub_824BA630` reads all three off the Contacts tuning class; the defaults are the
+        // values the owner's vault holds, used only if a field is missing.
+        let tuning_float = |name: &str, fallback: f32| {
+            vault.float(CONTACTS_TUNING_CLASS, "default", name).unwrap_or(fallback)
+        };
+        let landing_material = vault
+            .field(CONTACTS_TUNING_CLASS, "default", LANDING_MATERIAL_FIELD)
+            .ok()
+            .and_then(|f| u32::from_str_radix(f.data.trim(), 16).ok())
+            .map_or(95, |v| v as i32);
         Ok(Self {
+            landing_material,
+            landing_threshold: tuning_float(LANDING_THRESHOLD_FIELD, 0.1),
+            landing_ceiling: tuning_float(LANDING_CEILING_FIELD, 0.3),
             collision: CollisionStates::new(),
             collision_materials,
+            collision_live: Vec::new(),
             banks: SpliceBanks::load(
                 &assets.join("private/stock/data/audio/audiofiles.big"),
                 // The DLC bank is absent from a stock installation; only the stock one is required.
@@ -182,6 +213,12 @@ impl ContactVoicePlayer {
             if matches!(play.sound, ContactSound::GrindOnset) {
                 self.post_grind_onset(runtime, &play.request)?;
                 continue;
+            }
+            // `sub_824BA630` starts its two bank voices *and* posts to the contact-sound manager.
+            // The bank voices are handled below as before; the message is what makes a landing
+            // sound like the surface rather than like a generic impact.
+            if matches!(play.sound, ContactSound::LandingClass) {
+                self.post_landing(runtime, &play.request, audio)?;
             }
             let Some((bank, sample, mut bus)) = self.selection(&play, audio) else {
                 // The two unported subsystem paths dropped silently, which made a
@@ -267,6 +304,15 @@ impl ContactVoicePlayer {
                 runtime.tick_oneshot(handle, dt).map_err(|e| e.to_string())?;
             }
         }
+        // The collision voices own themselves: tick opens the delayed ones, and a voice that has
+        // finished releases itself and drops out of the list.
+        let mut still_live = Vec::with_capacity(self.collision_live.len());
+        for mut handle in std::mem::take(&mut self.collision_live) {
+            if runtime.tick_oneshot(&mut handle, dt).map_err(|e| e.to_string())? {
+                still_live.push(handle);
+            }
+        }
+        self.collision_live = still_live;
         // A play whose voices have all finished keeps no handles; retail's slot still holds its
         // container until the component frees it, so the entry stays until `free`.
         Ok(())
@@ -303,12 +349,91 @@ impl ContactVoicePlayer {
         };
         let slot = self.collision.post(message, &self.collision_materials);
         let started = self.collision.slots()[slot].started;
+        // Diagnostic: a grind onset that reaches here but makes no sound is the failure mode this
+        // subsystem is most likely to have, and it is invisible otherwise. One line per distinct
+        // message shape, through the same once-per-run channel as the failures.
+        self.report(&format!(
+            "GrindOnset posted a={} b={} tier={} -> slot {slot} started={started:?}",
+            message.material_a, message.material_b, tier
+        ));
         for record in 0..2 {
             if !started[record] {
                 continue;
             }
             // `sub_824D1F68` passes the *other* record's material, which `sub_824965D0` runs
             // through `sub_82497910` to get its class.
+            let other = self
+                .collision_materials
+                .other_class(message.material(1 - record), &self.surfaces);
+            let Some(sample) =
+                self.collision_materials
+                    .sample(message.material(record), other, message.tier(record))
+            else {
+                self.report(&format!(
+                    "GrindOnset record {record} material {} against class {other} resolved to no sample",
+                    message.material(record)
+                ));
+                continue;
+            };
+            self.play_collision(runtime, &sample);
+        }
+        Ok(())
+    }
+
+    /// `sub_824BA630`'s message to `CSTATEMGR_Collision`.
+    ///
+    /// Retail pairs the surface the wheels are on (audio state `+620`) with a board material the
+    /// Contacts tuning class supplies (95), gives both the same tier, and interpolates each one's
+    /// level over the **latched air time** — `[this+340]`, i.e. how long the skater was actually
+    /// falling. `tier` is 0 below the tuning threshold and 1 above it, and the window is `[0, t]`
+    /// for tier 0 and `[t, ceiling]` for tier 1 (0.1 and 0.3 in the owner's vault).
+    ///
+    /// **If either level comes out 0 the message is not posted at all** — that is retail's own
+    /// guard (`sub_824BA630` @ `0x824BABE0`), and it is why a landing on a material with no
+    /// window stays silent instead of playing something generic.
+    fn post_landing(
+        &mut self,
+        runtime: &mut AuthoredRuntime,
+        request: &VoiceRequest,
+        audio: &AudioState,
+    ) -> Result<(), String> {
+        let air_time = request.air_time.unwrap_or(0.0);
+        let surface = audio.wheel_material_620[0] as i32;
+        let board = self.landing_material;
+        let tier = i32::from(air_time >= self.landing_threshold);
+        let (lo, hi) = if tier == 0 {
+            (0.0, self.landing_threshold)
+        } else {
+            (self.landing_threshold, self.landing_ceiling)
+        };
+        let level_surface = self.collision_materials.contact_level(
+            surface, board, tier, lo, hi, air_time, &self.surfaces,
+        );
+        let level_board = self.collision_materials.contact_level(
+            board, surface, tier, lo, hi, air_time, &self.surfaces,
+        );
+        self.report(&format!(
+            "Landing surface={surface} board={board} tier={tier} air={air_time:.3}              levels={level_surface}/{level_board}"
+        ));
+        // Retail's own guard: either level at 0 and there is no message.
+        if level_surface == 0 || level_board == 0 {
+            return Ok(());
+        }
+        let message = ContactMessage {
+            material_a: board,
+            material_b: surface,
+            tier_a: tier,
+            tier_b: tier,
+            level_a: level_board,
+            level_b: level_surface,
+            ..ContactMessage::default()
+        };
+        let slot = self.collision.post(message, &self.collision_materials);
+        let started = self.collision.slots()[slot].started;
+        for record in 0..2 {
+            if !started[record] {
+                continue;
+            }
             let other = self
                 .collision_materials
                 .other_class(message.material(1 - record), &self.surfaces);
@@ -339,8 +464,17 @@ impl ContactVoicePlayer {
             return;
         };
         let gain = sample.level as f32 / 32_767.0;
+        self.report(&format!(
+            "collision voice {} #{:#x} level {} -> {} member(s) at gain x{gain:.3}, first delay {:.3}s gain {:.3}",
+            sample.bank,
+            sample.sample,
+            sample.level,
+            members.len(),
+            members.first().map_or(0.0, |m| m.values.delay),
+            members.first().map_or(0.0, |m| m.values.gain),
+        ));
         for member in members {
-            if let Err(error) = runtime.play_oneshot(&OneshotVoice {
+            match runtime.play_oneshot(&OneshotVoice {
                 sample: base + member.stream_offset,
                 gain: member.values.gain * gain,
                 pitch: member.values.pitch,
@@ -348,7 +482,12 @@ impl ContactVoicePlayer {
                 pan: member.pan,
                 bus: OneshotBus::Default,
             }) {
-                self.report(&format!("{} sample {:#x} member: {error}", sample.bank, sample.sample));
+                // Hold the handle: dropping it left a delayed member permanently unopened and a
+                // playing one never released.
+                Ok(handle) => self.collision_live.push(handle),
+                Err(error) => {
+                    self.report(&format!("{} sample {:#x} member: {error}", sample.bank, sample.sample));
+                }
             }
         }
     }

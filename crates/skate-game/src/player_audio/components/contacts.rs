@@ -386,6 +386,9 @@ pub(crate) struct VoiceRequest {
     pub tier: Option<i32>,
     /// Contacts controller output 15, the landing voice's owner send level.
     pub send_level: Option<u32>,
+    /// `sub_824BA630`: the latched air time (`[this+340]`) the contact-sound manager's landing
+    /// message interpolates its level over — retail's "how far did you actually fall".
+    pub air_time: Option<f32>,
 }
 
 /// The one-shot bank-voice sink. Implemented by the `skate-audio-core` bank-voice port; the
@@ -673,6 +676,7 @@ impl ContactsOwner {
             ContactSound::LandingClass,
             &VoiceRequest {
                 send_level: Some(inputs.landing_send_level_15),
+                air_time: Some(self.latches.air_time_340),
                 ..VoiceRequest::default()
             },
         );

@@ -177,6 +177,11 @@ pub(crate) struct CollisionMaterials {
 struct MaterialEntry {
     /// `[record+52]`, clamped as the original clamps it.
     level: u32,
+    /// `sub_82496C58`'s `(low, high)` windows, `[tier][class]`.
+    pairs: [[(i32, i32); 3]; 3],
+    /// Whether the RefSpec resolved at all; when it did not, retail reads its zeroed default
+    /// record and every window is `(0, 0)`, which makes the level 0 and suppresses the contact.
+    pairs_resolved: bool,
     /// `tier == 2`.
     tier_two: u16,
     /// `tier == 0`, by the paired material's class.
@@ -227,12 +232,86 @@ impl CollisionMaterials {
         // The original clamps the level into `0..=32767` before it reaches the voice record.
         let level = word(MATERIAL_LEVEL_FIELD).min(FULL_SCALE);
         let sample = |name: &str| u16::try_from(word(name)).unwrap_or(0);
+        let (pairs, pairs_resolved) = Self::level_pairs(vault, &key);
         MaterialEntry {
             level,
+            pairs,
+            pairs_resolved,
             tier_two: sample(fields.tier_two),
             tier_zero: fields.tier_zero.map(sample),
             tier_other: fields.tier_other.map(sample),
         }
+    }
+
+    /// `sub_824840E0`: follow the material's `Attrib::RefSpec` to its `13E20D398E385A56` record and
+    /// read `sub_82496C58`'s fourteen window bounds off it. The RefSpec's payload is
+    /// `class (8 bytes) | key (8 bytes) | padding`, so the key is bytes 8..16.
+    fn level_pairs(vault: &Collections, material_key: &str) -> ([[(i32, i32); 3]; 3], bool) {
+        let mut pairs = [[DEFAULT_LEVEL_PAIR; 3]; 3];
+        let Ok(spec) = vault.field(MATERIAL_CLASS, material_key, MATERIAL_LEVELS_REFSPEC) else {
+            return (pairs, false);
+        };
+        let data = spec.data.trim();
+        if data.len() < 32 {
+            return (pairs, false);
+        }
+        let key = format!("Hash_{}", &data[16..32]);
+        let mut resolved = false;
+        for (tier, row) in LEVEL_PAIRS.iter().enumerate() {
+            for (class, (low, high)) in row.iter().enumerate() {
+                let read = |name: &str| -> Option<i32> {
+                    let field = vault.field(LEVEL_CLASS, &key, name).ok()?;
+                    u32::from_str_radix(field.data.trim(), 16).ok().map(|v| v as i32)
+                };
+                if let (Some(low), Some(high)) = (read(low), read(high)) {
+                    pairs[tier][class] = (low, high);
+                    resolved = true;
+                }
+            }
+        }
+        (pairs, resolved)
+    }
+
+    /// `sub_82496C58`: the `0..=32767` level a contact between `material` and `other` carries.
+    ///
+    /// `value` is the quantity the window interpolates over — for a landing the latched air time
+    /// (`[this+340]`), which is why retail's landing weight follows how far you actually fell.
+    /// `lo`/`hi` are that tier's window. A negative material is 0, and a tier with no window keeps
+    /// the `(0, 32767)` default.
+    pub(crate) fn contact_level(
+        &self,
+        material: i32,
+        other: i32,
+        tier: i32,
+        lo: f32,
+        hi: f32,
+        value: f32,
+        surfaces: &SurfaceMap,
+    ) -> u32 {
+        if material < 0 {
+            return 0;
+        }
+        // `sub_82496C58` stops at material 97 and at "no material", both of which keep class 0.
+        let class = if material >= CLASS_LOOKUP_CEILING || other == NO_MATERIAL {
+            0
+        } else {
+            self.other_class(other, surfaces).clamp(0, 2) as usize
+        };
+        let (low, high) = match usize::try_from(tier) {
+            Ok(tier) if tier < LEVEL_PAIRS.len() => self
+                .entries
+                .get(material as usize)
+                .map_or(DEFAULT_LEVEL_PAIR, |entry| entry.pairs[tier][class]),
+            _ => DEFAULT_LEVEL_PAIR,
+        };
+        // `f30 = min(value, hi)`, then the interpolation — or just `high` when the window is empty.
+        let value = value.min(hi);
+        if hi <= lo {
+            return high.clamp(0, FULL_SCALE as i32) as u32;
+        }
+        let scaled = low as f32 + (high - low) as f32 / (hi - lo) * (value - lo);
+        // `fctiwz` truncates.
+        (scaled as i32).clamp(0, FULL_SCALE as i32) as u32
     }
 
     /// For tests and for callers that already know the table.
@@ -373,6 +452,44 @@ const HOM_FIELDS: KindFields = KindFields {
 /// `audiofiles.big`.
 pub(crate) const METAL_BANK: &str = "Skate_Metal.bnk";
 pub(crate) const HOM_BANK: &str = "HOM_Set_1.bnk";
+
+/// `sub_82496C58`'s `(low, high)` pairs. They do not live on the material record: the material's
+/// `Attrib::RefSpec` at `82B1451A90152514` points at a record of class `13E20D398E385A56`, which
+/// `sub_824840E0` dereferences, and the pairs are that record's fourteen `Int32`s. The offsets in
+/// the lifted code (`+0/+4`, `+8/+12`, …) are its AttribSys class layout, read from
+/// `skaterschema.vlt`.
+const MATERIAL_LEVELS_REFSPEC: &str = "Hash_82B1451A90152514";
+/// The class the RefSpec points at.
+const LEVEL_CLASS: &str = "Hash_13E20D398E385A56";
+/// `(tier, paired class) -> (low field, high field)`. `tier == 2` ignores the class; `tier >= 3`
+/// never reaches the table and keeps the `(0, 32767)` default.
+const LEVEL_PAIRS: [[(&str, &str); 3]; 3] = [
+    // tier 0: class 0 -> +8/+12, class 1 -> +24/+28, class >= 2 -> +52/+56
+    [
+        ("Hash_E24D9CB4000A53AC", "Hash_1A83AD0330976744"),
+        ("Hash_75DC915E876A9DC9", "Hash_711F1F54903E76C9"),
+        ("Hash_166BAB2FD5B60560", "Hash_0D6EF57A39AF0C93"),
+    ],
+    // tier 1: class 0 -> +0/+4, class 1 -> +16/+20, class >= 2 -> +44/+48
+    [
+        ("Hash_036F313CEBC664FD", "Hash_8001982DA2E91D6A"),
+        ("Hash_24B725E05CEB027E", "Hash_CBBB19E302CE1A17"),
+        ("Hash_41F2E2456A97752A", "Hash_2638FF12C8FBBCCB"),
+    ],
+    // tier 2: +32/+36 whatever the class
+    [
+        ("Hash_C8DED1BC20B9D6A5", "Hash_B8870D2001033E0F"),
+        ("Hash_C8DED1BC20B9D6A5", "Hash_B8870D2001033E0F"),
+        ("Hash_C8DED1BC20B9D6A5", "Hash_B8870D2001033E0F"),
+    ],
+];
+
+/// `sub_82496C58`'s defaults when the tier has no window (`tier >= 3`).
+const DEFAULT_LEVEL_PAIR: (i32, i32) = (0, FULL_SCALE as i32);
+
+/// `sub_82496C58` stops consulting the paired material's class at material 97 and treats the
+/// "no material" pair as class 0.
+const CLASS_LOOKUP_CEILING: i32 = 97;
 
 /// `sub_824965D0`'s per-material level, `[record+52]` — clamped to `0..=32767` by the original.
 const MATERIAL_LEVEL_FIELD: &str = "Hash_875BA75341DC8391";
@@ -653,7 +770,7 @@ mod tests {
     #[ignore = "needs the owner's assets"]
     fn the_vault_resolves_every_material_category() {
         let assets = std::path::Path::new(
-            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets",
+            "C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets",
         );
         let vault = Collections::load(assets).expect("vault");
         let (materials, unresolved) = CollisionMaterials::load(&vault);
@@ -682,7 +799,7 @@ mod tests {
     #[ignore = "needs the owner's assets"]
     fn the_chooser_picks_real_samples_out_of_the_right_banks() {
         let assets = std::path::Path::new(
-            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets",
+            "C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets",
         );
         let vault = Collections::load(assets).expect("vault");
         let (m, _) = CollisionMaterials::load(&vault);
@@ -715,6 +832,18 @@ mod tests {
             assert!((0..=2).contains(&class), "material {material} has paired class {class}");
         }
 
+        // Every tier a real onset can produce, not just the one that happened to work.
+        for tier in [0, 1] {
+            for family_base in [95, 96] {
+                let grind_material = 10;
+                let a = m.sample(family_base, m.other_class(grind_material, &surfaces), tier);
+                let b = m.sample(grind_material, m.other_class(family_base, &surfaces), tier);
+                println!("tier {tier} family {family_base}: {a:?} / {b:?}");
+            }
+        }
+        println!("other_class(10)={} other_class(95)={} other_class(96)={}",
+            m.other_class(10, &surfaces), m.other_class(95, &surfaces), m.other_class(96, &surfaces));
+
         // What a rail grind actually posts: family base 95/96 as one material, the grind material
         // (143 → 10) as the other, and the same tier on both.
         for family_base in [95, 96] {
@@ -730,6 +859,49 @@ mod tests {
             assert_ne!(first.sample, 0);
             assert_ne!(second.sample, 0);
         }
+    }
+
+    /// `sub_82496C58` against the real vault: a landing's level must actually vary with air time,
+    /// and must be non-zero for ordinary surfaces — retail drops the whole message if either level
+    /// is 0, so a zero here is silence.
+    ///
+    ///     cargo test -p skate-game --bin skate3rust -- --ignored the_landing_level --nocapture
+    #[test]
+    #[ignore = "needs the owner's assets"]
+    fn the_landing_level_follows_the_air_time() {
+        let assets = std::path::Path::new(
+            "C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets",
+        );
+        let vault = Collections::load(assets).expect("vault");
+        let (m, _) = CollisionMaterials::load(&vault);
+        let surfaces = SurfaceMap::load(&vault).expect("surface map");
+        let board = 95;
+        let (threshold, ceiling) = (0.1f32, 0.3f32);
+
+        let level = |surface: i32, air: f32| {
+            let tier = i32::from(air >= threshold);
+            let (lo, hi) = if tier == 0 { (0.0, threshold) } else { (threshold, ceiling) };
+            (
+                m.contact_level(surface, board, tier, lo, hi, air, &surfaces),
+                m.contact_level(board, surface, tier, lo, hi, air, &surfaces),
+            )
+        };
+
+        let mut varied = 0;
+        for surface in [0, 2, 8, 10, 15, 16, 40] {
+            let steps: Vec<_> = [0.02f32, 0.08, 0.15, 0.3, 1.0]
+                .iter()
+                .map(|air| (*air, level(surface, *air)))
+                .collect();
+            println!("surface {surface}: {steps:?}");
+            let surface_levels: Vec<u32> = steps.iter().map(|(_, (s, _))| *s).collect();
+            if surface_levels.windows(2).any(|w| w[0] != w[1]) {
+                varied += 1;
+            }
+        }
+        // The whole point: a soft landing and a hard one must not produce the same level.
+        assert!(varied > 0, "no surface varied its level with air time");
+        println!("{varied} of 7 surfaces vary with air time");
     }
 
     #[test]
