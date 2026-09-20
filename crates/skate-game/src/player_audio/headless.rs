@@ -189,13 +189,19 @@ fn headless_landing_impact_is_audible() {
         .chain((0..120).map(|i| rolling(102 + i, 5.0)))
         .collect();
     let mut peaks = Vec::new();
+    let mut natives = Vec::new();
+    let mut matrices = Vec::new();
     for observation in script {
         sound
             .frame(&mut runtime, &observation)
             .expect("player-sound frame");
         tick += 1;
         blocks_owed += blocks_per_frame;
-        let mut frame_peak = 0.0f32;
+        // Three meters, because they answer different questions. The native peak is what the
+        // retail recomp's own output pass logs, so it is the one that compares with a capture;
+        // the matrix peak is the downmix before the host trim and the clamp, which is what
+        // decides how much headroom that trim has to leave; the device peak is what is heard.
+        let (mut frame_peak, mut frame_native, mut frame_matrix) = (0.0f32, 0.0f32, 0.0f32);
         while blocks_owed >= 1.0 {
             blocks_owed -= 1.0;
             let native = runtime.pump_once().expect("render one block");
@@ -203,19 +209,42 @@ fn headless_landing_impact_is_audible() {
                 native.len(),
                 PCM_FRAMES_PER_BLOCK as usize * usize::from(PCM_CHANNELS)
             );
+            for sample in &native {
+                frame_native = frame_native.max(sample.abs());
+            }
+            for frame in native.chunks_exact(usize::from(PCM_CHANNELS)) {
+                for (front, surround) in [(frame[0], frame[4]), (frame[1], frame[5])] {
+                    frame_matrix = frame_matrix.max((front + 0.707 * frame[2] + 0.5 * surround).abs());
+                }
+            }
             frame_peak = super::downmix(&native)
                 .iter()
                 .fold(frame_peak, |peak, sample| peak.max(sample.abs()));
         }
         peaks.push((tick, frame_peak));
+        natives.push(frame_native);
+        matrices.push(frame_matrix);
     }
     // The airborne stretch is frames 61..102; the landing lands at 103.
     let air = peaks[70..100].iter().fold(0f32, |p, (_, v)| p.max(*v));
     let landing = peaks[102..130].iter().fold(0f32, |p, (_, v)| p.max(*v));
+    let db = |v: f32| 20.0 * v.max(1e-9).log10();
+    let rolling_native = natives[20..60].iter().fold(0f32, |p, v| p.max(*v));
+    let landing_native = natives[102..130].iter().fold(0f32, |p, v| p.max(*v));
+    let landing_matrix = matrices[102..130].iter().fold(0f32, |p, v| p.max(*v));
+    // Retail, metered at its own output pass with its music off: rolling -22.9 dBFS, landing
+    // +0.4 dBFS, i.e. +23.3 dB of impact over the bed and a landing that runs past unity.
+    eprintln!(
+        "native rolling {:.1} dBFS, native landing {:.1} dBFS (+{:.1} dB; retail +23.3), matrix landing {:.1} dBFS",
+        db(rolling_native),
+        db(landing_native),
+        db(landing_native) - db(rolling_native),
+        db(landing_matrix),
+    );
     eprintln!(
         "air peak {:.1} dBFS, landing peak {:.1} dBFS",
-        20.0 * air.max(1e-9).log10(),
-        20.0 * landing.max(1e-9).log10()
+        db(air),
+        db(landing),
     );
     assert!(
         landing > air * 1.5,

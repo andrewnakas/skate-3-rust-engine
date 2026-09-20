@@ -610,3 +610,47 @@ ports; audio only shows them up.
    0.14–0.28 rad). In a Rust playtest the squeak never posts, so one of those engine inputs does not
    reach retail's values during PhysicsSlideGround (101). Use `SKATE_AUDIO_TRACE` and compare its
    `AS` lines with the capture's `state.tsv`.
+
+## 8. Output levels, measured against the recomp (2026-09-20)
+
+Levels were being set by ear, which kept trading one complaint for another ("gunshots" → "too
+quiet" → "balance is off"). They are now set from a like-for-like measurement of both sides.
+
+**Method.** The recomp's output pass `sub_82B21F58` was hooked to log every finished six-channel
+block as `OUT <p0..p5> | rms <r> frames <n> ch <c>` (`src/skate3_audio_capture.cpp`). The same line
+is emitted by this engine from `player_audio/trace.rs::output`, followed by a `DEV` line for the
+post-downmix stereo. Retail's in-game music was switched off so only the player mix is metered.
+The owner played the same session on both sides: roll, ollies and flip tricks, landings. Each
+side's levels are the p50 of a 12-frame window after each takeoff/landing edge, against the p50 of
+the rolling stretches.
+
+**Retail (music off), native six-channel:**
+
+| | peak p50 | over rolling |
+|---|---|---|
+| rolling | −22.9 dBFS | — |
+| takeoff | −5.9 dBFS | +17.0 dB |
+| landing | +0.4 dBFS | +23.3 dB |
+
+Two things follow. Retail's rolling bed is quiet — about 23 dB below its impacts — and retail's
+native mix runs *past unity* on a landing, so the console's master/Dac stage supplies headroom that
+this port does not have.
+
+**This engine, same session, before the fix:** native rolling −22.7 dBFS (the grain bed already
+matches retail to within 0.2 dB), takeoff −17.2 (+5.5 dB) and landing −13.6 (+9.1 dB). So the bed
+was right all along and the *impacts* were 11–14 dB short; the earlier readings of "rolling too
+loud" were an artefact of measuring after the host trim, which compresses the ratio.
+
+**What changed as a result:**
+
+* `authored::oneshot::CONTACT_TRIM` 0.125 → 0.625, raising a landing by the measured 14 dB onto
+  retail's level. Still a deviation, because the Splice graph's own levels are unrecovered.
+* The takeoff pops are on by default (`SKATE_AUDIO_CONTACT_POPS=0` disables them): retail's takeoff
+  is +17 dB over its bed and the authored takeoff alone reached +5.5 dB.
+* `player_audio::OUTPUT_GAIN` 2.5 → 0.6. It is headroom, not balance: the 6→2 downmix measures
+  +2.6 dB over the native peak on an impact, which would put a retail-level landing near +3 dBFS
+  and into the clamp — that clamp is what made landings read as "gunshots". Scaling the mix here
+  for loudness would move it away from retail's measured levels.
+
+Still not ported: the console's own downmix and master level, so absolute loudness at the speakers
+may differ from a retail console's even though the internal balance now matches.

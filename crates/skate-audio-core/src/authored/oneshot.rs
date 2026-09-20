@@ -75,13 +75,16 @@ const PERCENT_MAX: f32 = 100.0;
 /// the owner send), and the collision samples are mastered at full scale, so a voice comes out at
 /// 0 dBFS — about 20 dB above this engine's rolling bed, where it clips.
 ///
-/// This trim is what the playtest asks for instead: an impact that carries over the bed without
-/// clipping. It must be set together with the host edge's own interim trim
-/// (`skate-game/src/player_audio.rs`, `OUTPUT_GAIN`, +12 dB): 0.125 here puts a landing near
-/// −17 dBFS in this crate's own output and about −5 dBFS after that host trim, against a bed at
-/// −11..−12 dBFS. A component multiplies the resolved gain by it; when the Splice graph and the
-/// retail master/Dac stage are recovered, both numbers should go away together.
-pub const CONTACT_TRIM: f32 = 0.125;
+/// The trim is now set from a measurement rather than by ear. With the recomp's output pass metered
+/// (`OUT` lines) and its music off, retail's own player mix over a session of ollies is: rolling
+/// peak p50 −22.9 dBFS, takeoff −5.9 (+17.0 dB over rolling), landing +0.4 (+23.3 dB) — retail's
+/// landings reach full scale. The same session in this engine measured rolling −22.7 (i.e. the bed
+/// already matches retail) with the landing 14 dB short at this trim's earlier 0.125.
+///
+/// 0.625 raises a landing by the measured 14 dB, putting it at retail's level. It remains a
+/// deviation only because the Splice graph's own levels are unrecoverable; when they are recovered
+/// this should become 1.0 (or disappear).
+pub const CONTACT_TRIM: f32 = 0.625;
 
 /// The owner send level the retail capture shows the wheel pops using: `level(14)` = 2590 of
 /// 32767, i.e. −22.0 dB (28 local pops, 0x0A15..0x0A1E). The MixMap produces it from the Contacts

@@ -41,18 +41,24 @@ const OUTPUT_CHANNELS: u16 = 2;
 const SAMPLE_RATE: u32 = 48_000;
 const QUEUE_FRAMES: usize = 4096;
 const OBSERVATION_QUEUE: usize = 16;
-// INTERIM host-edge trim, chosen by ear, not recovered: this edge stands in for retail's master/Dac
-// output stage, which is not ported (see `docs/player-audio-retail-drivers.md` section 7). The
-// owner's playtests found 4.0 right for the authored path and unity audibly too quiet.
+// The host edge is headroom, not balance — and it is now measured rather than guessed.
 //
-// 4.0 cannot stay, though: the authored landing alone arrives near -13 dBFS, so 4.0 left under 1 dB
-// of headroom and the Splice landing impact on top of it clipped. Measured over a landing, with the
-// impact included: 4.0 clips, 2.5 peaks at -1.2 dBFS, 2.0 at -3.2 dBFS. 2.5 keeps the impact and
-// costs about 4 dB against the level the owner approved.
+// With the recomp metered at its output pass (`OUT` lines) and its music off, retail's own player
+// mix over a session of ollies sits at rolling peak p50 -22.9 dBFS with landings reaching +0.4
+// dBFS: retail's native mix runs *past* unity on an impact and relies on a master/Dac stage this
+// port does not have. The same session in this engine measures rolling -22.7 dBFS and, with the
+// contact trim set from the same capture, landings at retail's level. So the levels themselves
+// already match retail and must not be scaled again; what is left to supply is the headroom.
 //
-// Raising it again means porting that master stage (and recovering the Splice graph's own levels,
-// `oneshot::CONTACT_TRIM`), not growing this constant until something clips.
-const OUTPUT_GAIN: f32 = 2.5;
+// `downmix` sums front + 0.707 centre + 0.5 surround, measured at +2.6 dB over the native peak on
+// an impact, which would put a retail-level landing near +3 dBFS and into the clamp — the clamp is
+// what made landings read as "gunshots". 0.6 (-4.4 dB) keeps a retail-level landing just under
+// full scale while preserving retail's 23 dB of impact-over-bed dynamics.
+//
+// This edge still stands in for retail's master/Dac stage (`docs/player-audio-retail-drivers.md`
+// section 7): it models that stage's headroom, not the console's own downmix or master level, so
+// absolute loudness at the speakers may still differ from a retail console's.
+const OUTPUT_GAIN: f32 = 0.6;
 
 #[derive(Resource)]
 struct PlayerAudioHost {

@@ -83,9 +83,10 @@ pub(crate) struct ContactVoicePlayer {
     rand: Rand,
     live: Vec<Live>,
     reported: std::collections::HashSet<String>,
-    /// The takeoff pops: retail's level for them is MixMap-driven from Contacts inputs nothing
-    /// writes yet, and the authored takeoff already sounds right, so they stay behind
-    /// `SKATE_AUDIO_CONTACT_POPS` until those inputs exist. The landing impact is always on.
+    /// The takeoff pops. Retail's metered takeoff is +17 dB over its rolling bed while this
+    /// engine's was +5.5 dB without them, so they are on by default; `SKATE_AUDIO_CONTACT_POPS=0`
+    /// turns them off. Their MixMap-driven environment send still uses `RETAIL_POPS_LEVEL`,
+    /// because the Contacts inputs that drive it are not written yet.
     pops_enabled: bool,
     /// The pops' owner-local six-channel send bus (`sub_82488DD0`), built on first use.
     pops_send: Option<u32>,
@@ -112,7 +113,7 @@ impl ContactVoicePlayer {
             rand: Rand::new(cache.map_or(1, |_| 1)),
             live: Vec::new(),
             reported: std::collections::HashSet::new(),
-            pops_enabled: std::env::var_os("SKATE_AUDIO_CONTACT_POPS").is_some(),
+            pops_enabled: std::env::var("SKATE_AUDIO_CONTACT_POPS").map_or(true, |v| v != "0"),
             pops_send: None,
         })
     }
