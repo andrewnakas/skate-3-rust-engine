@@ -61,6 +61,46 @@ values.
 **Fixed when.** An ordinary ollie runs in state 201, and `air_timing` can be deleted in favour of
 reading Air+176/+184 directly.
 
+### Retail's actual ollie path, recovered 2026-09-20 — and why the premise now needs re-measuring
+
+**Retail does not go 100 → 201.** An ordinary ollie runs **100 → 103 (GroundAnimation) → 201**, and
+the trajectory is launched *and completed in the same frame* inside GroundAnimation's
+`sub_82D33E30`, gated on `Toolkit_CalcGroundJump` (`sub_82D93618`) returning `JumpInfo+20 != 0`:
+
+```
+86.cpp:6996   bl 0x82d93618      Toolkit_CalcGroundJump
+86.cpp:7022   beq cr6,...        not active -> ordinary ground forces
+86.cpp:7080   bl 0x82d67848      LAUNCH
+86.cpp:7085   bl 0x82d68800      COMMIT, same frame -> selector+9658 valid = 1
+```
+
+Then PostInput (`sub_82DB5588`) calls `sub_82D68800` again — nothing is pending, so it early-outs
+and returns the **retained** `valid` — and stamps bit 0x400:
+`91.cpp:62477 rlwimi r4,r5,10,21,21`. The 103 arm of the selector reads `+2572 == 1` and yields
+`200 | bit` = 201 (`90.cpp:13258` → `90.cpp:14056`). `valid` is sticky: only `sub_82D67848`
+(launch) and `sub_82D67228` (reset) clear it. PhysicsGround launches **only** on the animated-board
+branch (`86.cpp:19001 lbz r8,2708(r31)`), which is a contact condition, not the ollie.
+
+**This engine already matches all of that.** `ground_animation/board.rs:71-104` launches on
+`jump.active` and calls `trajectory.update` on the very next lines, and `Trajectory::launch` fills
+`pending_results` synchronously (`air_trajectory/mod.rs:50-54`), so the completion really does
+happen in-frame. `complete_batch` sets `self.valid = true` at `selector.rs:278` **before** it
+starts any second pass, and `launch_pass` does not clear it — so a pending second pass does not
+take `valid` away. Both selector arms (`selector/ground.rs:33-35` for 100, `:107-109` for 103)
+match retail's `field_2572 == 1 → air_variant_from_2468()`.
+
+**So the "nothing publishes bit 10 except transiently" premise is not supported by the code as it
+now stands, and it has not been re-measured since the workaround was written.** Note also that
+rolling off an edge *correctly* yields PhysicsAir in both retail and here — `selector/ground.rs:42`
+and `:110` hard-code it, exactly as retail does — so a roll-off test proves nothing about ollies,
+and `tests/air_playback.rs` only ever asserts `category() == 200`, which 200/201/202 all satisfy.
+
+**Do this before changing any physics.** Play, ollie, and read the new `st=` field:
+`grep -o "AS st=[0-9]*" <trace> | sort | uniq -c`. If 201 appears on hops, this defect is stale
+like #3 and #7 were and the only work left is deleting the `air_timing` workaround. If it never
+does, the thing to instrument next is `jump.active` and the selector's `valid` at the moment
+PostInput publishes, since every other link above is confirmed present.
+
 ## 3. Powerslide squeaks — **the "never fires" premise was wrong (corrected 2026-09-20)**
 
 **Symptom as originally recorded.** No powerslide squeak sound, ever.
@@ -172,17 +212,79 @@ per-material impact level (see `docs/player-audio-retail-drivers.md` §9), so po
 landings and adds material-dependent landing weight at the same time. `sub_82486EF0`'s sink was
 traced as far as `[g[0x830CFDC4]+668]->vfunc12`; the handler beyond that is not yet followed.
 
+### Decoded 2026-09-20 — everything except the sink's own dispatch
+
+**Why a rail landing is silent specifically.** `Contacts::step` suppresses the ordinary landing
+voice during a grind (`contacts.rs:708`, `else if !airborne && !grinding`), so the grind onset is
+the *only* sound retail plays for that event — and it is the one that is dropped. The two
+suppressions compound into silence. Retail has no such gap because its onset always posts:
+`sub_824BB0E0` has no zero-level guard, unlike the landing `sub_824BA630`, which skips its message
+when either level is 0 (`11.cpp:26040-26050`).
+
+**The game-side chain is already complete and correct**: contact geometry → `impact_speed_128` →
+`AudioState.grind_impact_228` / `grind_material_692` / `grind_family_192` →
+`ContactsOwner::grind_onset` → `VoiceRequest { material, family_base, tier }` →
+`ContactVoices::play(GrindOnset, ..)`. Only the sink is missing.
+
+**The message is fully decoded.** `sub_82486EF0` allocates 48 bytes and writes: `+0x00` material A
+(the family base, 95 or 96), `+0x04` material B (the grind material, 143→10), `+0x08`/`+0x0C` the
+impact tier, `+0x10` a `vec4` world position copied wholesale (from audio state `+48` for the grind
+onset, `+144` for a landing), `+0x20`/`+0x24` the two 0…32767 levels, and three flag bytes at
+`+0x28`/`+0x29`/`+0x2A`. Delivery is two-stage: `[manager+668]->vtable[+12](msg)` returns another
+object and the message is handed to *its* `vtable[+12]` too.
+
+**The levels are decoded too.** `sub_82496C58` returns
+`low + (high - low) * (min(value, hi) - lo) / (hi - lo)`, truncated, with `(low, high)` chosen by a
+(mode × material-category) table and defaulting to `(0, 32767)`; it returns 0 for a negative
+material or mode 3. The tier selects which impact-speed window the interpolation runs over —
+`[0.0, 0.25]` for tier 0 and `[0.25, 0.5]` for tier 1, both vault floats
+(`086B66C3D4FFEE8F`, `B2ACAFDBCD963C93`) on the grind-material class. The Rust `VoiceRequest`
+carries the tier but not those two bounds.
+
+**What is still unknown is only the dispatch behind `vtable[+12]`** — i.e. how the material pair
+picks the actual sound. Nothing in `sub_82486EF0` or `sub_824BB0E0` names a bank or a sample, which
+is why `contact_voices.rs` is right to refuse to invent one. **Porting the onset means porting the
+contact-sound manager, not adding an arm to `ContactVoicePlayer::selection`.**
+
+**One confirmed, independent port gap while you are in there.** `ContactLatches::grind_gate_124` is
+read at `contacts.rs:667` but **never written anywhere in the tree**. Retail writes it at
+`sub_824BB0E0`'s tail from the constant at `0x8209975C` — verified directly in the lifted asm
+(`lfs f0,124(r3)` at the head, `stfs f0,124(r25)` at the tail). That is the onset's cooldown /
+re-arm; without it, once the onset *is* driven it will retrigger on every grind edge with no
+spacing. Fixing this now is pointless while the sound is silent, but it must land with the sink.
+
+As of this commit the two dropped sounds also **report themselves once per run** through the
+existing `SKATE_PLAYER_AUDIO contact_voice_unavailable` channel instead of disappearing silently.
+
 ---
 
-## Suggested order for the next session
+## Suggested order (updated 2026-09-20)
 
-1. **#2 (KnownAir)** — unblocks real air timing for everything, not just audio, and lets an
-   audio-side workaround be deleted. (#1 is resolved; nothing to do there.)
-3. **#7 (broadphase)** — a reproducible correctness failure in contact generation, and it has a
-   one-line repro.
-4. **#3 (powerslide inputs)** — one trace comparison away from being isolated.
-5. **#5 (surfaces)** — large, but the audio side is already ported and waiting.
-6. **#9 (rail/grind landings)** — one subsystem unlocks rail landings *and* continuous
-   material-dependent landing weight.
-7. **#4 (ragdoll/loose board)**, **#6 (NaN crash)** and **#8 (renderer race)** — all need a repro
+**Three of the nine entries turned out to rest on premises the evidence does not support** — #1
+(2026-09-20, earlier), then #7 and #3 here. A fourth, #2, is now in the same position. The pattern
+is consistent enough to be a rule: **re-measure the premise before writing code against it.**
+
+**One playtest answers two of these at once.** Play, ollie a few times, powerslide a few times,
+with `SKATE_AUDIO_TRACE=logs\...`, then:
+
+- `grep -o "AS st=[0-9]*" <trace> | sort | uniq -c` → does an ollie reach **201**? (#2)
+- `grep "AS st=101" <trace> | head` → does the squeak gate pass during a real powerslide, and is
+  there a `Class_Squeaks` `PO` on the same frame? (#3)
+
+Both questions were unanswerable before this session because `AS` carried no state id; it does now.
+
+1. **The playtest above** — it is the gate on both #2 and #3, and costs one run.
+2. **#5 (surfaces)** — large, but the audio side is already ported and waiting, and it is the
+   single biggest audible gap now that the impacts are measured-correct: every surface currently
+   sounds like concrete.
+3. **#9 (rail/grind landings)** — everything is decoded except the contact-sound manager's
+   `vtable[+12]` dispatch (see above). That one subsystem unlocks rail landings *and* the
+   continuous material-dependent landing weight in `player-audio-retail-drivers.md` §9. Land the
+   `grind_gate_124` re-arm with it.
+4. **The offboard static matching-group question** (the one deliberately failing test,
+   `embedded_static_rwcm_hits_distinct_actor_query_ids`) — needs retail to say whether static
+   registration normalises the packed unit group to -1.
+5. **#4 (ragdoll/loose board)**, **#6 (NaN crash)** and **#8 (renderer race)** — all need a repro
    before they can be chased.
+
+Resolved and needing nothing: **#1**, **#7**.
