@@ -246,6 +246,42 @@ picks the actual sound. Nothing in `sub_82486EF0` or `sub_824BB0E0` names a bank
 is why `contact_voices.rs` is right to refuse to invent one. **Porting the onset means porting the
 contact-sound manager, not adding an arm to `ContactVoicePlayer::selection`.**
 
+### The sink is pinned to three words of `.data`/`.rdata` (2026-09-20)
+
+The manager global `0x830CFDC4` is written in exactly one place, `sub_826D5500` (`28.cpp:52333`):
+a 2192-byte object allocated and constructed by `sub_824845B8`. There is **no `stw rX,668`
+anywhere**, because `+668` is not a named field: the constructor zero-fills a **14-entry pointer
+array at `+656..+708`** (`9.cpp:44075-44088`), and `sub_82484FE8` (`9.cpp:45097`) fills it with
+`modules[i] = sub_828DED90(i)`. So **the sink is `manager->modules[3]`** — array slot 3.
+
+`sub_828DED90` (`46.cpp:57277`) is a type-id registry lookup over a vector at `0x830BBE00` of
+12-byte descriptors (`+0` id, `+4` pool, `+8` create fn). The 14 descriptors are registered by
+`sub_8248D2A0` (`9.cpp:64145`), whose addresses, create functions, object sizes and vtable
+addresses are all recovered. **But the descriptors' id words live in `.data`, and the vtables'
+contents live in `.rdata`, and the recompiler lifts only `.text`** — so neither "which class is
+slot 3" nor "what function is at its `vtable[+12]`" is derivable from `generated/`.
+
+Also corrected: **`sub_828AAF88` is not a fallback sink.** It returns the default
+`EA::Allocator::ICoreAllocator` (`45.cpp:7080`), and the `loc_82486FBC` tail is
+`GetDefaultAllocator()->Free(msg, 0)` — the null-sink path *destroys* the message. Model it as
+"drop the event", not as a second delivery route. (Its twin `sub_828AAE90` is what allocated the
+48 bytes, which is how the `vt[8]=Alloc` / `vt[12]=Free` slots were confirmed.)
+
+**Three reads close this**, against a decrypted retail image at base `0x82000000`:
+1. the id word at `0x8302CD1C` and at `0x8302CD80 + 12n` for n=0..12 — find the one equal to 3;
+2. that descriptor's `+8` create fn, cross-checked against the recovered table, which names the
+   class (each create fn passes a distinct allocation-tag string, so the class name is readable);
+3. the word at `<that class's vtable> + 12` — the concrete `vtable[+12]`, which can then be pulled
+   out of `generated/` with the usual awk and read directly.
+
+**Getting a decrypted image is the blocker, and it is not hard in principle** — the retail
+`default.xex` at `out/build/windows-release/game/` is `encryption=0001, compression=0002` (AES +
+LZX), and the SDK ships `rex/system/xex_module.cpp` and `lzx.cpp` that do exactly this at runtime.
+Note that `rexglue.exe dump-xex` **looks like a stub in the SDK build on this machine**: it exits 0
+in 0.2 s and writes nothing, at any log level. Either fix that subcommand, add a tiny host that
+calls the SDK's `XexModule` loader and writes the image out, or read the words from the running
+recomp's memory.
+
 **One confirmed, independent port gap while you are in there.** `ContactLatches::grind_gate_124` is
 read at `contacts.rs:667` but **never written anywhere in the tree**. Retail writes it at
 `sub_824BB0E0`'s tail from the constant at `0x8209975C` — verified directly in the lifted asm
