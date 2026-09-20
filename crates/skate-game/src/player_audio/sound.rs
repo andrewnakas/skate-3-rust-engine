@@ -398,9 +398,15 @@ pub(crate) fn build(
     };
     // `sub_824B90D8` runs inside the Contacts process before the foot-drag trigger
     // (`sub_824BB540`), so the owner ticks first and shares the Contacts controller.
+    // TEMPORARY: the Splice contact one-shots (wheel pops and the landing impact) are ~20 dB too
+    // hot in the playtest — the gain chain is under investigation — so they are off unless
+    // `SKATE_AUDIO_CONTACT_VOICES=1`. The trigger side still runs either way.
+    let contact_voices_enabled = std::env::var_os("SKATE_AUDIO_CONTACT_VOICES").is_some();
     let voices = SharedContactVoices::default();
     let contacts_owner = ContactsOwner::new(&vault, true, Box::new(voices.clone()))?;
-    let contact_player = ContactVoicePlayer::new(assets, cache)?;
+    let contact_player = contact_voices_enabled
+        .then(|| ContactVoicePlayer::new(assets, cache))
+        .transpose()?;
     let entries = vec![
         Entry::new(
             "ContactsOwner",
@@ -422,5 +428,10 @@ pub(crate) fn build(
         ),
         Entry::new("OffBoard", ctrl(runtime, 9, "OffBoard")?, Box::new(Footsteps::new(&vault)?)),
     ];
-    PlayerSound::new(runtime, tuning, entries, Some((voices, contact_player)))
+    PlayerSound::new(
+        runtime,
+        tuning,
+        entries,
+        contact_player.map(|player| (voices, player)),
+    )
 }
