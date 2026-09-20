@@ -651,3 +651,29 @@ loud" were an artefact of measuring after the host trim, which compresses the ra
 
 Still not ported: the console's own downmix and master level, so absolute loudness at the speakers
 may differ from a retail console's even though the internal balance now matches.
+
+
+## 9. Open: the landing one-shot has no dynamics (found 2026-09-20)
+
+**Symptom, owner's words:** landings "sound the same" whatever the drop.
+
+**Not the Treatment layer.** With the old 10x scale removed, Class_Treatment word 9 measures
+min 12, p50 163, p90 209, max 393 over 748 landings in a playtest trace, across 184 distinct
+values — inside retail's 183–367 and clearly modulated by drop height. Implied jump height p50 is
+0.978 m. That layer is working.
+
+**The fixed layer is the Splice one-shot.** The landing impact that dominates what you hear is
+opened by `ContactVoicePlayer` with `gain = member.values.gain` straight from the bank record,
+scaled only by the constant `authored::oneshot::CONTACT_TRIM`. Nothing in that path varies with
+drop height, landing velocity or wheel count, so every landing fires at one level — which is why
+a curb drop and a roof gap are indistinguishable even though word 9 separates them cleanly.
+
+**What retail does instead.** The one-shot's level is a MixMap output like every other player gain.
+The Contacts component's controller inputs (ids 3, 6, 10, 17, 18, 21) are the ones still unwritten
+— the same gap that keeps the takeoff pops' environment send on the `RETAIL_POPS_LEVEL` constant.
+Until those inputs are fed from the audio state, contact one-shots cannot have retail's dynamics.
+
+**Next step.** Write the Contacts MixMap inputs from `AudioState` (landing bucket `+448`, landed
+mask `+464`, wheel count `+200`, and the air fields `+236`/`+240`/`+260`), then take the one-shot
+gain from the controller instead of `CONTACT_TRIM`. Verify by re-measuring: a small hop and a big
+drop must produce different `OUT` peaks, not just different word 9.
