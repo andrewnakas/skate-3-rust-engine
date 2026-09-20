@@ -30,6 +30,11 @@ pub struct GroundJumpSettings {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct GroundJumpInput {
+    /// **Not a retail field.** Scales the pop height this launch still has to climb, so the
+    /// caller can work around an engine defect without this lifted routine drifting from
+    /// `Toolkit_CalcGroundJump`. Retail behaviour is `1.0`; see
+    /// `docs/engine-defects.md` defect 1 and `physics::ground_animation::board`.
+    pub pop_height_scale: f32,
     pub flags_2468: u32,
     pub flags_2480: u32,
     pub flags_2484: u32,

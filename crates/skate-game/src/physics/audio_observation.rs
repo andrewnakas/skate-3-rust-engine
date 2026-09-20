@@ -188,19 +188,6 @@ struct AirTimingInputs {
 /// PhysicsAir: the audio state then saw +236 = 0 and +240 = 4.0 and the Treatment packet's air
 /// words stopped moving. Each branch below reads the same quantity from the native fields of the
 /// state that owns it.
-/// **TEMPORARY, SOUND ONLY — for downstream developers.** Audio state `+260` is Air+200, the hop's
-/// jump height (`max_y − start_y`, written by both air Fills). Retail plateaus at 1.1–2.2 m on an
-/// ollie; this engine's physics produces 0.10–0.13 m, so the Treatment patch's word 9
-/// (`height × 166.667`, clamped to 1000) never leaves the bottom of its range and landings sound
-/// weaker than retail. Scaling the value the audio worker sees by 10 puts it in retail's range
-/// until the physics pop height is fixed.
-///
-/// This multiplies ONLY the copy handed to audio: the native record keeps its own value, because
-/// animation (`remaining_air_time`, `time_to_land`) and the slow-motion camera read those fields.
-/// **Remove this once the physics ollie height matches retail** — see
-/// `docs/player-audio-retail-drivers.md` §7.
-const TEMPORARY_JUMP_HEIGHT_SCALE: f32 = 10.0;
-
 fn air_timing(inputs: AirTimingInputs) -> (f32, f32) {
     match inputs.state {
         201 => (inputs.published_176, inputs.published_184),
@@ -267,7 +254,7 @@ fn retail_inputs(
         wheel_count: physical.collision.wheel_count_0 & 7,
         air_time_in_state: air_time.0,
         air_time_until_landing: air_time.1,
-        air_jump_height: physical.air.jump_height_200 * TEMPORARY_JUMP_HEIGHT_SCALE,
+        air_jump_height: physical.air.jump_height_200,
         state_flags: skater.player_state.state_flags,
         offboard_feet: physical.off_board.flags_306_307.map(|flag| flag != 0),
         footplant: [

@@ -18,6 +18,23 @@ pub(super) fn set_drag(physics: &mut GamePhysics, drag: f32) {
         body.inertia.linear_drag = drag * DRAG_FREQUENCY;
     }
 }
+/// **TEMPORARY — for downstream developers.** The engine's ollie clears 0.10-0.13 m where retail
+/// clears 1.1-2.2 m, measured from audio state `+260` (Air+200 = `max_y - start_y`) against a
+/// retail capture. Everything that reads jump height is wrong as a result: the trick feels flat to
+/// play, and Treatment word 9 (`height x 166.667`, clamped to 1000) reports 16-22 where retail
+/// reports 183-367, so every landing sounds like the lightest possible touchdown.
+///
+/// The suspected root cause is `ground_jump`'s `height - current_height` term, where
+/// `current_height` is currently the skater's *absolute* body COM above the lowest wheel centre
+/// (~0.9 m) rather than a crouch-relative displacement: a ~1.0 m `JumpMaxHeight` then leaves ~0.1 m
+/// of pop, which matches the measurement. **This 10x is a stand-in, not the fix** — remove it once
+/// `current_height` is sourced correctly and an ollie measures 1.1-2.2 m on its own.
+///
+/// It is applied to the real launch, so the trajectory, the selector packet, `max_y` and the audio
+/// field all agree. It replaces an earlier audio-only scale that made landings sound right while
+/// the skater still barely left the ground. See `docs/engine-defects.md` defect 1.
+const TEMPORARY_POP_HEIGHT_SCALE: f32 = 10.0;
+
 pub(super) fn advance(physics: &mut GamePhysics, skater: &mut SkaterRuntime) -> Result<(), String> {
     let p = &skater.player_input.processed;
     let t = skater
@@ -64,6 +81,7 @@ pub(super) fn advance(physics: &mut GamePhysics, skater: &mut SkaterRuntime) -> 
             jump_controls: skater.animation_input.extra.jump_controls,
             gravity_y: p.gravity_2648,
             surface_speed: p.scalar_2656,
+            pop_height_scale: TEMPORARY_POP_HEIGHT_SCALE,
         },
         mode,
         &skater.ground_animation_settings.jump,

@@ -61,7 +61,11 @@ pub fn calculate(
             ),
             input.reference_up,
         );
-        let remaining = maximum(height - current_height, 0.0);
+        // Retail has no scale here: `pop_height_scale` is 1.0 unless the caller is working
+        // around the engine's short pop (`docs/engine-defects.md` defect 1). Scaling the
+        // remaining climb rather than the launch speed keeps the whole trajectory consistent,
+        // because apex rise is linear in this term.
+        let remaining = maximum(height - current_height, 0.0) * input.pop_height_scale;
         let square = (remaining * input.gravity_y) * -2.0;
         let speed = square_root(square);
         let angle = acos(vector_clamp(normal[1], -1.0, 1.0));
