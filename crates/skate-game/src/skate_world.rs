@@ -1352,10 +1352,15 @@ mod tests {
         let mut scene = crate::map_render::PreparedScene::new(&world);
         scene.prepare(Some(&map), std::path::Path::new("unused"));
         scene.publish(&mut world);
-        assert_eq!(world.resource::<Assets<Mesh>>().len(), 1);
-        assert_eq!(world.resource::<Assets<StandardMaterial>>().len(), 1);
-        assert_eq!(world.resource::<Assets<Image>>().len(), 2);
-        assert_eq!(world.query::<&Mesh3d>().iter(&world).count(), 1);
+        // A custom (non-stock) map takes the `celestial_bodies` branch, which adds
+        // one shared disc mesh and spawns the sun and the moon from it. So: the
+        // world mesh plus the disc; the world material plus one per body; the
+        // lightmap and the world texture plus one texture per body; and three
+        // drawn entities -- the world and the two discs.
+        assert_eq!(world.resource::<Assets<Mesh>>().len(), 2);
+        assert_eq!(world.resource::<Assets<StandardMaterial>>().len(), 3);
+        assert_eq!(world.resource::<Assets<Image>>().len(), 4);
+        assert_eq!(world.query::<&Mesh3d>().iter(&world).count(), 3);
         let lightmap = world
             .query::<&bevy::pbr::Lightmap>()
             .single(&world)
