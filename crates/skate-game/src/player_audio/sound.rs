@@ -14,7 +14,7 @@ use skate_audio_core::authored::AuthoredRuntime;
 use skate_audio_core::mixmap::{self, inputs};
 
 use super::audio_state::AudioState;
-use super::components::{Component, ControlSnapshot, Controls, Tick};
+use super::components::{Component, ControlSnapshot, Tick};
 use super::contact_voices::{ContactVoicePlayer, SharedContactVoices};
 use super::tuning::AudioTuning;
 use crate::skate_audio::PlayerAudioObservation;
@@ -294,13 +294,7 @@ impl PlayerSound {
         // The Contacts component recorded its one-shot plays during its process; open them now,
         // before the evaluation, as retail's process does.
         if let Some((shared, player)) = &mut self.contact_voices {
-            // Retail scales every contact member by the owner's level id 14 (`sub_824AF240`).
-            let gain = self
-                .entries
-                .iter()
-                .find(|entry| entry.name == "ContactsOwner")
-                .map_or(0.0, |entry| entry.last.level(14) as f32 / 32767.0);
-            player.drain(runtime, shared, &self.audio, gain, FRAME_SECONDS)?;
+            player.drain(runtime, shared, &self.audio, FRAME_SECONDS)?;
         }
 
         // 3. Evaluate.
@@ -398,15 +392,9 @@ pub(crate) fn build(
     };
     // `sub_824B90D8` runs inside the Contacts process before the foot-drag trigger
     // (`sub_824BB540`), so the owner ticks first and shares the Contacts controller.
-    // TEMPORARY: the Splice contact one-shots (wheel pops and the landing impact) are ~20 dB too
-    // hot in the playtest — the gain chain is under investigation — so they are off unless
-    // `SKATE_AUDIO_CONTACT_VOICES=1`. The trigger side still runs either way.
-    let contact_voices_enabled = std::env::var_os("SKATE_AUDIO_CONTACT_VOICES").is_some();
     let voices = SharedContactVoices::default();
     let contacts_owner = ContactsOwner::new(&vault, true, Box::new(voices.clone()))?;
-    let contact_player = contact_voices_enabled
-        .then(|| ContactVoicePlayer::new(assets, cache))
-        .transpose()?;
+    let contact_player = ContactVoicePlayer::new(assets, cache)?;
     let entries = vec![
         Entry::new(
             "ContactsOwner",
@@ -428,10 +416,5 @@ pub(crate) fn build(
         ),
         Entry::new("OffBoard", ctrl(runtime, 9, "OffBoard")?, Box::new(Footsteps::new(&vault)?)),
     ];
-    PlayerSound::new(
-        runtime,
-        tuning,
-        entries,
-        contact_player.map(|player| (voices, player)),
-    )
+    PlayerSound::new(runtime, tuning, entries, Some((voices, contact_player)))
 }

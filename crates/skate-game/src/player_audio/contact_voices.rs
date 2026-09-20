@@ -83,6 +83,12 @@ pub(crate) struct ContactVoicePlayer {
     rand: Rand,
     live: Vec<Live>,
     reported: std::collections::HashSet<String>,
+    /// The takeoff pops: retail's level for them is MixMap-driven from Contacts inputs nothing
+    /// writes yet, and the authored takeoff already sounds right, so they stay behind
+    /// `SKATE_AUDIO_CONTACT_POPS` until those inputs exist. The landing impact is always on.
+    pops_enabled: bool,
+    /// The pops' owner-local six-channel send bus (`sub_82488DD0`), built on first use.
+    pops_send: Option<u32>,
 }
 
 impl ContactVoicePlayer {
@@ -106,6 +112,8 @@ impl ContactVoicePlayer {
             rand: Rand::new(cache.map_or(1, |_| 1)),
             live: Vec::new(),
             reported: std::collections::HashSet::new(),
+            pops_enabled: std::env::var_os("SKATE_AUDIO_CONTACT_POPS").is_some(),
+            pops_send: None,
         })
     }
 
@@ -116,9 +124,6 @@ impl ContactVoicePlayer {
         runtime: &mut AuthoredRuntime,
         shared: &SharedContactVoices,
         audio: &AudioState,
-        // `owner_gain`: the owner's level reader id 14 over 32767 — `sub_824B9CC8` and
-        // `sub_824BA630` scale every member by it (vtable slot 15 is the shared level reader).
-        owner_gain: f32,
         dt: f32,
     ) -> Result<(), String> {
         let (queued, freed) = {
@@ -137,9 +142,32 @@ impl ContactVoicePlayer {
             }
         }
         for play in queued {
-            let Some((bank, sample, bus)) = self.selection(&play, audio) else {
+            let Some((bank, sample, mut bus)) = self.selection(&play, audio) else {
                 continue;
             };
+            // `sub_824B9CC8` routes the pops through the owner's own send bus, whose first send
+            // carries the environment level the owner reads as level(14).
+            if matches!(play.sound, ContactSound::Pop) {
+                let send = match self.pops_send {
+                    Some(send) => send,
+                    None => {
+                        match runtime.build_owner_send(
+                            self.pops.bus,
+                            skate_audio_core::authored::oneshot::RETAIL_POPS_LEVEL,
+                        ) {
+                            Ok(send) => {
+                                self.pops_send = Some(send);
+                                send
+                            }
+                            Err(error) => {
+                                self.report(&format!("pops send bus: {error}"));
+                                continue;
+                            }
+                        }
+                    }
+                };
+                bus = OneshotBus::Module(send);
+            }
             // A contact sound that cannot resolve or play must not take the whole player-sound
             // worker down with it: report it once and carry on with the rest of the mix.
             let members = match self.banks.resolve(bank, sample, &mut self.state, &mut self.rand) {
@@ -190,7 +218,7 @@ impl ContactVoicePlayer {
     /// `sub_824B9CC8`'s and `sub_824BA630`'s sample choice.
     fn selection(&self, play: &Queued, audio: &AudioState) -> Option<(&'static str, u16, OneshotBus)> {
         match play.sound {
-            ContactSound::Pop => {
+            ContactSound::Pop if self.pops_enabled => {
                 let class = usize::try_from(play.request.selector.unwrap_or(0)).unwrap_or(0);
                 // `sub_824BA310`: the wheel material's AudioSurfaceMap lane +8 plus the soft-wheel
                 // test (`sub_82494D78`).
@@ -202,13 +230,14 @@ impl ContactVoicePlayer {
                 };
                 let category = surface_category(lane, audio.soft_wheels_684 != 0);
                 let (bank, sample) = self.pops.sample(class, category, false)?;
+                // Replaced with the owner send bus in `drain`.
                 Some((bank, sample, OneshotBus::EqChain(self.pops.bus)))
             }
             ContactSound::Landing => {
                 Some((self.landing.bank(), self.landing.sample, OneshotBus::Default))
             }
-            // See the module note: not this subsystem, and not an invented sample.
-            ContactSound::PopRoll | ContactSound::GrindOnset => None,
+            // Pops off (see `pops_enabled`), and the two paths that are a different subsystem.
+            ContactSound::Pop | ContactSound::PopRoll | ContactSound::GrindOnset => None,
         }
     }
 }

@@ -76,9 +76,12 @@ const PERCENT_MAX: f32 = 100.0;
 /// 0 dBFS — about 20 dB above this engine's rolling bed, where it clips.
 ///
 /// This trim is what the playtest asks for instead: an impact that carries over the bed without
-/// clipping. At 0.25 a landing peaks near −12 dBFS against a bed of −20..−24 dBFS. A component
-/// multiplies the resolved gain by it; when the Splice graph is recovered, it should go away.
-pub const CONTACT_TRIM: f32 = 0.25;
+/// clipping. It must be set together with the host edge's own interim trim
+/// (`skate-game/src/player_audio.rs`, `OUTPUT_GAIN`, +12 dB): 0.125 here puts a landing near
+/// −17 dBFS in this crate's own output and about −5 dBFS after that host trim, against a bed at
+/// −11..−12 dBFS. A component multiplies the resolved gain by it; when the Splice graph and the
+/// retail master/Dac stage are recovered, both numbers should go away together.
+pub const CONTACT_TRIM: f32 = 0.125;
 
 /// The owner send level the retail capture shows the wheel pops using: `level(14)` = 2590 of
 /// 32767, i.e. −22.0 dB (28 local pops, 0x0A15..0x0A1E). The MixMap produces it from the Contacts

@@ -42,15 +42,17 @@ const SAMPLE_RATE: u32 = 48_000;
 const QUEUE_FRAMES: usize = 4096;
 const OBSERVATION_QUEUE: usize = 16;
 // INTERIM host-edge trim, chosen by ear, not recovered: this edge stands in for retail's master/Dac
-// output stage, which is not ported (see `docs/player-audio-retail-drivers.md`). The owner's
-// playtests put the authored path (takeoffs, landings, rolling) at the right level with 4.0 and
-// audibly too quiet at unity, so 4.0 stays until that stage is ported.
+// output stage, which is not ported (see `docs/player-audio-retail-drivers.md` section 7). The
+// owner's playtests found 4.0 right for the authored path and unity audibly too quiet.
 //
-// The mix arrives here at about -20 dBFS peak rolling and -13 dBFS on a landing, so 4.0 leaves ~1 dB
-// of headroom on a landing. Anything new on this path must sit inside that: the Splice contact
-// one-shots currently peak near -3 dBFS on their own and clip here, which is why they are gated off
-// (`SKATE_AUDIO_CONTACT_VOICES`) until their gain chain is corrected.
-const OUTPUT_GAIN: f32 = 4.0;
+// 4.0 cannot stay, though: the authored landing alone arrives near -13 dBFS, so 4.0 left under 1 dB
+// of headroom and the Splice landing impact on top of it clipped. Measured over a landing, with the
+// impact included: 4.0 clips, 2.5 peaks at -1.2 dBFS, 2.0 at -3.2 dBFS. 2.5 keeps the impact and
+// costs about 4 dB against the level the owner approved.
+//
+// Raising it again means porting that master stage (and recovering the Splice graph's own levels,
+// `oneshot::CONTACT_TRIM`), not growing this constant until something clips.
+const OUTPUT_GAIN: f32 = 2.5;
 
 #[derive(Resource)]
 struct PlayerAudioHost {
