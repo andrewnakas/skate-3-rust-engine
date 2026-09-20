@@ -282,6 +282,44 @@ in 0.2 s and writes nothing, at any log level. Either fix that subcommand, add a
 calls the SDK's `XexModule` loader and writes the image out, or read the words from the running
 recomp's memory.
 
+### The sink is no longer blocked: the image dumps, and the chain resolves (2026-09-20, later)
+
+`rexglue.exe dump-xex` is **not** a stub after all. Its own `_putenv_s` does not reach the loader,
+but the loader reads `REXGLUE_DUMP_XEX_IMAGE_DIR` from the environment, so setting that variable
+*externally* dumps the decrypted image:
+
+```
+cd C:\dev\skate3recomp\outuild\windows-release\game
+REXGLUE_DUMP_XEX_IMAGE_DIR=<out> rexglue.exe dump-xex default.xex <out>
+```
+
+That writes `default_82000000_011B0000.bin` (18,546,688 bytes, base `0x82000000`), i.e. `.data`
+and `.rdata` included. File offset = address − `0x82000000`.
+
+With it, the three reads are done:
+
+1. **Slot 3 is the FIRST descriptor**, `0x8302CD1C`: id 3, name pointer `0x82247544`, create fn
+   `sub_824F16D0`. (An earlier inferred bijection guessed reg pos 4 — it was wrong. Read the ids,
+   do not derive them.) Full table, descriptor → id: CD1C→3, CD80→10, CD8C→2, CD98→0, CDA4→1,
+   CDB0→4, CDBC→5, CDC8→6, CDD4→7, CDE0→8, CDEC→9, CDF8→11, CE04→12, CE10→13.
+2. **The class is `CSTATEMGR_Collision`** (the name string at `0x82247544`).
+3. **Its vtable is `0x822FD4FC`**, read from the create function itself
+   (`lis r9,-32208; addi r8,r9,-11012; stw r8,0(r3)` = `0x82300000 − 0x2B04`) rather than from an
+   inherited table, which had it 0x10000 too high. Slots: +0 `824F1B70`, +4 `828DE848`,
+   +8 `824F17B8`, **+12 `824F1818`**, +16 `828DEE58`, +20 `828DEED8`, +24 `828DEF38`,
+   +28 `824F16B0`, +32 `824F16C0`, +36 `824F88A8`.
+
+**`sub_824F1818` (hop 1) is a voice-slot router, not the voice starter.** It walks the linked list
+at `[this+16]` through `[node+4]`, keeps the node with the lowest signed `[node+64]` (a priority or
+age), calls `[node->vtable+28](node)` on the winner and returns it. `sub_82486EF0` then delivers
+the 48-byte message to *that node's* `vtable[+12]` — hop 2, which is where the material pair and
+the two levels finally choose a sound.
+
+**Next step, and it is now ordinary work rather than a dead end:** find what populates
+`[manager+16]`, take a node's vtable out of the dumped image the same way, and read its `+12`.
+Everything upstream is pinned, and `sub_824F16D0` shows the object is 28 bytes with `+12`, `+16`,
+`+20` zeroed, `+4`/`+8` set to the `0x82165A10` float (0.0) and `+24` a zeroed byte.
+
 **One confirmed, independent port gap while you are in there.** `ContactLatches::grind_gate_124` is
 read at `contacts.rs:667` but **never written anywhere in the tree**. Retail writes it at
 `sub_824BB0E0`'s tail from the constant at `0x8209975C` — verified directly in the lifted asm
