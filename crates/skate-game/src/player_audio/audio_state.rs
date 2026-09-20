@@ -1834,4 +1834,46 @@ mod tests {
         state.update(&inputs, &tuning);
         assert_eq!(state.body_impact_496, [0.0; 8]);
     }
+
+    /// The retail air words the Treatment packet streams: within one hop +236 rises by the fixed
+    /// step and +236 + +240 (the predicted total air time) stays put, +260 holds the jump height,
+    /// and +240 is never the PhysicsAir constant 4.0. This is the behaviour the engine-side
+    /// `air_timing` publication reproduces for ordinary airs.
+    #[test]
+    fn capture_air_words_hold_a_constant_total_and_a_plateau() {
+        let Some(path) = capture_path() else {
+            return;
+        };
+        let rows = load_capture_states(&path).unwrap();
+        let mut air_rows = 0;
+        let mut rising = 0;
+        let mut sum_changed = 0;
+        let mut height_dropped = 0;
+        for pair in rows.windows(2) {
+            let (previous, current) = (&pair[0].1, &pair[1].1);
+            if !current.in_known_air_332 {
+                continue;
+            }
+            air_rows += 1;
+            assert_ne!(current.air_until_landing_240, 4.0);
+            let step = current.air_time_236 - previous.air_time_236;
+            if !previous.in_known_air_332 || !(step > 0.0 && step <= 0.04) {
+                continue;
+            }
+            rising += 1;
+            let total = current.air_time_236 + current.air_until_landing_240;
+            let previous_total = previous.air_time_236 + previous.air_until_landing_240;
+            if (total - previous_total).abs() > 1e-4 {
+                sum_changed += 1;
+            }
+            if current.air_jump_height_260 < previous.air_jump_height_260 - 1e-6 {
+                height_dropped += 1;
+            }
+        }
+        assert!(air_rows > 1000, "{air_rows}");
+        assert!(rising > 1000, "{rising}");
+        // Both only move when the predictor re-plans inside a hop.
+        assert!(sum_changed * 50 < rising, "{sum_changed} of {rising}");
+        assert!(height_dropped * 50 < rising, "{height_dropped} of {rising}");
+    }
 }

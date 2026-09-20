@@ -46,6 +46,9 @@ const OUTPUT_GAIN: f32 = 4.0;
 #[derive(Resource)]
 struct PlayerAudioHost {
     input: SyncSender<PlayerAudioObservation>,
+    /// The last forwarded observation, repeated while paused (see [`forward`]).
+    last_observation: Option<PlayerAudioObservation>,
+    paused_carry: f32,
     status: Mutex<Receiver<WorkerStatus>>,
     live: LivePcm,
     last_report: Instant,
@@ -102,6 +105,8 @@ fn start(
         .ok();
     commands.insert_resource(PlayerAudioHost {
         input,
+        last_observation: None,
+        paused_carry: 0.0,
         status: Mutex::new(status),
         live,
         last_report: Instant::now(),
@@ -112,11 +117,31 @@ fn start(
 fn forward(
     mut host: Option<ResMut<PlayerAudioHost>>,
     mut observations: MessageReader<PlayerAudioObservation>,
+    virtual_time: Res<Time<bevy::time::Virtual>>,
+    real_time: Res<Time<bevy::time::Real>>,
 ) {
     let Some(host) = host.as_deref_mut() else {
         return;
     };
+    // Retail keeps publishing an audio state every frame while the game is paused — its physics
+    // values simply stay frozen — and silences the player path through SFXObj_Pause's input. The
+    // simulation schedule does not run while `Time<Virtual>` is paused, so repeat the last
+    // observation at the simulation rate with `paused` set, which is what retail's frozen state is.
+    if virtual_time.is_paused() {
+        if let Some(last) = host.last_observation.clone() {
+            host.paused_carry += real_time.delta_secs();
+            while host.paused_carry >= sound::FRAME_SECONDS {
+                host.paused_carry -= sound::FRAME_SECONDS;
+                let mut frozen = last.clone();
+                frozen.retail.paused = true;
+                let _ = host.input.try_send(frozen);
+            }
+        }
+        return;
+    }
+    host.paused_carry = 0.0;
     for observation in observations.read() {
+        host.last_observation = Some(observation.clone());
         match host.input.try_send(observation.clone()) {
             Ok(()) => {}
             Err(TrySendError::Full(lost)) => {

@@ -158,6 +158,72 @@ fn body_contacts(
     contacts
 }
 
+/// What each airborne state owns for Air+176 / Air+184.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct AirTimingInputs {
+    /// State+16.
+    state: u32,
+    /// Air+176 and Air+184 as the PhysOut record carries them.
+    published_176: f32,
+    published_184: f32,
+    /// PhysicsAir+160, its own time in state.
+    physics_air_elapsed: f32,
+    /// The trajectory selector's current prediction time (`QueryResult+48`), `None` when there is
+    /// no selection and negative when that trajectory hits nothing.
+    predicted_contact_time: Option<f32>,
+    /// BipedAir+448 / +444.
+    biped_duration: f32,
+    biped_remaining: f32,
+}
+
+/// Air+176 (time in the air state) and Air+184 (time until the predicted landing) for the state
+/// the skater is actually in.
+///
+/// Only KnownAir Fill `sub_82D36880` writes both natively: +176 = KnownAir+180, its own timer,
+/// and +184 = KnownAir+196 (the selected prediction's collision time, `QueryResult+48`) minus
+/// that timer. `PhysState_PhysicsAir::FillPhysOut` `sub_82D34E90` writes +184 = 4.0 while the
+/// selector latch (PhysicsAir+174) is set and never writes +176, and the BipedAir fill
+/// `sub_82D30808` writes neither. Retail reaches KnownAir whenever a trajectory is valid, but the
+/// engine publishes that flag (Processed2468 bit 10) only briefly, so ordinary ollies run in
+/// PhysicsAir: the audio state then saw +236 = 0 and +240 = 4.0 and the Treatment packet's air
+/// words stopped moving. Each branch below reads the same quantity from the native fields of the
+/// state that owns it.
+/// **TEMPORARY, SOUND ONLY — for downstream developers.** Audio state `+260` is Air+200, the hop's
+/// jump height (`max_y − start_y`, written by both air Fills). Retail plateaus at 1.1–2.2 m on an
+/// ollie; this engine's physics produces 0.10–0.13 m, so the Treatment patch's word 9
+/// (`height × 166.667`, clamped to 1000) never leaves the bottom of its range and landings sound
+/// weaker than retail. Scaling the value the audio worker sees by 10 puts it in retail's range
+/// until the physics pop height is fixed.
+///
+/// This multiplies ONLY the copy handed to audio: the native record keeps its own value, because
+/// animation (`remaining_air_time`, `time_to_land`) and the slow-motion camera read those fields.
+/// **Remove this once the physics ollie height matches retail** — see
+/// `docs/player-audio-retail-drivers.md` §7.
+const TEMPORARY_JUMP_HEIGHT_SCALE: f32 = 10.0;
+
+fn air_timing(inputs: AirTimingInputs) -> (f32, f32) {
+    match inputs.state {
+        201 => (inputs.published_176, inputs.published_184),
+        // PhysicsAir+160 is the state timer; PhysicsAir keeps no landing time, so the KnownAir
+        // formula runs over the trajectory selector's current prediction. A trajectory that hits
+        // nothing leaves `contact_time` negative, where the state's own +184 write stands.
+        200 | 202 => {
+            let elapsed = inputs.physics_air_elapsed;
+            let remaining = inputs
+                .predicted_contact_time
+                .filter(|time| *time >= 0.0)
+                .map_or(inputs.published_184, |time| time - elapsed);
+            (elapsed, remaining)
+        }
+        // BipedAir+448 is the sampled trajectory's duration and +444 its remaining time.
+        501 => (
+            inputs.biped_duration - inputs.biped_remaining,
+            inputs.biped_remaining,
+        ),
+        _ => (inputs.published_176, inputs.published_184),
+    }
+}
+
 /// The native PhysOut fields `sub_827A1B78` packs for the audio-state bridge `sub_824B0DA8`
 /// and the PhysOut audio conditioner `sub_82772748`, read from the engine's published native
 /// records.
@@ -174,6 +240,19 @@ fn retail_inputs(
     let deck = physics.board.part_transforms()[BodyId::Deck.index()];
     let feet = &skater.foot_physical.output;
     let skeleton = &skater.skeleton;
+    let air_time = air_timing(AirTimingInputs {
+        state: physical.state.state_16,
+        published_176: physical.air.time_in_state_176,
+        published_184: physical.air.scalar_184,
+        physics_air_elapsed: skater.air_state.time_in_state,
+        predicted_contact_time: skater
+            .trajectory
+            .selector
+            .selection()
+            .map(|selection| selection.prediction.result.contact_time),
+        biped_duration: skater.biped_air.state.duration_448,
+        biped_remaining: skater.biped_air.state.time_remaining_444,
+    });
     let score = &skater.animation.motion.score_packet;
     let trick = score
         .trick_names
@@ -186,9 +265,9 @@ fn retail_inputs(
         com_velocity: raw_vector(physical.reckoning.vector_16),
         position: raw_vector(physical.reckoning.vector_64),
         wheel_count: physical.collision.wheel_count_0 & 7,
-        air_time_in_state: physical.air.time_in_state_176,
-        air_time_until_landing: physical.air.scalar_184,
-        air_jump_height: physical.air.jump_height_200,
+        air_time_in_state: air_time.0,
+        air_time_until_landing: air_time.1,
+        air_jump_height: physical.air.jump_height_200 * TEMPORARY_JUMP_HEIGHT_SCALE,
         state_flags: skater.player_state.state_flags,
         offboard_feet: physical.off_board.flags_306_307.map(|flag| flag != 0),
         footplant: [
@@ -256,6 +335,9 @@ fn retail_inputs(
         deck_position: lanes(bodies[BodyId::Deck.index()].rates.position),
         deck_forward: riding.motion.effective_basis.columns[2],
         combo_multiplier: skater.scoring.session.combo.multiplier,
+        // The simulation does not run while paused, so the worker's own forwarder repeats the
+        // last observation with this set (see `player_audio::forward`).
+        paused: false,
         ground_normal: triple(physical.ground.vector_80),
         turn: skater.animation_input.fields.turn,
         jump_strength: skater.animation_input.extra.jump_strength,
@@ -482,5 +564,44 @@ mod tests {
         assert_eq!(speeds[1], 0.0);
         assert!((speeds[2] - 4.0).abs() < 1e-5);
         assert_eq!(speeds[3], 0.0);
+    }
+
+    #[test]
+    fn air_timing_uses_the_owning_state_and_leaves_known_air_alone() {
+        let inputs = AirTimingInputs {
+            published_176: 0.25,
+            published_184: 4.0,
+            physics_air_elapsed: 0.5,
+            biped_duration: 0.8,
+            biped_remaining: 0.3,
+            ..Default::default()
+        };
+        // KnownAir keeps the pair it published itself.
+        assert_eq!(air_timing(AirTimingInputs { state: 201, ..inputs }), (0.25, 4.0));
+        // PhysicsAir with no prediction: only the timer changes.
+        assert_eq!(air_timing(AirTimingInputs { state: 200, ..inputs }), (0.5, 4.0));
+        // A landing predicted 1.1 s after launch leaves 0.6 s from 0.5 s in.
+        let (elapsed, remaining) = air_timing(AirTimingInputs {
+            state: 202,
+            predicted_contact_time: Some(1.1),
+            ..inputs
+        });
+        assert_eq!(elapsed, 0.5);
+        assert!((remaining - 0.6).abs() < 1e-6, "{remaining}");
+        // A trajectory that hits nothing keeps the state's own +184.
+        assert_eq!(
+            air_timing(AirTimingInputs {
+                state: 200,
+                predicted_contact_time: Some(-1.0),
+                ..inputs
+            }),
+            (0.5, 4.0)
+        );
+        // BipedAir splits its own duration and remaining time; the sum stays the duration.
+        let (elapsed, remaining) = air_timing(AirTimingInputs { state: 501, ..inputs });
+        assert!((elapsed - 0.5).abs() < 1e-6 && remaining == 0.3);
+        assert!((elapsed + remaining - 0.8).abs() < 1e-6);
+        // On the ground the published pair stands.
+        assert_eq!(air_timing(AirTimingInputs { state: 100, ..inputs }), (0.25, 4.0));
     }
 }

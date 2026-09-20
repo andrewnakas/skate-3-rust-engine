@@ -60,6 +60,7 @@ pub(crate) struct PlayerSound {
     jitter: inputs::Jitter,
     music: inputs::MusicEmphasis,
     music_controller: u32,
+    pause_controller: u32,
     listener: inputs::Listener,
     positions: [(u32, inputs::ObjPos); 2],
     entries: Vec<Entry>,
@@ -106,6 +107,7 @@ impl PlayerSound {
             jitter: inputs::Jitter::retail(),
             music: inputs::MusicEmphasis::default(),
             music_controller: controller(runtime, 0x4000_0010, "Music")?,
+            pause_controller: controller(runtime, 0x4000_0070, "Pause")?,
             listener: inputs::Listener::default(),
             positions: [
                 (
@@ -256,6 +258,14 @@ impl PlayerSound {
         self.audio.multiplier_flags_2f0d0 = flags;
         let music = self.music.process(flags, false, FRAME_SECONDS);
         set(runtime, self.music_controller, &music)?;
+        // SFXObj_Pause (`sub_824E1D00`, a slot-9 process): retail keeps the bridge, the components
+        // and the voices running while paused and ducks every player level through input 0 (it
+        // reaches silence in ~175 ms and recovers in ~88 ms). Written every frame, paused or not.
+        set(
+            runtime,
+            self.pause_controller,
+            &inputs::pause_inputs(observation.retail.paused),
+        )?;
         // Jitter (`sub_824EF378`): 24 random-walk channels drawn from the shared retail generator.
         runtime
             .mixmap_jitter_tick(&mut self.jitter)

@@ -236,6 +236,9 @@ pub struct RetailAudioInputs {
     /// The score module's combo multiplier (`sub_82DA4238` stores it at the score output +56;
     /// `sub_827A2E88` turns it into the frame record's x1.5/x2/x3 tier flags).
     pub combo_multiplier: f32,
+    /// Gameplay is paused (the pause menu). Retail keeps the bridge, the components and the voices
+    /// running and ducks the mix through SFXObj_Pause (`sub_824E1D00`) input 0 instead.
+    pub paused: bool,
     /// Ground+80: the wheel-contact normal (`ground.vector_80`).
     pub ground_normal: [f32; 3],
     /// Ground+264 = Processed+2676, the turn attribute.
@@ -299,6 +302,7 @@ impl Default for RetailAudioInputs {
             deck_position: [0.0; 3],
             deck_forward: [0.0; 3],
             combo_multiplier: 1.0,
+            paused: false,
             dt: 0.0,
             ground_speed: 0.0,
             com_velocity: [0.0; 3],

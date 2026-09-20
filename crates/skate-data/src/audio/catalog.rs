@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use skate_audio_core::pcm::{CachedPcm, PcmSource};
 use skate_audio_core::{Guest, Segment};
-use skate_audio_formats::{banks, eaac, eb};
+use skate_audio_formats::{banks, eaac, eb, splc};
 
 use super::{Error, describe};
 
@@ -35,6 +35,13 @@ pub const PLAYER_BANKS: &[&str] = &[
     "FOOT_DRAG.abk",
     "sense_of_speed.abk",
 ];
+
+/// The `SPLC` sound banks the one-shot ("Splice") voices play from: wheel pops and the landing
+/// impact (`sub_824B9CC8`, `sub_824BA630`) name `Skate_Collisions` samples through the vault.
+/// `DLC_Cartoon_Collisions.bnk` is the pops' DLC variant and is absent from a base installation,
+/// so it is loaded only when the archive holds it.
+pub const SPLICE_BANKS: &[&str] = &["Skate_Collisions.bnk"];
+pub const OPTIONAL_SPLICE_BANKS: &[&str] = &["DLC_Cartoon_Collisions.bnk"];
 
 /// Where the installer stages the MixMap under `assets`.
 pub const MIXMAP_PATH: &str = "private/stock/data/audio/MixMapSK8.mxb";
@@ -78,6 +85,83 @@ impl PlayerAudioCatalog {
     /// Decode all rider/board samples, or load a cache whose source bytes match exactly.
     pub fn load(archive: &Path, image: &Path, cache: Option<&Path>) -> Result<Self, Error> {
         Self::load_banks(archive, image, cache, PLAYER_BANKS)
+    }
+
+    /// The `SPLC` sound banks of [`SPLICE_BANKS`], with every sample in their tables decoded. The
+    /// samples land in [`Self::samples`] addressed by their EAAC header offset, exactly as the
+    /// patch banks' are, so `AuthoredRuntime::insert_pcm(bank_base + header_offset, ..)` serves
+    /// both.
+    pub fn load_splice_banks(&mut self, archive: &Path, cache: Option<&Path>) -> Result<(), Error> {
+        let data = std::fs::read(archive).map_err(|e| io_error(archive, e))?;
+        let parsed = eb::Archive::parse(&data)?;
+        let wanted: Vec<(&str, bool)> = SPLICE_BANKS
+            .iter()
+            .map(|n| (*n, true))
+            .chain(OPTIONAL_SPLICE_BANKS.iter().map(|n| (*n, false)))
+            .collect();
+        for (name, required) in wanted {
+            let member = parsed.entries.iter().find(|e| {
+                e.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            });
+            let member = match (member, required) {
+                (Some(member), _) => member,
+                (None, false) => continue,
+                (None, true) => return Err(Error::Format(format!("missing sound bank {name}"))),
+            };
+            if member.is_compressed() {
+                return Err(Error::Format(format!("compressed sound bank {name}")));
+            }
+            let bytes = member_bytes(&data, member)?;
+            let bank = splc::Splc::parse(bytes)?;
+            let ranges: Vec<std::ops::Range<usize>> = (0..bank.samples.len())
+                .map(|index| {
+                    let start = bank.streams_offset + bank.samples[index].offset as usize;
+                    let end = bank.streams_offset + bank.samples[index].end as usize;
+                    start..end.max(start)
+                })
+                .collect();
+            let path = cache
+                .map(|root| root.join(format!("{name}.{:016x}.v3.pcm", fingerprint(bytes))));
+            let cached = path
+                .as_deref()
+                .and_then(|path| read_cache_ranges(path, bytes, &ranges));
+            let decoded = match cached {
+                Some(decoded) => {
+                    self.cache_hits += decoded.len();
+                    decoded
+                }
+                None => {
+                    let decoded = decode_ranges(name, bytes, &ranges)?;
+                    if let Some(path) = path.as_deref() {
+                        let _ = write_cache(path, bytes, &decoded);
+                    }
+                    decoded
+                }
+            };
+            for (index, (offset, header, samples)) in decoded.into_iter().enumerate() {
+                let mut source = PcmSource::new(Arc::from(samples), header.channels())
+                    .map_err(|e| Error::Format(e.to_string()))?;
+                if let Some(start) = header.loop_start {
+                    source = source
+                        .with_loop(start as usize, header.num_samples as usize)
+                        .map_err(|e| Error::Format(format!("{name}#{index}: {e}")))?;
+                }
+                self.samples.push(BankPcm {
+                    bank: name.into(),
+                    index,
+                    header_offset: offset,
+                    header,
+                    pcm: CachedPcm {
+                        source,
+                        sample_rate: header.sample_rate,
+                    },
+                });
+            }
+            self.banks.push((name.into(), bytes.to_vec()));
+        }
+        Ok(())
     }
 
     /// An explicit bank subset for fixture replay; normal gameplay loads the full catalog.
@@ -244,11 +328,24 @@ pub fn load_guest_image(directory: &Path) -> Result<Guest, Error> {
 type Decoded = Vec<(u32, eaac::Header, Vec<i16>)>;
 
 fn decode_bank(name: &str, bytes: &[u8], bank: &banks::Abk) -> Result<Decoded, Error> {
-    let mut decoded = Vec::with_capacity(bank.present());
-    for index in 0..bank.present() {
-        let range = bank
-            .sample_range(index)
-            .ok_or_else(|| Error::Format(format!("{name}#{index}: absent sample")))?;
+    let ranges = (0..bank.present())
+        .map(|index| {
+            bank.sample_range(index)
+                .ok_or_else(|| Error::Format(format!("{name}#{index}: absent sample")))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    decode_ranges(name, bytes, &ranges)
+}
+
+/// Decode the EAAC stream in each range, as the resident-sample path needs it.
+fn decode_ranges(
+    name: &str,
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+) -> Result<Decoded, Error> {
+    let mut decoded = Vec::with_capacity(ranges.len());
+    for (index, range) in ranges.iter().enumerate() {
+        let range = range.clone();
         let data = bytes
             .get(range.clone())
             .ok_or_else(|| Error::Format(format!("{name}#{index}: sample outside bank")))?;
@@ -303,6 +400,28 @@ fn read_cache(path: &Path, bank: &[u8], parsed: &banks::Abk) -> Option<Decoded> 
     let mut decoded = Vec::with_capacity(parsed.present());
     for index in 0..parsed.present() {
         let range = parsed.sample_range(index)?;
+        let header = eaac::Header::parse(bank.get(range.clone())?, 0).ok()?;
+        let length = header.num_samples as usize * usize::from(header.channels()) * 2;
+        let pcm = bytes
+            .get(cursor..cursor.checked_add(length)?)?
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        decoded.push((range.start as u32, header, pcm));
+        cursor += length;
+    }
+    (cursor == bytes.len()).then_some(decoded)
+}
+
+/// [`read_cache`] for a bank whose samples are addressed by explicit ranges (`SPLC`).
+fn read_cache_ranges(path: &Path, bank: &[u8], ranges: &[std::ops::Range<usize>]) -> Option<Decoded> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.get(..8)? != CACHE_MAGIC || bytes.get(8..8 + bank.len())? != bank {
+        return None;
+    }
+    let mut cursor = 8 + bank.len();
+    let mut decoded = Vec::with_capacity(ranges.len());
+    for range in ranges {
         let header = eaac::Header::parse(bank.get(range.clone())?, 0).ok()?;
         let length = header.num_samples as usize * usize::from(header.channels()) * 2;
         let pcm = bytes

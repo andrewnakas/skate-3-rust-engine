@@ -410,6 +410,7 @@ pub mod ambience;
 pub mod catalog;
 pub mod ffmpeg;
 pub mod grains;
+pub mod splice;
 
 #[cfg(test)]
 mod tests;

@@ -15,6 +15,7 @@
 //! | `40010090` OffBoard | `sub_824E9270` (id 0) | [`off_board_input`] |
 //! | `400100A0` HandGrabs | `sub_824EC3E0` (id 0) | [`hand_grabs_input`] |
 //! | `40010000` SkateBoard | `sub_824C5CA8` (0, 6), `sub_824C6198` (4), `sub_824CA738` (2, 3), `sub_824C7438` (1) | ported in `skate-game`'s `components/board.rs`, not here |
+//! | `40000070` Pause | `sub_824E1D00` (ids 0, 1, 2) | [`pause_inputs`], [`Pause`] |
 //! | `40000010` Music ids 3, 6 | `sub_824D1208` over the frame record's multiplier bits (`sub_827A2E88`) | [`multiplier_flags`], [`MusicEmphasis`] |
 //! | globals | see [`FREE_SKATE_GLOBALS`] | values only |
 //!
@@ -647,6 +648,98 @@ pub fn hand_grabs_input(grab_36: bool) -> (u32, u32) {
     (0, if grab_36 { 32767 } else { 0 })
 }
 
+// ---------------------------------------------------------------------- pause
+
+/// The game-side terms SFXObj_Pause's process `sub_824E1D00` tests. `sys` is `*(0x830CFDC4)`.
+///
+/// * `request`: the duck request (`r29`). Retail sets it when **all** of these hold:
+///   `*(0x830CFE24)` and the world `*(0x83083C38)` exist; `sub_824D4EE0(*(0x830CFE24), 1)` — the
+///   singleton's flag bit 0, i.e. `([obj+256] & [obj+260] & 1) != 0` under its `+4` lock;
+///   `sub_8279E180(world)` is false (the world has no active child through its `+112` vfunc 16);
+///   `[*(0x830CFDBC)]+104` is 0; `sys+468` is 0; and `sub_82487ED0()` is false (game-flow state
+///   `sys+1196` is not 7, and not 3-with-`[[sub_824AD240()+8]+56]+60 == 1`). The capture holds it
+///   for the whole pause-menu pause.
+/// * `mode_1064`: `sys+1064 == 1`, a field of the game-mode block `sys+1056…+1072` that
+///   `sub_8252E288` fills from a record (the same block holds the mode `sys+1060` the Treatment
+///   component's HOM companion and `sub_824898C8` test). It is 1 through free-skate play in the
+///   capture: the pause menu there raises id 0. It was not 1 during the capture's start-up, where
+///   the same request raised id 2 instead.
+/// * `state_6`: `sys+1196 == 6`, which never happens in the capture (id 1 is 0 throughout).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PauseFields {
+    pub request: bool,
+    pub mode_1064: bool,
+    pub state_6: bool,
+}
+
+/// SFXObj_Pause (`40000070`, factory row `0x8302D270`, constructor `sub_824E1B30`, vtable
+/// `0x822FC1B8`): only the process slot 9 (`sub_824E1D00`) does anything — slot 10 is the stub
+/// `0x82B61BB8`, so the class reads no outputs and posts no message.
+///
+/// The process takes no dt and has no slew: the fade is the MixMap's own. In the capture, the
+/// evaluation after id 0 goes to 32767 starts a 175 ms / 12-evaluation ramp that takes every
+/// player controller's level outputs to 0 (SkateBoard, Contacts, Wheels, Rail, Cracks, Tricks,
+/// Clothing, Treatments, SenseOfSpeed, OffBoard), and clearing it brings them back over 88 ms /
+/// 6 evaluations. Through the ported MixMap at a fixed 1/60, SkateBoard's id 21 reaches 0 11 ticks
+/// after id 0 is set; id 2 mutes in 2 ticks instead; id 1 changes no level output.
+///
+/// **Retail ducks and keeps running.** Through the capture's whole pause (evaluations 8895–12843)
+/// the bridge still publishes a state every evaluation, the audio state's time scale `+220` stays
+/// 1.0 and its `+224` byte stays 0 (both are 1.0 and 0 in all 18553 of the capture's states, so
+/// neither is how retail silences a pause), the state's physics values are frozen at their last
+/// pre-pause values (ground speed 5.390 throughout), and every component keeps posting its packet
+/// redelivery each evaluation (`Class_rolling` twice, `Class_wheels_skid`, `Class_Treatment`,
+/// `SenseOfSpeed_wind` once) with 3 posts and 4 releases in those 3949 evaluations. Nothing is
+/// skipped and no voice is stopped: the sound goes away only because of this controller.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pause {
+    /// `this+28`, the id-2 latch. The constructor sets it (`li r5,1 ; stb r5,28(r3)`).
+    pub armed_28: bool,
+}
+
+impl Default for Pause {
+    fn default() -> Self {
+        Self::retail()
+    }
+}
+
+impl Pause {
+    /// `sub_824E1B30`.
+    pub fn retail() -> Self {
+        Self { armed_28: true }
+    }
+
+    /// One process call: ids 0, 1, 2 in the order `sub_824E1D00` writes them.
+    ///
+    /// With `mode_1064` the request goes straight to id 0. Without it the first requesting frame
+    /// only clears the latch and the following ones hold id 2 (the capture's start-up path, and
+    /// its three 1–2 evaluation blips during play). Releasing the request re-arms the latch.
+    pub fn process(&mut self, fields: PauseFields) -> [(u32, u32); 3] {
+        let mut id0 = 0;
+        let mut id2 = 0;
+        if fields.request {
+            if fields.mode_1064 {
+                id0 = 32767;
+            } else if self.armed_28 {
+                self.armed_28 = false;
+            } else {
+                id2 = 32767;
+            }
+        } else {
+            self.armed_28 = true;
+        }
+        [(0, id0), (1, if fields.state_6 { 32767 } else { 0 }), (2, id2)]
+    }
+}
+
+/// The free-skate Pause inputs: `Pause::process` with retail's free-skate terms
+/// (`mode_1064` = true, `state_6` = false), which needs no state because that path never touches
+/// the id-2 latch. This is what the capture's pause menu writes — id 0 alone — and what an engine
+/// with a menu/pause state should write every frame, paused or not.
+pub fn pause_inputs(paused: bool) -> [(u32, u32); 3] {
+    Pause::retail().process(PauseFields { request: paused, mode_1064: true, state_6: false })
+}
+
 // ---------------------------------------------------------------------- the combo multiplier
 
 /// The multiplier tier bits of the audio frame record's flags word (`*(0x83083C38) + 0x2F0D0`,
@@ -775,7 +868,7 @@ impl MusicEmphasis {
 /// | `40000030` | CameraMan | none | — |
 /// | `40000050` | Reverb (`sub_824DF468`) | 4: 198/6/0 · 5: 12571/18/32767 · 6: 5776/12/0 | 5 = 32767 (mode); 4 and 6 follow the frame record's `+16` reverb key (`sub_824DE548`; set by `sub_827A2E88` from the world region lookup `sub_82C0EAC0` type 10 at the player's position) — not ported |
 /// | `40000060` | NIS (`sub_824E1230`) | 9: 579/6/0 | 0 (id 9 = `sub_82487ED0`: game-flow state `[0x830CFDC4]+1196` = 7, or 3 with a sub-state; not free skate) |
-/// | `40000070` | Pause (`sub_824E1D00`) | 0: 3949/2/0 (one pause) · 2: 4/6/0 | 0 |
+/// | `40000070` | Pause (`sub_824E1D00`) | 0: 3949/2/0 (one pause-menu pause) · 2: 4/6/0 (start-up and three 1–2 evaluation blips) | [`pause_inputs`] every frame |
 /// | `40000080` | Speech (`sub_824E2050`) | 1: 61/2/0 · 4: 372/10/0 | 0 |
 /// | `40000090` | Bloom | none | — |
 /// | `400000A0` | VU (`sub_824EDBE8`) | 0: 17476/9504/32767 | [`FREE_SKATE_MUSIC_VU`] |
@@ -787,8 +880,9 @@ impl MusicEmphasis {
 /// 6, Master 0–6 and 8, CameraMan 0, Reverb 0 and 4, NIS 0–2, 4, 5, 7–10, 13, Pause 0–2, Speech 1,
 /// Bloom 0, VU 0–1, Challenge 1, 4–9, 11, HOM 0, 2–4, Menu 8 and Jitter 0–3 — not Master 9/10 or
 /// Reverb 5/6. Of the ids that vary in the capture, Music 3/6, Reverb 4, VU 0, NIS 9, Pause 0 and
-/// Speech 1 reach them: NIS 9 and Pause 0 are menu/pause states; Reverb 4 (the world's reverb
-/// zone), VU 0 (the output meters) and Speech 1 (61 evaluations, writer not traced) are not ported.
+/// Speech 1 reach them: Music 3/6 ([`MusicEmphasis`]) and Pause 0 ([`pause_inputs`]) are ported;
+/// NIS 9 is a game-flow state; Reverb 4 (the world's reverb zone), VU 0 (the output meters) and
+/// Speech 1 (61 evaluations, writer not traced) are not.
 ///
 /// **Music on the player's path.** Music ids 3 and 6 are the combo multiplier, ported as
 /// [`MusicEmphasis`] (see [`multiplier_flags`]). Id 0 is music playback (the music player's

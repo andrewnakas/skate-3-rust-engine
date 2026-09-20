@@ -6,6 +6,7 @@
 //! File access and codec decoding never occur in this owner.
 
 mod mixmap_host;
+pub mod oneshot;
 
 use std::collections::HashMap;
 

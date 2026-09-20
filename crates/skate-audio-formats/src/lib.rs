@@ -13,6 +13,7 @@ pub mod grain;
 pub mod hash;
 pub mod mpf;
 pub mod mus;
+pub mod splc;
 
 /// A parse failure, with the byte offset it was detected at.
 #[derive(Clone, Debug, PartialEq, Eq)]

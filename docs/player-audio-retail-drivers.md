@@ -582,3 +582,31 @@ Corrections to §1: 615/616 = **Skeleton 600/601** (feet inside the deck box), n
 | 780 | builder | (676 or state 500) && deck contact && deck material < 94; d = deck up · wheel normal: d < [0x822F8994] → 1; [0x8207268C] < d < 0.1 → 2 | loose board | derivable once Coll+12 exists |
 | 718 | [B+64]+0 == 7 | — | OffboardAir | `physical.filtered_state_0 == 7` |
 | 309 / 320 | OffBoard 309 / 310 | Processed2480 bits 18 / 7 | — | processed flags |
+
+## 7. Open engine-side gaps that change how player audio sounds
+
+Recorded 2026-09-19 from playtests of the ported path. These are **physics/engine** gaps, not audio
+ports; audio only shows them up.
+
+1. **Ollie jump height is ~10x too small.** Audio state `+260` is Air+200 = `max_y − start_y`
+   (deck part Y minus Processed+500), written by KnownAir Fill `sub_82D36880` and
+   `sub_82D34E90`. The retail capture plateaus at **1.1–2.2 m** per hop; this engine produces
+   **0.10–0.13 m**. Treatment word 9 is `clamp(trunc(height × 166.667), 0, 1000)`, so retail's
+   landings sit high in that range and ours sit at 16–22.
+   **Temporary patch (sound only):** `crates/skate-game/src/physics/audio_observation.rs`
+   multiplies the value handed to audio by `TEMPORARY_JUMP_HEIGHT_SCALE` = 10. The native record is
+   untouched, because animation and the slow-motion camera read the same fields. **Remove the
+   scale when the physics pop height matches retail.**
+2. **The engine rarely enters KnownAir.** Retail is in KnownAir (state 201) for essentially every
+   hop; this engine selects it only while Processed2468 bit 10 (trajectory valid) is published, and
+   nothing publishes that bit except transiently, so ordinary ollies run in PhysicsAir (200/202).
+   PhysicsAir publishes nothing for Air+176 and a constant 4.0 for Air+184, which left the audio
+   state's `+236` at 0 — and with it every per-wheel landing bucket (`+244` → `+448`), i.e. no
+   landing impact at all. Audio now reads the owning state's own timer/prediction instead
+   (`audio_observation::air_timing`), but the physics-side fix (publish bit 10 so KnownAir runs)
+   is still worth doing.
+3. **Powerslide squeaks do not fire.** Retail's gate is both feet inside the deck box (`+615`/`+616`),
+   more than one wheel down, and `|deck tilt +264| × 114.5916 ≥ 15` (retail's slides sit at
+   0.14–0.28 rad). In a Rust playtest the squeak never posts, so one of those engine inputs does not
+   reach retail's values during PhysicsSlideGround (101). Use `SKATE_AUDIO_TRACE` and compare its
+   `AS` lines with the capture's `state.tsv`.

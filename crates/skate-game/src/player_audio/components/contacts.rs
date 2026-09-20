@@ -295,6 +295,429 @@ impl Component for FootDrag {
 }
 
 /// Retail recomp capture access for the tests (`.local/captures/extract`).
+
+// =====================================================================================
+// SFXObj_Contacts one-shot contact voices: pops, landing, grind onset.
+// =====================================================================================
+//
+// `sub_824B90D8` is not a separate object: the Contacts component process `sub_824B8218`
+// (slot 9, gated `[[this+16]+52]`) calls it in the middle of its chain, so the pops, landing
+// and grind-onset sounds live on the same object as [`FootDrag`]. Retail order inside
+// `sub_824B8218`: `sub_824B95A0` (deck-box timers), `sub_824B9948`, `sub_824BB330`,
+// `sub_824B86E0`, **`sub_824B90D8`** (this port), `sub_824BB540` (the foot-drag trigger,
+// [`FootDrag`]), `sub_824BBB28`, `sub_824BC188`, `sub_824BD000`, `sub_824BD358`,
+// `sub_824B85B0`, `sub_824BFA48`, `sub_824C01E8`, `sub_824C07D8`, `sub_824C0DA8`, the `+440`
+// countdown, `sub_824C0AB8`.
+//
+// These sounds are **not** authored messages. Each routine creates a generic `"Splice"` voice
+// container through the object factory `sub_828AAC28` (the same allocator as the authored
+// `sub_828AAE90`, plus flag bit 0x0100_0000) and drives a bank-sample voice with
+// `sub_82975700` / `sub_82975A60`, freeing it again with `sub_824836B8`. They therefore have
+// no message slot, no packet and no redelivery, and they appear nowhere in the retail capture
+// (no object in posts.tsv / releases.tsv / updates/, and vf.tsv only records the controller
+// reads 52/56/60). What can be checked against the capture is the *trigger frames*, which
+// [`ContactsOwner`] derives from state.tsv edges; that is what `contacts_owner_edges_match_the_capture`
+// does.
+//
+// The one-shot output itself is behind [`ContactVoices`]. The bank-voice side (the `"Splice"`
+// factory, `sub_82975700`/`sub_82975A60`, hold-and-free and the bank pick `sub_824B9AD8`) is
+// being ported separately in `skate-audio-core`; this file supplies every game-side input that
+// port needs and holds the voice handles exactly where retail holds them.
+//
+// Ported here (decoded from `sub_824B90D8`, `sub_824B9CC8`, `sub_824BA630`, `sub_824BB0E0`):
+// - the edges and gates that fire each sound, and the five owner latches;
+// - the pop strength selector ladder (+468 against two vault thresholds, forced to 0 on
+//   audio trick 33/34);
+// - the pop roll voice's speed-tiered bank sample (+208 against three vault speeds);
+// - the landing voice's vault bank sample and eEQChain, and its local-player gate;
+// - the grind-onset gate, material and family sample base;
+// - which slot holds which voice (`+60` pop, `+96` pop roll, `+56` landing) and when retail
+//   frees it.
+//
+// NOT ported (undecoded, and not observable in the capture) — these are labelled at each use:
+// - the bank pick `sub_824B9AD8` for the pop voice: retail turns the selector into a (bank,
+//   sample) pair. The selector is handed to [`ContactVoices`] instead.
+// - the pop voice gain: vtable slot 60 called with id 14, scaled by `[0x8220__+664]` and two
+//   further vault fields (`E34B48082B5BF185`, `C3C25A37D00712A8`).
+// - `sub_82975A60`'s spatialisation, and `sub_82489058`'s reset of the `+72` sub-object.
+// - the landing voices past the first (vault fields `85FDC8BF696BCA5C` = 95,
+//   `F262042EAA295711` = 860, `1E86469556ACD80A` = 862, thresholds 0.1/0.3/0.65/0.75/1.0).
+// - the grind-onset variant behind its second threshold (`B2ACAFDBCD963C93` = 0.5).
+// - the rolling/scrape contacts `sub_824BC188` and the eight further paths listed above.
+// - whatever frees the pop roll slot `+96`. `sub_824B9CC8` only ever starts that voice when the
+//   slot is empty and never clears it, so one of the unported paths in `sub_824B8218` must
+//   release it; until that is found the roll voice starts once and then stays held (the capture
+//   edge replay shows 1 roll against 28 pops for this reason).
+//
+// Controller inputs are **not** written here: `sub_824B90D8` resets ids 0/1/6 and the pop and
+// landing routines raise ids 0 and 1, all of which the MixMap `inputs::Contacts` port owns.
+
+/// Which retail routine asked for a voice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContactSound {
+    /// `sub_824B9CC8` first voice, held at `+60`.
+    Pop,
+    /// `sub_824B9CC8` second voice, held at `+96`.
+    PopRoll,
+    /// `sub_824BA630` first voice, held at `+56`.
+    Landing,
+    /// `sub_824BB0E0`.
+    GrindOnset,
+}
+
+/// Everything the game side resolves before the bank voice starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct VoiceRequest {
+    /// The vault bank-sample index, where the routine reads one directly.
+    pub sample: Option<u32>,
+    /// Retail pop strength 0/1/2, the input to the undecoded bank pick `sub_824B9AD8`.
+    pub selector: Option<i32>,
+    /// eEQChain from the vault (class `42AFE160E647167C`).
+    pub eq_chain: Option<u32>,
+    /// `sub_824BB0E0`: the grind material (+692, 143 → 10).
+    pub material: Option<u32>,
+    /// `sub_824BB0E0`: 95 for grind families 1/2/5, else 96.
+    pub family_base: Option<u32>,
+    /// `sub_824BB0E0`: 1 once the impact passes the first vault threshold.
+    pub tier: Option<i32>,
+}
+
+/// The one-shot bank-voice sink. Implemented by the `skate-audio-core` bank-voice port; the
+/// component holds whatever handle `play` returns exactly where retail holds it and hands it
+/// back to `free` when retail calls `sub_824836B8`.
+pub(crate) trait ContactVoices {
+    /// Start a one-shot voice. `None` when no voice could be started (retail keeps its slot 0).
+    fn play(&mut self, sound: ContactSound, request: &VoiceRequest) -> Option<u32>;
+    /// Retail `sub_824836B8`: free a voice this component still holds.
+    fn free(&mut self, handle: u32);
+}
+
+/// A sink that starts nothing, for hosts without the bank-voice path yet.
+// Constructed by the worker once `ContactsOwner` is registered.
+#[allow(dead_code)]
+pub(crate) struct NoContactVoices;
+
+impl ContactVoices for NoContactVoices {
+    fn play(&mut self, _sound: ContactSound, _request: &VoiceRequest) -> Option<u32> {
+        None
+    }
+    fn free(&mut self, _handle: u32) {}
+}
+
+/// Vault tuning. Every field is read through the audio tuning holder `*(0x830CFDA4)`:
+/// `+24` = class `C26949FCB638A2CA`/`default` (the class [`FootDragTuning`] already uses),
+/// `+40` = grind material class `049861E8F9A8D16B`/`default`, `+140` = eEQChain class
+/// `42AFE160E647167C`/`default`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ContactsTuning {
+    /// `F2A1E273ABB8E9AB` (0.42) and `D7758385CDB8DC26` (0.25): +468 → selector 2 / 1.
+    pub pop_hard: f32,
+    pub pop_medium: f32,
+    /// `E34B48082B5BF185` on the eEQChain class (0).
+    pub pop_eq_chain: u32,
+    /// `58523180E1AD61B4` (12), `A73073D3A33E35AE` (8), `FB71DF2C85928859` (4): the +208 tiers.
+    pub roll_speed_high: f32,
+    pub roll_speed_mid: f32,
+    pub roll_speed_low: f32,
+    /// `7A745D81E4BCABC3`, `537C97E4F64A0EE2`, `9C4CDCF0DD84C281`, `537C97E4F64A0EE2`: the bank
+    /// sample per tier. The stock vault sets all four to 1111, so which field belongs to which
+    /// tier is not observable with stock data; the order here is the order the routine reads them.
+    pub roll_sample_high: u32,
+    pub roll_sample_mid: u32,
+    pub roll_sample_low: u32,
+    pub roll_sample_idle: u32,
+    /// `633FA94E39C1AE8F` (1095) and `8B0E030799CBDD00` (1): the first landing voice.
+    pub landing_sample: u32,
+    pub landing_eq_chain: u32,
+    /// `086B66C3D4FFEE8F` (0.25) on the grind material class: the +228 impact gate.
+    pub grind_impact_threshold: f32,
+}
+
+impl ContactsTuning {
+    pub(crate) fn load(vault: &Collections) -> Result<Self, String> {
+        let f = |name: &str| vault.float(TUNING_CLASS, DEFAULT_KEY, name);
+        let i = |name: &str| vault_word(vault, TUNING_CLASS, DEFAULT_KEY, name);
+        Ok(Self {
+            pop_hard: f("Hash_F2A1E273ABB8E9AB")?,
+            pop_medium: f("Hash_D7758385CDB8DC26")?,
+            pop_eq_chain: vault_word(vault, EQ_CLASS, DEFAULT_KEY, "Hash_E34B48082B5BF185")?,
+            roll_speed_high: f("Hash_58523180E1AD61B4")?,
+            roll_speed_mid: f("Hash_A73073D3A33E35AE")?,
+            roll_speed_low: f("Hash_FB71DF2C85928859")?,
+            roll_sample_high: i("Hash_7A745D81E4BCABC3")?,
+            roll_sample_mid: i("Hash_537C97E4F64A0EE2")?,
+            roll_sample_low: i("Hash_9C4CDCF0DD84C281")?,
+            roll_sample_idle: i("Hash_537C97E4F64A0EE2")?,
+            landing_sample: i("Hash_633FA94E39C1AE8F")?,
+            landing_eq_chain: vault_word(vault, EQ_CLASS, DEFAULT_KEY, "Hash_8B0E030799CBDD00")?,
+            grind_impact_threshold: vault.float(
+                "Hash_049861E8F9A8D16B",
+                DEFAULT_KEY,
+                "Hash_086B66C3D4FFEE8F",
+            )?,
+        })
+    }
+}
+
+/// The audio-state fields `sub_824B90D8` and its three routines read.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ContactsInputs {
+    pub grind_family_192: u32,
+    pub ground_speed_208: f32,
+    pub grind_impact_228: f32,
+    pub air_time_236: f32,
+    pub in_known_air_332: bool,
+    pub grinding_341: bool,
+    pub trick_active_343: bool,
+    pub audio_trick_348: u32,
+    pub jump_velocity_468: f32,
+    pub bail_676: bool,
+    pub grind_material_692: u32,
+}
+
+impl ContactsInputs {
+    pub(crate) fn from_state(state: &AudioState) -> Self {
+        Self {
+            grind_family_192: state.grind_family_192,
+            ground_speed_208: state.ground_speed_208,
+            grind_impact_228: state.grind_impact_228,
+            air_time_236: state.air_time_236,
+            in_known_air_332: state.in_known_air_332,
+            grinding_341: state.grinding_341,
+            trick_active_343: state.trick_active_343,
+            audio_trick_348: state.audio_trick_348,
+            jump_velocity_468: state.jump_velocity_468,
+            bail_676: state.bail_676,
+            grind_material_692: state.grind_material_692,
+        }
+    }
+
+    /// The capture's 160 state words from +192.
+    #[cfg(test)]
+    pub(crate) fn from_capture(words: &[u32]) -> Self {
+        let word = |offset: usize| words[(offset - 192) / 4];
+        let float = |offset: usize| f32::from_bits(word(offset));
+        let byte = |offset: usize| (word(offset & !3) >> (8 * (3 - (offset & 3)))) & 0xFF != 0;
+        Self {
+            grind_family_192: word(192),
+            ground_speed_208: float(208),
+            grind_impact_228: float(228),
+            air_time_236: float(236),
+            in_known_air_332: byte(332),
+            grinding_341: byte(341),
+            trick_active_343: byte(343),
+            audio_trick_348: word(348),
+            jump_velocity_468: float(468),
+            bail_676: byte(676),
+            grind_material_692: word(692),
+        }
+    }
+}
+
+/// Audio trick ids that suppress the pop (`sub_824B90D8`: -1, 31, 32, 35, 36).
+const POP_BLOCKING_TRICKS: [i32; 5] = [-1, 31, 32, 35, 36];
+/// `sub_824B9CC8` skips the pop voice while `+424 < 2`. Since `sub_824BA630` zeroes `+424`, this
+/// also suppresses a pop on the frame straight after any landing.
+const POP_WARMUP_FRAMES: i32 = 2;
+/// `sub_824BB0E0`: no grind material (+692 = 143) falls back to 10.
+const GRIND_MATERIAL_FALLBACK: u32 = 10;
+/// `sub_824BB0E0`: grind families 1/2/5 use sample base 95, every other family 96.
+const GRIND_FAMILY_BASE_LOW: u32 = 95;
+const GRIND_FAMILY_BASE_HIGH: u32 = 96;
+
+/// The owner latches `sub_824B90D8` keeps across frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ContactLatches {
+    /// `+120`: previous frame's +332.
+    pub airborne_120: bool,
+    /// `+122`: previous frame's +341.
+    pub grinding_122: bool,
+    /// `+340`: +236 sampled while airborne.
+    pub air_time_340: f32,
+    /// `+344`: previous frame's +676.
+    pub bail_344: bool,
+    /// `+424`: processed-frame counter, incremented every process and reset by the landing.
+    pub frames_424: i32,
+    /// `+124`: the grind-onset gate. Written by a path that is not ported, so it stays 0 and
+    /// the grind onset is never suppressed here.
+    pub grind_gate_124: f32,
+    /// `+64`: the pop selector the routine stores beside its voice.
+    pub pop_selector_64: i32,
+}
+
+/// `sub_824B90D8` and the three voice routines it drives.
+pub(crate) struct ContactsOwner {
+    tuning: ContactsTuning,
+    /// `[this+28]+72`: the local skater. Only the local player gets the landing voice.
+    local: bool,
+    latches: ContactLatches,
+    /// `+60` pop, `+96` pop roll, `+56` landing.
+    held_pop_60: Option<u32>,
+    held_roll_96: Option<u32>,
+    held_landing_56: Option<u32>,
+    voices: Box<dyn ContactVoices>,
+}
+
+impl ContactsOwner {
+    // Called by the worker once `ContactsOwner` is registered on the Contacts controller.
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        vault: &Collections,
+        local: bool,
+        voices: Box<dyn ContactVoices>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            tuning: ContactsTuning::load(vault)?,
+            local,
+            latches: ContactLatches::default(),
+            held_pop_60: None,
+            held_roll_96: None,
+            held_landing_56: None,
+            voices,
+        })
+    }
+
+    pub(crate) fn latches(&self) -> ContactLatches {
+        self.latches
+    }
+
+    /// `sub_824B9CC8(this, audio_trick)`.
+    fn pops(&mut self, inputs: &ContactsInputs) {
+        let warm = self.latches.frames_424 < POP_WARMUP_FRAMES;
+        // Retail frees the held voice and clears +60..+76 (including `sub_82489058` on the +72
+        // sub-object, which is not ported) before deciding whether to start a new one.
+        if let Some(handle) = self.held_pop_60.take() {
+            self.voices.free(handle);
+        }
+        self.latches.pop_selector_64 = 0;
+        if !warm {
+            let mut selector = 0;
+            if inputs.jump_velocity_468 > self.tuning.pop_hard {
+                selector = 2;
+            } else if inputs.jump_velocity_468 > self.tuning.pop_medium {
+                selector = 1;
+            }
+            let trick = inputs.audio_trick_348 as i32;
+            if trick == 33 || trick == 34 {
+                selector = 0;
+            }
+            self.latches.pop_selector_64 = selector;
+            // The (bank, sample) pair comes from the undecoded `sub_824B9AD8`; the sink resolves
+            // it from the selector. The gain (vtable 60 id 14 × constant × vault) is not ported.
+            let request = VoiceRequest {
+                selector: Some(selector),
+                eq_chain: Some(self.tuning.pop_eq_chain),
+                ..VoiceRequest::default()
+            };
+            self.held_pop_60 = self.voices.play(ContactSound::Pop, &request);
+        }
+        if self.held_roll_96.is_none() {
+            let speed = inputs.ground_speed_208;
+            let sample = if speed > self.tuning.roll_speed_high {
+                self.tuning.roll_sample_high
+            } else if speed > self.tuning.roll_speed_mid {
+                self.tuning.roll_sample_mid
+            } else if speed > self.tuning.roll_speed_low {
+                self.tuning.roll_sample_low
+            } else {
+                self.tuning.roll_sample_idle
+            };
+            let request = VoiceRequest { sample: Some(sample), ..VoiceRequest::default() };
+            self.held_roll_96 = self.voices.play(ContactSound::PopRoll, &request);
+        }
+    }
+
+    /// `sub_824BA630`.
+    fn landing(&mut self, _inputs: &ContactsInputs) {
+        // Retail resets the frame counter and raises controller input 1 (the MixMap port owns
+        // the input) before its voices.
+        self.latches.frames_424 = 0;
+        if !self.local {
+            return;
+        }
+        if let Some(handle) = self.held_landing_56.take() {
+            self.voices.free(handle);
+        }
+        let request = VoiceRequest {
+            sample: Some(self.tuning.landing_sample),
+            eq_chain: Some(self.tuning.landing_eq_chain),
+            ..VoiceRequest::default()
+        };
+        self.held_landing_56 = self.voices.play(ContactSound::Landing, &request);
+    }
+
+    /// `sub_824BB0E0`.
+    fn grind_onset(&mut self, inputs: &ContactsInputs) {
+        if self.latches.grind_gate_124 > 0.0 {
+            return;
+        }
+        let material = if inputs.grind_material_692 == 143 {
+            GRIND_MATERIAL_FALLBACK
+        } else {
+            inputs.grind_material_692
+        };
+        let family_base = if matches!(inputs.grind_family_192, 1 | 2 | 5) {
+            GRIND_FAMILY_BASE_LOW
+        } else {
+            GRIND_FAMILY_BASE_HIGH
+        };
+        // Retail reads the 0.25 threshold, then a second 0.5 threshold whose variant is not
+        // decoded; only the first tier is ported.
+        let tier = i32::from(inputs.grind_impact_228 > self.tuning.grind_impact_threshold);
+        let request = VoiceRequest {
+            material: Some(material),
+            family_base: Some(family_base),
+            tier: Some(tier),
+            ..VoiceRequest::default()
+        };
+        // This routine does not hold its voice in a slot the process reads back.
+        let _ = self.voices.play(ContactSound::GrindOnset, &request);
+    }
+
+    /// `sub_824B90D8` without the controller-input resets.
+    pub(crate) fn step(&mut self, inputs: &ContactsInputs) {
+        self.latches.frames_424 = self.latches.frames_424.wrapping_add(1);
+        let was_airborne = self.latches.airborne_120;
+        let airborne = inputs.in_known_air_332;
+        let grinding = inputs.grinding_341;
+        if !was_airborne {
+            let trick = inputs.audio_trick_348 as i32;
+            if airborne
+                && inputs.trick_active_343
+                && !POP_BLOCKING_TRICKS.contains(&trick)
+                && !self.latches.grinding_122
+            {
+                self.pops(inputs);
+            }
+        } else if !airborne && !grinding {
+            self.landing(inputs);
+        }
+        if airborne {
+            self.latches.air_time_340 = inputs.air_time_236;
+        }
+        self.latches.bail_344 = inputs.bail_676;
+        self.latches.airborne_120 = airborne;
+        if grinding && !self.latches.grinding_122 {
+            self.grind_onset(inputs);
+        }
+        self.latches.grinding_122 = grinding;
+    }
+}
+
+impl Component for ContactsOwner {
+    fn process(&mut self, tick: &mut Tick) -> Result<(), String> {
+        let inputs = ContactsInputs::from_state(tick.audio);
+        self.step(&inputs);
+        Ok(())
+    }
+
+    /// `sub_824B90D8` runs entirely in the process chain; there is no `+40` work and no packet
+    /// to redeliver.
+    fn update(&mut self, _tick: &mut Tick) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod capture {
     use std::collections::{BTreeMap, HashMap};
@@ -625,5 +1048,353 @@ mod tests {
                 our_updates.iter().filter(|f| updates.contains_key(f)).count()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::capture;
+    use super::*;
+
+    /// Records what the retail routines asked the bank-voice sink for.
+    #[derive(Default)]
+    struct Recorder {
+        played: Vec<(ContactSound, VoiceRequest)>,
+        freed: Vec<u32>,
+        next: u32,
+    }
+
+    /// A sink shared with the test, since the component owns its sink.
+    #[derive(Clone, Default)]
+    struct SharedRecorder(std::rc::Rc<std::cell::RefCell<Recorder>>);
+
+    impl ContactVoices for SharedRecorder {
+        fn play(&mut self, sound: ContactSound, request: &VoiceRequest) -> Option<u32> {
+            let mut r = self.0.borrow_mut();
+            r.next += 1;
+            let handle = r.next;
+            r.played.push((sound, *request));
+            Some(handle)
+        }
+        fn free(&mut self, handle: u32) {
+            self.0.borrow_mut().freed.push(handle);
+        }
+    }
+
+    impl SharedRecorder {
+        fn sounds(&self) -> Vec<ContactSound> {
+            self.0.borrow().played.iter().map(|(s, _)| *s).collect()
+        }
+        fn take(&self) -> Vec<(ContactSound, VoiceRequest)> {
+            std::mem::take(&mut self.0.borrow_mut().played)
+        }
+        fn kinds(&self) -> Vec<ContactSound> {
+            self.take().iter().map(|(s, _)| *s).collect()
+        }
+        fn freed(&self) -> Vec<u32> {
+            self.0.borrow().freed.clone()
+        }
+    }
+
+    /// The stock vault values, so the unit tests need no assets;
+    /// `contacts_owner_tuning_reads_the_vault` checks them against the real vault.
+    fn tuning() -> ContactsTuning {
+        ContactsTuning {
+            pop_hard: f32::from_bits(0x3ED7_0A3D),
+            pop_medium: f32::from_bits(0x3E80_0000),
+            pop_eq_chain: 0,
+            roll_speed_high: 12.0,
+            roll_speed_mid: 8.0,
+            roll_speed_low: 4.0,
+            roll_sample_high: 1111,
+            roll_sample_mid: 1111,
+            roll_sample_low: 1111,
+            roll_sample_idle: 1111,
+            landing_sample: 1095,
+            landing_eq_chain: 1,
+            grind_impact_threshold: 0.25,
+        }
+    }
+
+    fn owner(local: bool) -> (ContactsOwner, SharedRecorder) {
+        let sink = SharedRecorder::default();
+        let owner = ContactsOwner {
+            tuning: tuning(),
+            local,
+            latches: ContactLatches::default(),
+            held_pop_60: None,
+            held_roll_96: None,
+            held_landing_56: None,
+            voices: Box::new(sink.clone()),
+        };
+        (owner, sink)
+    }
+
+    /// Airborne with a trick active and a pop-permitting trick id.
+    fn air(trick: u32) -> ContactsInputs {
+        ContactsInputs {
+            in_known_air_332: true,
+            trick_active_343: true,
+            audio_trick_348: trick,
+            ..ContactsInputs::default()
+        }
+    }
+
+    #[test]
+    fn pop_needs_the_airborne_rising_edge_the_trick_flag_and_a_permitted_trick() {
+        // Warm-up: the first processed frame has +424 == 1, so the pop voice is skipped while
+        // the roll voice still starts.
+        let (mut o, sink) = owner(true);
+        o.step(&air(5));
+        assert_eq!(sink.sounds(), vec![ContactSound::PopRoll]);
+
+        // A proper edge on a later frame plays both.
+        let (mut o, sink) = owner(true);
+        o.step(&ContactsInputs::default());
+        o.step(&air(5));
+        assert_eq!(sink.kinds(), vec![ContactSound::Pop, ContactSound::PopRoll]);
+        // Still airborne: no new edge.
+        o.step(&air(5));
+        assert!(sink.take().is_empty());
+
+        // Blocked trick ids fire nothing at all.
+        for trick in [31u32, 32, 35, 36, u32::MAX] {
+            let (mut o, sink) = owner(true);
+            o.step(&ContactsInputs::default());
+            o.step(&air(trick));
+            assert!(sink.take().is_empty(), "trick {trick} should block the pop");
+        }
+
+        // +343 clear blocks it too.
+        let (mut o, sink) = owner(true);
+        o.step(&ContactsInputs::default());
+        o.step(&ContactsInputs { trick_active_343: false, ..air(5) });
+        assert!(sink.take().is_empty());
+
+        // Previously grinding blocks it (latch +122).
+        let (mut o, sink) = owner(true);
+        o.step(&ContactsInputs { grinding_341: true, ..ContactsInputs::default() });
+        sink.take();
+        o.step(&air(5));
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn pop_selector_walks_the_jump_velocity_thresholds() {
+        for (velocity, expected) in [(0.0f32, 0), (0.3, 1), (0.5, 2)] {
+            let (mut o, sink) = owner(true);
+            o.step(&ContactsInputs::default());
+            o.step(&ContactsInputs { jump_velocity_468: velocity, ..air(5) });
+            let played = sink.take();
+            let (_, pop) = played.iter().find(|(s, _)| *s == ContactSound::Pop).unwrap();
+            assert_eq!(pop.selector, Some(expected), "velocity {velocity}");
+            assert_eq!(o.latches().pop_selector_64, expected);
+            assert_eq!(pop.eq_chain, Some(0));
+        }
+        // Tricks 33 and 34 force the softest selector however hard the pop was.
+        for trick in [33u32, 34] {
+            let (mut o, sink) = owner(true);
+            o.step(&ContactsInputs::default());
+            o.step(&ContactsInputs { jump_velocity_468: 5.0, ..air(trick) });
+            let played = sink.take();
+            let (_, pop) = played.iter().find(|(s, _)| *s == ContactSound::Pop).unwrap();
+            assert_eq!(pop.selector, Some(0));
+        }
+    }
+
+    #[test]
+    fn pop_roll_sample_walks_the_speed_tiers_and_is_held_once() {
+        let mut t = tuning();
+        t.roll_sample_high = 10;
+        t.roll_sample_mid = 20;
+        t.roll_sample_low = 30;
+        t.roll_sample_idle = 40;
+        for (speed, expected) in [(20.0f32, 10), (9.0, 20), (5.0, 30), (1.0, 40)] {
+            let (mut o, sink) = owner(true);
+            o.tuning = t;
+            o.step(&ContactsInputs::default());
+            o.step(&ContactsInputs { ground_speed_208: speed, ..air(5) });
+            let played = sink.take();
+            let (_, roll) = played.iter().find(|(s, _)| *s == ContactSound::PopRoll).unwrap();
+            assert_eq!(roll.sample, Some(expected), "speed {speed}");
+        }
+        // The roll voice is held at +96: coming down lands, and the next pop frees only the
+        // +60 pop voice (handle 1) and does not restart the roll. The landing zeroes +424, so
+        // the pop needs one more grounded frame to clear the warm-up gate.
+        let (mut o, sink) = owner(true);
+        o.step(&ContactsInputs::default());
+        o.step(&air(5));
+        sink.take();
+        o.step(&ContactsInputs::default());
+        o.step(&ContactsInputs::default());
+        o.step(&air(5));
+        assert_eq!(sink.kinds(), vec![ContactSound::Landing, ContactSound::Pop]);
+        assert_eq!(sink.freed(), vec![1]);
+    }
+
+    #[test]
+    fn landing_resets_the_frame_counter_so_the_next_pop_is_gated() {
+        // A pop on the frame straight after a landing is suppressed, because the landing set
+        // +424 to 0 and `sub_824B9CC8` wants +424 >= 2.
+        let (mut o, sink) = owner(true);
+        o.step(&ContactsInputs::default());
+        o.step(&air(5));
+        sink.take();
+        o.step(&ContactsInputs::default());
+        o.step(&air(5));
+        assert_eq!(sink.kinds(), vec![ContactSound::Landing]);
+    }
+
+    #[test]
+    fn landing_fires_on_the_falling_edge_only_when_not_grinding_and_local() {
+        let (mut o, sink) = owner(true);
+        o.step(&air(5));
+        sink.take();
+        // Falling edge, not grinding: the landing voice, and the frame counter resets.
+        o.step(&ContactsInputs::default());
+        let played = sink.take();
+        assert_eq!(played.len(), 1);
+        assert_eq!(played[0].0, ContactSound::Landing);
+        assert_eq!(played[0].1.sample, Some(1095));
+        assert_eq!(played[0].1.eq_chain, Some(1));
+        assert_eq!(o.latches().frames_424, 0);
+
+        // Landing into a grind plays no landing voice; the grind onset takes over.
+        let (mut o, sink) = owner(true);
+        o.step(&air(5));
+        sink.take();
+        o.step(&ContactsInputs { grinding_341: true, ..ContactsInputs::default() });
+        assert_eq!(sink.kinds(), vec![ContactSound::GrindOnset]);
+
+        // A remote skater gets no landing voice, but the counter still resets.
+        let (mut o, sink) = owner(false);
+        o.step(&air(5));
+        sink.take();
+        o.step(&ContactsInputs::default());
+        assert!(sink.take().is_empty());
+        assert_eq!(o.latches().frames_424, 0);
+    }
+
+    #[test]
+    fn grind_onset_uses_the_material_family_base_and_impact_tier() {
+        let (mut o, sink) = owner(true);
+        o.step(&ContactsInputs {
+            grinding_341: true,
+            grind_material_692: 143,
+            grind_family_192: 2,
+            grind_impact_228: 0.5,
+            ..ContactsInputs::default()
+        });
+        let played = sink.take();
+        assert_eq!(played[0].0, ContactSound::GrindOnset);
+        // 143 becomes 10, family 2 uses base 95, impact 0.5 over 0.25 gives tier 1.
+        assert_eq!(played[0].1.material, Some(10));
+        assert_eq!(played[0].1.family_base, Some(95));
+        assert_eq!(played[0].1.tier, Some(1));
+
+        // Another family and a quiet impact.
+        let (mut o, sink) = owner(true);
+        o.step(&ContactsInputs {
+            grinding_341: true,
+            grind_material_692: 7,
+            grind_family_192: 4,
+            grind_impact_228: 0.1,
+            ..ContactsInputs::default()
+        });
+        let played = sink.take();
+        assert_eq!(
+            (played[0].1.material, played[0].1.family_base, played[0].1.tier),
+            (Some(7), Some(96), Some(0))
+        );
+
+        // Only the rising edge fires.
+        o.step(&ContactsInputs { grinding_341: true, ..ContactsInputs::default() });
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn latches_track_the_retail_members() {
+        let (mut o, _sink) = owner(true);
+        o.step(&ContactsInputs { air_time_236: 1.5, bail_676: true, ..air(5) });
+        let l = o.latches();
+        assert_eq!((l.airborne_120, l.bail_344, l.air_time_340), (true, true, 1.5));
+        assert_eq!(l.frames_424, 1);
+        // On the ground the air-time latch keeps its last airborne value.
+        o.step(&ContactsInputs { air_time_236: 9.0, ..ContactsInputs::default() });
+        assert_eq!(o.latches().air_time_340, 1.5);
+        assert!(!o.latches().airborne_120);
+    }
+
+    fn owner_vault() -> Option<Collections> {
+        let root = std::path::PathBuf::from(r"C:\s3\installations8eda9dc4644496d81ae73af95ff4285ssets");
+        root.join("private/stock/skater-collections.json")
+            .exists()
+            .then(|| Collections::load(&root).unwrap())
+    }
+
+    /// Skipped without the assets.
+    #[test]
+    fn contacts_owner_tuning_reads_the_vault() {
+        let Some(v) = owner_vault() else { return };
+        assert_eq!(ContactsTuning::load(&v).unwrap(), tuning());
+    }
+
+    /// The trigger frames are the only part of these sounds the capture can check, since they
+    /// come purely from state.tsv edges. This replays every captured frame, reports the pop /
+    /// landing / grind-onset frames and asserts each one sits on a real edge.
+    #[test]
+    #[ignore = "needs .local/captures"]
+    fn contacts_owner_edges_match_the_capture() {
+        let Some(root) = capture::root() else { return };
+        let states = capture::states(&root);
+        let sink = SharedRecorder::default();
+        let mut o = ContactsOwner {
+            tuning: tuning(),
+            local: true,
+            latches: ContactLatches::default(),
+            held_pop_60: None,
+            held_roll_96: None,
+            held_landing_56: None,
+            voices: Box::new(sink.clone()),
+        };
+        let mut frames: Vec<(u32, ContactSound)> = Vec::new();
+        for (&frame, words) in &states {
+            let inputs = ContactsInputs::from_capture(words);
+            o.step(&inputs);
+            for (sound, _) in sink.take() {
+                frames.push((frame, sound));
+            }
+        }
+        let count = |what: ContactSound| frames.iter().filter(|(_, s)| *s == what).count();
+        let list = |what: ContactSound| {
+            frames.iter().filter(|(_, s)| *s == what).map(|(f, _)| *f).collect::<Vec<_>>()
+        };
+        println!("pops        {} {:?}", count(ContactSound::Pop), list(ContactSound::Pop));
+        println!("pop rolls   {}", count(ContactSound::PopRoll));
+        println!("landings    {} {:?}", count(ContactSound::Landing), list(ContactSound::Landing));
+        println!("grind onset {} {:?}", count(ContactSound::GrindOnset), list(ContactSound::GrindOnset));
+        // Every trigger must sit on a real edge of the captured state.
+        for (frame, sound) in &frames {
+            let now = ContactsInputs::from_capture(&states[frame]);
+            let previous = states
+                .range(..frame)
+                .next_back()
+                .map(|(_, w)| ContactsInputs::from_capture(w))
+                .unwrap_or_default();
+            match sound {
+                ContactSound::Pop | ContactSound::PopRoll => {
+                    assert!(now.in_known_air_332 && !previous.in_known_air_332, "frame {frame}");
+                    assert!(now.trick_active_343, "frame {frame}");
+                }
+                ContactSound::Landing => {
+                    assert!(!now.in_known_air_332 && previous.in_known_air_332, "frame {frame}");
+                    assert!(!now.grinding_341, "frame {frame}");
+                }
+                ContactSound::GrindOnset => {
+                    assert!(now.grinding_341 && !previous.grinding_341, "frame {frame}");
+                }
+            }
+        }
+        assert!(count(ContactSound::Landing) > 0, "the capture should contain landings");
     }
 }

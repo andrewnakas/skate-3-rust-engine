@@ -47,6 +47,25 @@ fn inputs(dir: &PathBuf, ctrl: &str) -> HashMap<u32, [u32; 16]> {
     out
 }
 
+/// A controller's captured output words by evaluation, unpacked into the 32 output ids: the
+/// `MC` line's fourth field holds 16 words, word *k* carrying id 2*k* in its low half and id
+/// 2*k* + 1 in its high half.
+fn outputs(dir: &PathBuf, ctrl: &str) -> HashMap<u32, [u32; 32]> {
+    let mut out = HashMap::new();
+    let text = std::fs::read_to_string(dir.join("mixmap").join(format!("{ctrl}.tsv"))).unwrap();
+    for line in text.lines() {
+        let frame: u32 = line.split('\t').next().unwrap().parse().unwrap();
+        let mut ids = [0u32; 32];
+        for (i, w) in line.split('|').nth(3).unwrap().split_whitespace().enumerate() {
+            let w = u32::from_str_radix(w, 16).unwrap();
+            ids[2 * i] = w & 0xFFFF;
+            ids[2 * i + 1] = w >> 16;
+        }
+        out.insert(frame, ids);
+    }
+    out
+}
+
 fn word(s: &[u32], off: u32) -> u32 {
     s[((off - 192) / 4) as usize]
 }
@@ -449,4 +468,82 @@ fn music_emphasis_tiers_match_the_flips_emphasis_in_the_capture() {
     assert_eq!(modal((0, 5000)), (1287, 1865));
     assert_eq!(modal((0, 12000)), (1969, 2853));
     assert_eq!(modal((32767, 32767)), (28343, 32730));
+}
+
+#[test]
+fn the_pause_writer_latches_only_outside_the_free_skate_path() {
+    // Free skate: the request goes straight to id 0, and id 2 stays clear.
+    assert_eq!(pause_inputs(true), [(0, 32767), (1, 0), (2, 0)]);
+    assert_eq!(pause_inputs(false), [(0, 0), (1, 0), (2, 0)]);
+    // sys+1064 != 1 (the capture's start-up path): the first requesting frame only clears the
+    // latch, later frames hold id 2, and releasing the request re-arms it.
+    let mut pause = Pause::retail();
+    assert!(pause.armed_28);
+    let f = PauseFields { request: true, mode_1064: false, state_6: false };
+    assert_eq!(pause.process(f), [(0, 0), (1, 0), (2, 0)]);
+    assert!(!pause.armed_28);
+    assert_eq!(pause.process(f), [(0, 0), (1, 0), (2, 32767)]);
+    assert_eq!(pause.process(PauseFields::default()), [(0, 0), (1, 0), (2, 0)]);
+    assert!(pause.armed_28);
+    // id 1 is the game-flow state alone.
+    assert_eq!(
+        pause.process(PauseFields { request: false, mode_1064: true, state_6: true }),
+        [(0, 0), (1, 32767), (2, 0)]
+    );
+}
+
+/// The capture's pause: `pause_inputs` reproduces the Pause controller's words, and while id 0 is
+/// held every player controller's level outputs are silent. The extract is
+/// `mixmap/4A26B250.tsv` (the `MC` lines of `40000070`).
+#[test]
+fn the_pause_inputs_and_the_player_silence_match_the_capture() {
+    let Some(dir) = extract() else { return };
+    if !dir.join("mixmap/4A26B250.tsv").is_file() {
+        eprintln!("skipped: no 40000070 extract (mixmap/4A26B250.tsv)");
+        return;
+    }
+    let pause = inputs(&dir, "4A26B250");
+    let mut held = Vec::new();
+    for (&frame, words) in &pause {
+        for id in 3..16 {
+            assert_eq!(words[id], 0, "frame {frame}: Pause id {id}");
+        }
+        assert_eq!(words[1], 0, "frame {frame}: the capture never reaches game-flow state 6");
+        assert!(words[0] == 0 || words[2] == 0, "frame {frame}: ids 0 and 2 are exclusive");
+        for id in [0, 2] {
+            assert!(words[id] == 0 || words[id] == 32767, "frame {frame}: Pause id {id}");
+        }
+        if words[0] != 0 {
+            held.push(frame);
+        }
+        // The free-skate path (`mode_1064`) writes id 0 alone, so wherever id 2 is clear the
+        // ported writer reproduces the capture's words exactly.
+        if words[2] == 0 {
+            assert_eq!(
+                pause_inputs(words[0] != 0),
+                [(0, words[0]), (1, words[1]), (2, words[2])],
+                "frame {frame}"
+            );
+        }
+    }
+    held.sort_unstable();
+    assert_eq!(held.len(), 3949, "the capture's one pause-menu pause");
+    let (first, last) = (held[0], held[held.len() - 1]);
+    assert_eq!(last - first + 1, held.len() as u32, "one contiguous pause");
+
+    // Every player controller's level outputs are 0 while the pause is held, within 12
+    // evaluations of it starting. The levels here are the ones the components read as levels
+    // (`read_gain`), i.e. the outputs that are non-zero before the pause and fall to 0.
+    for ctrl in ["4A26A8A0", "4A26A8B0", "4A26A8C0", "4A26A8D0", "4A26A8E0", "4A26A8F0", "4A26A900", "4A26A910", "4A26A920", "4A26A930"] {
+        let outs = outputs(&dir, ctrl);
+        let before = &outs[&(first - 5)];
+        let after = &outs[&(first + 12)];
+        let fell: Vec<usize> = (0..32).filter(|&i| before[i] > 1000 && after[i] <= 1).collect();
+        assert!(!fell.is_empty(), "{ctrl}: no output fell silent during the pause");
+        for &i in &fell {
+            for frame in (first + 12)..=last {
+                assert!(outs[&frame][i] <= 1, "{ctrl} output {i} at {frame}: {}", outs[&frame][i]);
+            }
+        }
+    }
 }
