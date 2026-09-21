@@ -104,9 +104,18 @@ impl WheelsVault {
         let float = |name: &str| c.float(HOLDER, WHEELS, name);
         let int = |name: &str| c.integer(HOLDER, WHEELS, name).map(|v| v as i32);
         Ok(Self {
-            snr: [text("Hash_044FB3ECB9FCB35F")?, text("Hash_243117D2CD2EDC70")?],
-            sek: [text("Hash_82F1E6D5A0300576")?, text("Hash_6CD2B3AB6ACF77C4")?],
-            start: [float("Hash_FD874514FD49261E")?, float("Hash_8CC31309D10F1763")?],
+            snr: [
+                text("Hash_044FB3ECB9FCB35F")?,
+                text("Hash_243117D2CD2EDC70")?,
+            ],
+            sek: [
+                text("Hash_82F1E6D5A0300576")?,
+                text("Hash_6CD2B3AB6ACF77C4")?,
+            ],
+            start: [
+                float("Hash_FD874514FD49261E")?,
+                float("Hash_8CC31309D10F1763")?,
+            ],
             top_kmh: float("Hash_4890392C91829954")?,
             eq_chain: vault_word(c, EQ_CLASS, "default", "Hash_55E6488906A2E330")?,
             peak_far: int("Hash_5DDF8C07AC1D35C4")?,
@@ -176,7 +185,11 @@ pub(crate) fn gain_id(audio: &AudioState, handplant_760: bool) -> u32 {
 }
 
 /// `sub_824CE488`'s local bus values: PI20 `{frequency, q, gain}` and HS20 `{corner, gain}`.
-pub(crate) fn bus_filters(vault: &WheelsVault, time_scale: f32, camera_680: f32) -> ([f32; 3], [f32; 2]) {
+pub(crate) fn bus_filters(
+    vault: &WheelsVault,
+    time_scale: f32,
+    camera_680: f32,
+) -> ([f32; 3], [f32; 2]) {
     let t = if time_scale > 1.0 { 1.0 } else { time_scale };
     let far = vault.peak_far as f32;
     let near = vault.peak_near as f32;
@@ -186,7 +199,11 @@ pub(crate) fn bus_filters(vault: &WheelsVault, time_scale: f32, camera_680: f32)
     let frequency = fmadd_single(f64::from(f9), f64::from(camera_680), f64::from(f12)) as f32;
     let corner = t * vault.shelf_corner as f32;
     let span = vault.shelf_near - vault.shelf_far;
-    let shelf = fmadd_single(f64::from(span), f64::from(camera_680), f64::from(vault.shelf_far)) as f32;
+    let shelf = fmadd_single(
+        f64::from(span),
+        f64::from(camera_680),
+        f64::from(vault.shelf_far),
+    ) as f32;
     ([frequency, vault.peak_q, vault.peak_gain], [corner, shelf])
 }
 
@@ -259,9 +276,17 @@ impl Wheels {
         for k in 0..2 {
             let snr = find(&vault.snr[k])?;
             streams[k] = g
-                .load_resident(&snr.name, &snr.bytes, snr.samples.clone(), snr.channels, snr.rate)
+                .load_resident(
+                    &snr.name,
+                    &snr.bytes,
+                    snr.samples.clone(),
+                    snr.channels,
+                    snr.rate,
+                )
                 .map_err(|e| e.to_string())?;
-            seeks[k] = g.place(&find(&vault.sek[k])?.bytes).map_err(|e| e.to_string())?;
+            seeks[k] = g
+                .place(&find(&vault.sek[k])?.bytes)
+                .map_err(|e| e.to_string())?;
         }
         g.reserve_voices(3);
         let bus = g.stream_bus(vault.eq_chain).map_err(|e| e.to_string())?;
@@ -293,7 +318,11 @@ impl Wheels {
     fn spin(&mut self, tick: &mut Tick, index: usize, trigger: bool) -> Result<(), String> {
         let voice = self.voices[index];
         let finished = match voice {
-            Some(v) => tick.runtime.grains().stream_finished(v).map_err(|e| e.to_string())?,
+            Some(v) => tick
+                .runtime
+                .grains()
+                .stream_finished(v)
+                .map_err(|e| e.to_string())?,
             None => false,
         };
         let c = tick.controls;
@@ -325,7 +354,8 @@ impl Wheels {
                 }
             }
             Step::Hold => {
-                let gain = c.level(gain_id(tick.audio, self.handplant_760)) as i32 as f32 * INV_32767;
+                let gain =
+                    c.level(gain_id(tick.audio, self.handplant_760)) as i32 as f32 * INV_32767;
                 let pitch = c.pitch(2) as f32 * INV_4096;
                 let v = voice.expect("held voice");
                 tick.runtime
@@ -335,7 +365,10 @@ impl Wheels {
             }
             Step::Finished | Step::Release => {
                 let v = self.voices[index].take().expect("voice to stop");
-                tick.runtime.grains().stream_stop(v).map_err(|e| e.to_string())?;
+                tick.runtime
+                    .grains()
+                    .stream_stop(v)
+                    .map_err(|e| e.to_string())?;
             }
         }
         Ok(())
@@ -352,7 +385,8 @@ impl Wheels {
         let pan = c.raw(0) as i32 as f32 * PAN_SCALE;
         g.stream_post(self.bus, 5, 0, pan).map_err(e)?;
         if self.local {
-            let (peak, shelf) = bus_filters(&self.vault, tick.audio.time_scale_220, self.camera_680);
+            let (peak, shelf) =
+                bus_filters(&self.vault, tick.audio.time_scale_220, self.camera_680);
             for (id, value) in peak.into_iter().enumerate() {
                 g.stream_post(self.bus, 1, id as u32, value).map_err(e)?;
             }
@@ -393,21 +427,36 @@ pub(crate) mod tests {
     pub(crate) struct Fixed(pub &'static [(u32, u32, u32)]);
     impl Controls for Fixed {
         fn raw(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 52 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 52 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
         fn pitch(&self, id: u32) -> i32 {
-            self.0.iter().find(|r| r.0 == 56 && r.1 == id).map_or(0, |r| r.2 as i32)
+            self.0
+                .iter()
+                .find(|r| r.0 == 56 && r.1 == id)
+                .map_or(0, |r| r.2 as i32)
         }
         fn level(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 60 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 60 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
     }
 
     /// The vault's values (`skater-collections.json`, holder instance `03B710C80E1AC13E`).
     pub(crate) fn vault() -> WheelsVault {
         WheelsVault {
-            snr: ["Whls_spins_Jump_1.snr".into(), "Whls_spins_Man_1.snr".into()],
-            sek: ["Whls_spins_Jump_1.sek".into(), "Whls_spins_Man_1.sek".into()],
+            snr: [
+                "Whls_spins_Jump_1.snr".into(),
+                "Whls_spins_Man_1.snr".into(),
+            ],
+            sek: [
+                "Whls_spins_Jump_1.sek".into(),
+                "Whls_spins_Man_1.sek".into(),
+            ],
             start: [14.0, 14.0],
             top_kmh: 50.0,
             eq_chain: 6,
@@ -471,11 +520,20 @@ pub(crate) mod tests {
     #[test]
     fn bus_filters_interpolate_on_the_camera_factor() {
         let v = vault();
-        assert_eq!(bus_filters(&v, 1.0, 0.0), ([4500.0, v.peak_q, 20.0], [4000.0, 3.0]));
-        assert_eq!(bus_filters(&v, 1.0, 1.0), ([800.0, v.peak_q, 20.0], [4000.0, 0.5]));
+        assert_eq!(
+            bus_filters(&v, 1.0, 0.0),
+            ([4500.0, v.peak_q, 20.0], [4000.0, 3.0])
+        );
+        assert_eq!(
+            bus_filters(&v, 1.0, 1.0),
+            ([800.0, v.peak_q, 20.0], [4000.0, 0.5])
+        );
         // The time scale is clamped to 1 and scales both corners.
         assert_eq!(bus_filters(&v, 2.0, 0.0).0[0], 4500.0);
-        assert_eq!(bus_filters(&v, 0.5, 0.0), ([2250.0, v.peak_q, 20.0], [2000.0, 3.0]));
+        assert_eq!(
+            bus_filters(&v, 0.5, 0.0),
+            ([2250.0, v.peak_q, 20.0], [2000.0, 3.0])
+        );
         // The capture's usual +680: fmsubs/fmadds, one rounding each.
         let c = 0.820_902_5_f32;
         let (peak, shelf) = bus_filters(&v, 1.0, c);
@@ -531,7 +589,9 @@ pub(crate) mod tests {
         let mut current = [usize::MAX; 3];
         let mut ours: HashMap<u32, Vec<(bool, u32)>> = HashMap::new();
         for (&frame, _) in states.range(states.keys().next().unwrap() + 1..) {
-            let Some(audio) = states.get(&(frame - 1)) else { continue };
+            let Some(audio) = states.get(&(frame - 1)) else {
+                continue;
+            };
             let mut events = Vec::new();
             for (index, trigger) in triggers(audio, true, false).into_iter().enumerate() {
                 match step(&mut flags[index], trigger, voices[index], false) {
@@ -588,19 +648,34 @@ pub(crate) mod tests {
     fn wheels_play_headless() {
         use skate_audio_core::authored::AuthoredRuntime;
         use skate_data::audio::catalog::PlayerAudioCatalog;
-        let assets = std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+        let assets = std::path::PathBuf::from(
+            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets",
+        );
         let cache = std::env::var_os("LOCALAPPDATA")
             .map(std::path::PathBuf::from)
             .map(|p| p.join("Skate3RustEngine/audio-pcm-cache"));
         let catalog = PlayerAudioCatalog::from_assets(&assets, cache.as_deref()).unwrap();
-        let mut runtime = AuthoredRuntime::new(catalog.guest, catalog.projects, catalog.banks).unwrap();
+        let mut runtime =
+            AuthoredRuntime::new(catalog.guest, catalog.projects, catalog.banks).unwrap();
         let (vault, members) = load(&assets, cache.as_deref()).unwrap();
-        let controls = Fixed(&[(60, 1, 24_000), (56, 2, 4096), (60, 3, 0), (60, 4, 0), (52, 0, 0)]);
+        let controls = Fixed(&[
+            (60, 1, 24_000),
+            (56, 2, 4096),
+            (60, 3, 0),
+            (60, 4, 0),
+            (52, 0, 0),
+        ]);
         let mut audio = AudioState::default();
         audio.time_scale_220 = 1.0;
         audio.ground_speed_208 = 5.0;
         let mut wheels = {
-            let mut tick = Tick { runtime: &mut runtime, audio: &audio, controls: &controls, dt: 1.0 / 60.0, tick: 0 };
+            let mut tick = Tick {
+                runtime: &mut runtime,
+                audio: &audio,
+                controls: &controls,
+                dt: 1.0 / 60.0,
+                tick: 0,
+            };
             Wheels::new(&mut tick, vault, &members, true).unwrap()
         };
         let mut rms = Vec::new();
@@ -608,7 +683,13 @@ pub(crate) mod tests {
         for frame in 0..150u64 {
             audio.in_known_air_332 = (10..100).contains(&frame);
             {
-                let mut tick = Tick { runtime: &mut runtime, audio: &audio, controls: &controls, dt: 1.0 / 60.0, tick: frame };
+                let mut tick = Tick {
+                    runtime: &mut runtime,
+                    audio: &audio,
+                    controls: &controls,
+                    dt: 1.0 / 60.0,
+                    tick: frame,
+                };
                 wheels.update(&mut tick).unwrap();
             }
             // 48000 / 256 blocks per second, 60 frames per second.
@@ -617,7 +698,10 @@ pub(crate) mod tests {
             while blocks >= 1.0 {
                 blocks -= 1.0;
                 let pcm = runtime.pump_once().unwrap();
-                sum += pcm.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>();
+                sum += pcm
+                    .iter()
+                    .map(|s| f64::from(*s) * f64::from(*s))
+                    .sum::<f64>();
                 n += pcm.len();
             }
             rms.push((sum / n.max(1) as f64).sqrt());

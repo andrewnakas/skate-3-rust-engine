@@ -21,25 +21,25 @@ use skate_data::audio::catalog::PlayerAudioCatalog;
 
 use super::{LivePcm, PlayerAudioObservation};
 
-#[path = "player_audio/tuning.rs"]
-mod tuning;
 #[path = "player_audio/audio_state.rs"]
 mod audio_state;
-#[path = "player_audio/components/mod.rs"]
-mod components;
-#[path = "player_audio/contact_voices.rs"]
-mod contact_voices;
 #[path = "player_audio/collision_materials.rs"]
 mod collision_materials;
 #[path = "player_audio/collision_states.rs"]
 mod collision_states;
+#[path = "player_audio/components/mod.rs"]
+mod components;
+#[path = "player_audio/contact_voices.rs"]
+mod contact_voices;
+#[cfg(test)]
+#[path = "player_audio/headless.rs"]
+mod headless;
 #[path = "player_audio/sound.rs"]
 mod sound;
 #[path = "player_audio/trace.rs"]
 mod trace;
-#[cfg(test)]
-#[path = "player_audio/headless.rs"]
-mod headless;
+#[path = "player_audio/tuning.rs"]
+mod tuning;
 
 const OUTPUT_CHANNELS: u16 = 2;
 const SAMPLE_RATE: u32 = 48_000;
@@ -169,7 +169,11 @@ fn forward(
                 host.dropped_observations += 1;
                 eprintln!(
                     "SKATE_PLAYER_AUDIO observation_overflow tick={} footstep={} push={} landed={} events={:?}",
-                    lost.tick, lost.footstep_strength, lost.foot_push_speed, lost.landed, lost.events
+                    lost.tick,
+                    lost.footstep_strength,
+                    lost.foot_push_speed,
+                    lost.landed,
+                    lost.events
                 );
             }
             Err(TrySendError::Disconnected(_)) => break,
@@ -306,7 +310,9 @@ pub(crate) fn prepare(assets: &std::path::Path) -> Result<Prepared, String> {
     } else {
         None
     };
-    runtime.load_mixmap(&mixmap).map_err(|error| error.to_string())?;
+    runtime
+        .load_mixmap(&mixmap)
+        .map_err(|error| error.to_string())?;
     let sound = sound::build(&mut runtime, assets, cache_directory().as_deref())?;
     eprintln!("SKATE_PLAYER_AUDIO player_sound ready");
     Ok(Prepared {
@@ -363,9 +369,12 @@ fn run(
         // considered a Skate 3 match.
         let stereo = downmix(&native);
         trace::output(&native, usize::from(PCM_CHANNELS), &stereo);
-        window_peak = native.iter().fold(window_peak, |peak, sample| peak.max(sample.abs()));
+        window_peak = native
+            .iter()
+            .fold(window_peak, |peak, sample| peak.max(sample.abs()));
         window_blocks += 1;
-        if trace && window_blocks as u64 * u64::from(PCM_FRAMES_PER_BLOCK) >= u64::from(SAMPLE_RATE) {
+        if trace && window_blocks as u64 * u64::from(PCM_FRAMES_PER_BLOCK) >= u64::from(SAMPLE_RATE)
+        {
             let stats = runtime.stats();
             // The graph arena: blocks live must plateau. It climbing without bound was the
             // voice-graph leak that ended a long session in "guest heap exhausted".
@@ -403,7 +412,9 @@ fn next_observation<T>(observations: &Receiver<T>) -> Result<Option<T>, String> 
     match observations.try_recv() {
         Ok(observation) => Ok(Some(observation)),
         Err(TryRecvError::Empty) => Ok(None),
-        Err(TryRecvError::Disconnected) => Err("player audio observation source disconnected".into()),
+        Err(TryRecvError::Disconnected) => {
+            Err("player audio observation source disconnected".into())
+        }
     }
 }
 
@@ -660,7 +671,11 @@ impl DirectMixer {
                 observation.landing_clean,
                 observation.landing_sketchy,
                 observation.landing_type,
-                if ordinary_retail_landing { "treatments:17" } else { "treatments:severity-fallback" },
+                if ordinary_retail_landing {
+                    "treatments:17"
+                } else {
+                    "treatments:severity-fallback"
+                },
             );
         }
         let roll_gain = (0.015 + speed * 0.0035).min(0.065);
@@ -729,16 +744,13 @@ impl DirectMixer {
             &foot_drag_slots,
             surface,
             (observation.foot_push_speed.abs() * 0.03).clamp(0.04, 0.12),
-            matches!(observation.state, 101 | 102)
-                && observation.foot_push_speed.abs() > 0.35,
+            matches!(observation.state, 101 | 102) && observation.foot_push_speed.abs() > 0.35,
         );
 
         // The animation signal can remain above zero through an entire planted-foot interval.
         // A rising-edge-only trigger consequently missed later steps when two contacts overlapped.
         // Keep the retail variants, but permit another contact after a short gait cooldown.
-        if observation.footstep_strength > 0.05
-            && observation.tick >= self.next_footstep_tick
-        {
+        if observation.footstep_strength > 0.05 && observation.tick >= self.next_footstep_tick {
             self.play_from(
                 "fstep_skateshoe1_sm.abk",
                 &footstep_slots,
@@ -820,7 +832,8 @@ impl DirectMixer {
             );
             self.next_skid_tick = observation.tick + 8;
         }
-        let sliding_or_reverting = observation.powersliding || matches!(observation.state, 101 | 102);
+        let sliding_or_reverting =
+            observation.powersliding || matches!(observation.state, 101 | 102);
         if sliding_or_reverting
             && observation.contact_count > 0
             && speed > 0.5
@@ -1085,8 +1098,8 @@ impl EventProducer {
                 // Exact Class_Treatment constructor message from the retail session trace. The
                 // object is posted once when the player-audio owner starts and remains held.
                 let post = [
-                    0, 0x7fff, 0, 0, 0x1000, 0x61a8, 0, 0, 0, 0, 0x01f4, 0, 0, 0, 0,
-                    0x1b58, 0x6d60, 0x7fff, 0, 1, 1, 8,
+                    0, 0x7fff, 0, 0, 0x1000, 0x61a8, 0, 0, 0, 0, 0x01f4, 0, 0, 0, 0, 0x1b58,
+                    0x6d60, 0x7fff, 0, 1, 1, 8,
                 ];
                 let handle = runtime
                     .post("Class_Treatment", &post)
@@ -1174,8 +1187,8 @@ impl EventProducer {
         // Recovered Class_Flips constructor layout. Words 7..11 are its five clamped gameplay
         // inputs; words 16..27 are the stock voice-property defaults captured from retail.
         let post = [
-            0, 32_767, 0, 0, 0x1000, 0x61a8, 0, 0, 0, strength, 500, selector, 0, 0, 0,
-            0, 1, 0x6bfe, 0x3a00, 0x1a00, 0, 0x2710, 0, 0, 1, 1, 0, 6,
+            0, 32_767, 0, 0, 0x1000, 0x61a8, 0, 0, 0, strength, 500, selector, 0, 0, 0, 0, 1,
+            0x6bfe, 0x3a00, 0x1a00, 0, 0x2710, 0, 0, 1, 1, 0, 6,
         ];
         let handle = runtime
             .post("Class_Flips", &post)
@@ -1220,8 +1233,8 @@ impl EventProducer {
                 // pitch and trick-selector ramps. Without this update, the selected voice is
                 // intentionally opened at zero gain.
                 let update = [
-                    0x38d7, 32_767, 0, 0x0999, 0x0fe6, 0x618b, 0, 0, 0, strength, 500,
-                    selector, 0, 0, 0, 0, 1,
+                    0x38d7, 32_767, 0, 0x0999, 0x0fe6, 0x618b, 0, 0, 0, strength, 500, selector, 0,
+                    0, 0, 0, 1,
                 ];
                 runtime
                     .redeliver(handle, &update)
@@ -1241,8 +1254,8 @@ impl EventProducer {
                 // Recorded Class_grind updates replace the constructor's first word and publish
                 // the live level, contact scalar, filters, speed, surface and grind layer.
                 let update = [
-                    32_767, level, 0x0434, 0, 0x1000, 0x618b, 0x004d, speed, 0x0400, surface, layer,
-                    0x628e, 0, 0, 0, 0, 5,
+                    32_767, level, 0x0434, 0, 0x1000, 0x618b, 0x004d, speed, 0x0400, surface,
+                    layer, 0x628e, 0, 0, 0, 0, 5,
                 ];
                 runtime
                     .redeliver(handle, &update)
@@ -1251,15 +1264,20 @@ impl EventProducer {
                 // Exact 17-word constructor payload from the retail Class_grind trace. Layer 2 is
                 // the sustained rail voice; the old shifted payload selected near-silent impulses.
                 let post = [
-                    0, 32_767, 0, 0, 0, 25_000, 0, speed, 0x0400, surface, layer, 0x628e, 0, 0, 0, 0, 5,
+                    0, 32_767, 0, 0, 0, 25_000, 0, speed, 0x0400, surface, layer, 0x628e, 0, 0, 0,
+                    0, 5,
                 ];
                 let handle = runtime
                     .post("Class_grind", &post)
                     .map_err(|error| error.to_string())?;
                 eprintln!(
                     "SKATE_PLAYER_AUDIO grind_start tick={} speed={physical_speed:.3} family={} substate={} surface={} impact={:.3} layer={} handle={handle:#010x}",
-                    observation.tick, observation.grind_family, observation.grind_substate,
-                    observation.grind_audio_surface, observation.grind_impact_speed, layer
+                    observation.tick,
+                    observation.grind_family,
+                    observation.grind_substate,
+                    observation.grind_audio_surface,
+                    observation.grind_impact_speed,
+                    layer
                 );
                 self.grind = Some(handle);
             }
@@ -1299,8 +1317,14 @@ struct RollingLayer {
 
 /// `sub_824C9830` posts layer 0 into holder +1304 and layer 3 into +1308.
 const ROLLING_LAYERS: [RollingLayer; 2] = [
-    RollingLayer { selector: 0, gain_cap: 12_999 },
-    RollingLayer { selector: 3, gain_cap: 4_913 },
+    RollingLayer {
+        selector: 0,
+        gain_cap: 12_999,
+    },
+    RollingLayer {
+        selector: 3,
+        gain_cap: 4_913,
+    },
 ];
 
 /// `sub_824C9948`: `clamp(v * 3.6 / maxSpeed[layer], 0, 1) * 10000`, truncated (`fctiwz`). The 3.6
@@ -1478,8 +1502,7 @@ const TREATMENT_LANDING_UPDATES: [[u32; 3]; 10] = [
 /// normal game speed. Writing a landing strength here played the Treatments patch up to 2x fast.
 fn treatment_update(phase: usize) -> [u32; 17] {
     let mut update = [
-        0x2caf, 0x7fff, 0, 0x097d, 0x0ff6, 0x61a8, 0, 0, 0, 0, 0x01f4, 0, 0, 0, 1,
-        0x1b58, 0x6d60,
+        0x2caf, 0x7fff, 0, 0x097d, 0x0ff6, 0x61a8, 0, 0, 0, 0, 0x01f4, 0, 0, 0, 1, 0x1b58, 0x6d60,
     ];
     if let Some(values) = phase
         .checked_sub(1)
@@ -1504,7 +1527,9 @@ fn landing_treatment_strength(
     } else {
         0.0
     };
-    (350.0 + severity * 650.0 + quality).round().clamp(1.0, 1_000.0) as u32
+    (350.0 + severity * 650.0 + quality)
+        .round()
+        .clamp(1.0, 1_000.0) as u32
 }
 
 /// Temporary direct-mixer level for the shipped treatment bank while the recovered authored
@@ -1657,7 +1682,10 @@ mod tests {
         let update = rolling_update(2_999, 0, DEFAULT_ROLLING_SURFACE, 12_999);
         assert_eq!(update[0], 32_767);
         assert_eq!((update[2], update[9], update[10]), (4_086, 24_971, 77));
-        assert_eq!((update[3], update[4], update[6], update[11]), (2_999, 0, 2, 12_999));
+        assert_eq!(
+            (update[3], update[4], update[6], update[11]),
+            (2_999, 0, 2, 12_999)
+        );
     }
 
     #[test]
@@ -1692,7 +1720,10 @@ mod tests {
         sender.send((10, "foot contact")).unwrap();
         sender.send((11, "landing")).unwrap();
         sender.send((12, "idle")).unwrap();
-        assert_eq!(next_observation(&receiver).unwrap(), Some((10, "foot contact")));
+        assert_eq!(
+            next_observation(&receiver).unwrap(),
+            Some((10, "foot contact"))
+        );
         assert_eq!(next_observation(&receiver).unwrap(), Some((11, "landing")));
         assert_eq!(next_observation(&receiver).unwrap(), Some((12, "idle")));
         assert_eq!(next_observation(&receiver).unwrap(), None);
@@ -1752,11 +1783,8 @@ mod tests {
 
     #[test]
     fn direct_bank_downmix_preserves_the_treatment_rear_layers() {
-        let source = PcmSource::new(
-            std::sync::Arc::from([10_000i16, -8_000, 6_000, -4_000]),
-            4,
-        )
-        .unwrap();
+        let source =
+            PcmSource::new(std::sync::Arc::from([10_000i16, -8_000, 6_000, -4_000]), 4).unwrap();
         let (left, right) = direct_stereo_frame(&source, 0);
         assert!(left > 0.39, "left keeps the front and rear-left layers");
         assert!(right < -0.30, "right keeps the front and rear-right layers");
@@ -1779,7 +1807,6 @@ mod tests {
         assert!(!advance_offboard_stride(&mut distance, 0.0));
         assert_eq!(distance, 0.0);
     }
-
 
     #[test]
     fn downmix_keeps_frames_and_separates_sides() {

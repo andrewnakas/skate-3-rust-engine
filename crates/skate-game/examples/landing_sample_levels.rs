@@ -57,7 +57,9 @@ fn measure(bytes: &[u8], at: usize) -> Option<(f32, f32)> {
 /// walker needs the *next* start as its end — handed the whole bank it reads past this stream and
 /// into the next one's bytes, where the block sizes are garbage.
 fn stream_starts(banks: &SpliceBanks, bank: &str) -> Vec<usize> {
-    let Some(splc) = banks.bank(bank) else { return Vec::new() };
+    let Some(splc) = banks.bank(bank) else {
+        return Vec::new();
+    };
     let mut starts: Vec<usize> = (0..u16::MAX)
         .map_while(|index| splc.stream_offset(index))
         .collect();
@@ -85,7 +87,11 @@ fn voice(banks: &SpliceBanks, bank: &str, sample: u16, label: &str, starts: &[us
     let mut best: Option<(f32, f32, f32)> = None;
     for m in &members {
         let at = m.stream_offset as usize;
-        let end = starts.iter().copied().find(|&s| s > at).unwrap_or(raw.len());
+        let end = starts
+            .iter()
+            .copied()
+            .find(|&s| s > at)
+            .unwrap_or(raw.len());
         let Some((peak, _rms)) = measure(&raw[..end], at) else {
             continue;
         };
@@ -112,7 +118,10 @@ fn voice(banks: &SpliceBanks, bank: &str, sample: u16, label: &str, starts: &[us
 }
 
 fn main() {
-    let assets = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_ASSETS));
+    let assets = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ASSETS));
     let vault = Collections::load(&assets).expect("vault");
     let landing = LandingTuning::load(&vault).expect("landing tuning");
     let banks = SpliceBanks::load(
@@ -127,7 +136,10 @@ fn main() {
     println!("\nThe impact voice (fixed for every landing):");
     voice(&banks, bank, landing.sample, "impact", &starts);
 
-    println!("\nThe ladder voice (deck test x air >= {:.2} s):", landing.ladder_seconds);
+    println!(
+        "\nThe ladder voice (deck test x air >= {:.2} s):",
+        landing.ladder_seconds
+    );
     for test in 0..2 {
         for hard in 0..2 {
             let label = format!("test {test}, {}", if hard == 1 { "hard" } else { "soft" });
@@ -135,7 +147,9 @@ fn main() {
         }
     }
 
-    println!("\nThe class voice (`sub_824BA3F0`, kind 0) -- this is where retail's step should be:");
+    println!(
+        "\nThe class voice (`sub_824BA3F0`, kind 0) -- this is where retail's step should be:"
+    );
     for class in 0..3u32 {
         // Mode is the surface category only for class 2; 0 otherwise.
         for category in 0..if class >= 2 { 4u8 } else { 1 } {
@@ -143,7 +157,13 @@ fn main() {
                 println!("  class {class} cat {category}: no sample");
                 continue;
             };
-            voice(&banks, bank, sample, &format!("class {class}, cat {category}"), &starts);
+            voice(
+                &banks,
+                bank,
+                sample,
+                &format!("class {class}, cat {category}"),
+                &starts,
+            );
         }
     }
     println!();

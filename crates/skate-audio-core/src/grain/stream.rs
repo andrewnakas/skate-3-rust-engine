@@ -60,7 +60,10 @@ pub struct Voice {
 fn class(g: &Guest, id: u32, name: &str) -> Result<u32> {
     let found = find(g, id)?;
     if found == 0 {
-        return Err(Error::new(id, format!("stream voice class {name} is not registered")));
+        return Err(Error::new(
+            id,
+            format!("stream voice class {name} is not registered"),
+        ));
     }
     Ok(found)
 }
@@ -92,7 +95,10 @@ pub fn build_bus<H: Heap + ?Sized, T: Trig + ?Sized>(
     let system = g.u32(root + 8)?;
     let graph = modules::build_graph(g, heap, trig, system, 2, 7, frame + 96)?;
     if graph == 0 {
-        return Err(Error::new(0x824C_E108, "wheels bus graph allocation failed"));
+        return Err(Error::new(
+            0x824C_E108,
+            "wheels bus graph allocation failed",
+        ));
     }
     let bus = Bus {
         graph,
@@ -140,7 +146,10 @@ pub fn start<H: Heap + ?Sized, T: Trig + ?Sized>(
     let system = g.u32(root + 8)?;
     let graph = modules::build_graph(g, heap, trig, system, 1, 5, frame + 96)?;
     if graph == 0 {
-        return Err(Error::new(0x824C_EAF0, "wheels voice graph allocation failed"));
+        return Err(Error::new(
+            0x824C_EAF0,
+            "wheels voice graph allocation failed",
+        ));
     }
     let voice = Voice {
         graph,
@@ -170,7 +179,12 @@ pub fn start<H: Heap + ?Sized, T: Trig + ?Sized>(
 
     let route_block = frame + 80;
     classes::class_defaults(g, send, 0, route_block)?;
-    route(g, route_block, g.u32(voice.modules + 16)?, g.u32(bus.modules)?)?;
+    route(
+        g,
+        route_block,
+        g.u32(voice.modules + 16)?,
+        g.u32(bus.modules)?,
+    )?;
     Ok(voice)
 }
 

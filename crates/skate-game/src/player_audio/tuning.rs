@@ -125,7 +125,11 @@ impl AudioTuning {
             wheel_impact_divisor: data.float(WHEEL_CLASS, WHEEL_KEY, "Hash_3D399FE04952B425")?,
             wheel_bucket_high: data.float(WHEEL_CLASS, WHEEL_KEY, "Hash_6D3D91A9BA7ADCDC")?,
             wheel_bucket_low: data.float(WHEEL_CLASS, WHEEL_KEY, "Hash_2A70BB8A382574E4")?,
-            body_impact_scale: data.float("physics_collision", "default", "Hash_1430BD50F0A33475")?,
+            body_impact_scale: data.float(
+                "physics_collision",
+                "default",
+                "Hash_1430BD50F0A33475",
+            )?,
             body_impact_speed_x: graph[4..12].try_into().unwrap(),
             body_impact_speed_y: graph[12..20].try_into().unwrap(),
             tricks: audio_tricks(data)?,
@@ -228,13 +232,28 @@ mod tests {
             tuning.landing_thresholds.map(f32::to_bits),
             [0x3FC0_0000, 0x4026_6666, 0x405C_CCCD]
         );
-        assert_eq!(tuning.jump_thresholds.map(f32::to_bits), [0x3EE6_6666, 0x3F40_0000]);
+        assert_eq!(
+            tuning.jump_thresholds.map(f32::to_bits),
+            [0x3EE6_6666, 0x3F40_0000]
+        );
         assert_eq!(tuning.wheel_impact_divisor, 9.0);
         assert_eq!(tuning.wheel_bucket_high, 0.5);
         assert_eq!(tuning.wheel_bucket_low.to_bits(), 0x3E9E_B852);
         assert_eq!(tuning.body_impact_scale, 10.0);
         assert_eq!(tuning.body_impact_speed_x[1].to_bits(), 0x3EBB_9F41);
-        assert_eq!(tuning.body_impact_speed_y, [1.0, 1.2, f32::from_bits(0x3FBE_2BE0), f32::from_bits(0x3FF5_0753), f32::from_bits(0x401B_6DB5), 3.6, f32::from_bits(0x4092_4921), 5.0]);
+        assert_eq!(
+            tuning.body_impact_speed_y,
+            [
+                1.0,
+                1.2,
+                f32::from_bits(0x3FBE_2BE0),
+                f32::from_bits(0x3FF5_0753),
+                f32::from_bits(0x401B_6DB5),
+                3.6,
+                f32::from_bits(0x4092_4921),
+                5.0
+            ]
+        );
         assert_eq!(tuning.tricks.len(), 332);
         // Doc §4: ollie → 28, kickflip → 0.
         let id = |name: &str| {

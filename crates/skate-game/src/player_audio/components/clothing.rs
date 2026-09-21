@@ -25,9 +25,9 @@
 use skate_data::collections::Collections;
 
 use super::super::audio_state::AudioState;
-use super::contacts::{clamp_word, vault_word, SurfaceMap};
-use super::words::{fctiwz, THOUSAND};
-use super::{post, redeliver, release, Component, Controls, Tick};
+use super::contacts::{SurfaceMap, clamp_word, vault_word};
+use super::words::{THOUSAND, fctiwz};
+use super::{Component, Controls, Tick, post, redeliver, release};
 
 const SLIDE_CLASS: &str = "Hash_6EBA5BCD3E38A98A";
 const FALLS_CLASS: &str = "Hash_A867FBE3454326FF";
@@ -188,11 +188,19 @@ pub(crate) fn body_contact(inputs: &BodySlideInputs, tuning: &BodySlideTuning) -
     } else {
         tuning.surfaces.lookup(material, 40) as i32
     };
-    BodyContact { kind, speed, sliding }
+    BodyContact {
+        kind,
+        speed,
+        sliding,
+    }
 }
 
 /// `sub_824DC0E8` → `sub_824B7070`: the posted packet.
-pub(crate) fn body_slide_constructor(tuning: &BodySlideTuning, inputs: &BodySlideInputs, contact: &BodyContact) -> [u32; BODY_SLIDE_WORDS] {
+pub(crate) fn body_slide_constructor(
+    tuning: &BodySlideTuning,
+    inputs: &BodySlideInputs,
+    contact: &BodyContact,
+) -> [u32; BODY_SLIDE_WORDS] {
     let mut words = [0; BODY_SLIDE_WORDS];
     words[3] = clamp_word(contact.speed, 0, 1_000);
     words[4] = 25_000;
@@ -232,7 +240,11 @@ pub(crate) enum SlideAction {
 
 /// `sub_824DC0E8`: held → keep while speed > keep threshold and sliding, else release; not
 /// held → post when sliding and speed > start threshold.
-pub(crate) fn body_slide_action(tuning: &BodySlideTuning, contact: &BodyContact, held: bool) -> SlideAction {
+pub(crate) fn body_slide_action(
+    tuning: &BodySlideTuning,
+    contact: &BodyContact,
+    held: bool,
+) -> SlideAction {
     if held {
         if contact.speed > tuning.keep_speed && contact.sliding {
             SlideAction::Keep
@@ -254,7 +266,10 @@ pub(crate) struct BodySlide {
 
 impl BodySlide {
     pub(crate) fn new(vault: &Collections) -> Result<Self, String> {
-        Ok(Self { tuning: BodySlideTuning::load(vault)?, held: None })
+        Ok(Self {
+            tuning: BodySlideTuning::load(vault)?,
+            held: None,
+        })
     }
 }
 
@@ -310,7 +325,10 @@ impl ClothFallsTuning {
 
 /// `sub_824DBF10`'s two speed words: `fctiwz(1/range × +328 × 1000)` (the constructor's w3) and
 /// the level `max(that, fctiwz(+672 × 1/range × 1000))` it stores at component +44.
-pub(crate) fn cloth_falls_speeds(tuning: &ClothFallsTuning, inputs: &ClothFallsInputs) -> (i32, i32) {
+pub(crate) fn cloth_falls_speeds(
+    tuning: &ClothFallsTuning,
+    inputs: &ClothFallsInputs,
+) -> (i32, i32) {
     let reciprocal = 1.0 / tuning.speed_range;
     let body = fctiwz(reciprocal * inputs.body_speed_328 * THOUSAND);
     let limbs = fctiwz(inputs.limb_speed_672 * reciprocal * THOUSAND);
@@ -318,7 +336,10 @@ pub(crate) fn cloth_falls_speeds(tuning: &ClothFallsTuning, inputs: &ClothFallsI
 }
 
 /// `sub_824B72D8`: the posted packet.
-pub(crate) fn cloth_falls_constructor(tuning: &ClothFallsTuning, body: i32) -> [u32; CLOTH_FALLS_WORDS] {
+pub(crate) fn cloth_falls_constructor(
+    tuning: &ClothFallsTuning,
+    body: i32,
+) -> [u32; CLOTH_FALLS_WORDS] {
     let mut words = [0; CLOTH_FALLS_WORDS];
     words[3] = clamp_word(body, 0, 1_000);
     words[4] = 25_000;
@@ -327,7 +348,11 @@ pub(crate) fn cloth_falls_constructor(tuning: &ClothFallsTuning, body: i32) -> [
 }
 
 /// `sub_824DCA48`'s rewrite of the held packet; `level` is component +44.
-pub(crate) fn cloth_falls_update(words: &mut [u32; CLOTH_FALLS_WORDS], level: i32, controls: &dyn Controls) {
+pub(crate) fn cloth_falls_update(
+    words: &mut [u32; CLOTH_FALLS_WORDS],
+    level: i32,
+    controls: &dyn Controls,
+) {
     let gain = controls.level(2) as i32;
     words[1] = clamp_word(controls.raw(0) as i32, 0, 0xFFFF);
     words[2] = clamp_word(controls.pitch(1), 0, 8_192);
@@ -347,7 +372,11 @@ pub(crate) struct ClothFalls {
 }
 
 /// What `sub_824DBF10` does to the cloth-falls message this frame.
-pub(crate) fn cloth_falls_action(inputs: &ClothFallsInputs, previous_bail: bool, held: bool) -> SlideAction {
+pub(crate) fn cloth_falls_action(
+    inputs: &ClothFallsInputs,
+    previous_bail: bool,
+    held: bool,
+) -> SlideAction {
     if held {
         if inputs.bail_over_677 || !inputs.bail_676 {
             SlideAction::Release
@@ -414,7 +443,10 @@ pub(crate) struct Clothing {
 
 impl Clothing {
     pub(crate) fn new(vault: &Collections) -> Result<Self, String> {
-        Ok(Self { cloth_falls: ClothFalls::new(vault)?, body_slide: BodySlide::new(vault)? })
+        Ok(Self {
+            cloth_falls: ClothFalls::new(vault)?,
+            body_slide: BodySlide::new(vault)?,
+        })
     }
 }
 
@@ -453,14 +485,27 @@ mod tests {
     }
 
     fn falls_tuning() -> ClothFallsTuning {
-        ClothFallsTuning { speed_range: 5.0, eq: 5 }
+        ClothFallsTuning {
+            speed_range: 5.0,
+            eq: 5,
+        }
     }
 
     #[test]
     fn body_contact_prefers_part_one_then_the_first_later_part() {
         let tuning = slide_tuning();
-        let mut inputs = BodySlideInputs { com_speed_212: 2.25, ..Default::default() };
-        assert_eq!(body_contact(&inputs, &tuning), BodyContact { kind: 2, speed: 500, sliding: false });
+        let mut inputs = BodySlideInputs {
+            com_speed_212: 2.25,
+            ..Default::default()
+        };
+        assert_eq!(
+            body_contact(&inputs, &tuning),
+            BodyContact {
+                kind: 2,
+                speed: 500,
+                sliding: false
+            }
+        );
         // Parts 0 and 1 slide: part 1's material (16 → 15 → type 1) wins.
         inputs.slide_528 = [0.5, -0.25, 0.0, 0.0, 0.0, 0.0];
         inputs.material_560 = [4, 16, 0, 0, 0, 0];
@@ -483,13 +528,35 @@ mod tests {
     #[test]
     fn body_slide_starts_above_350_and_holds_above_150() {
         let tuning = slide_tuning();
-        let contact = |speed, sliding| BodyContact { kind: 2, speed, sliding };
-        assert_eq!(body_slide_action(&tuning, &contact(350, true), false), SlideAction::Nothing);
-        assert_eq!(body_slide_action(&tuning, &contact(351, true), false), SlideAction::Post);
-        assert_eq!(body_slide_action(&tuning, &contact(900, false), false), SlideAction::Nothing);
-        assert_eq!(body_slide_action(&tuning, &contact(151, true), true), SlideAction::Keep);
-        assert_eq!(body_slide_action(&tuning, &contact(150, true), true), SlideAction::Release);
-        assert_eq!(body_slide_action(&tuning, &contact(900, false), true), SlideAction::Release);
+        let contact = |speed, sliding| BodyContact {
+            kind: 2,
+            speed,
+            sliding,
+        };
+        assert_eq!(
+            body_slide_action(&tuning, &contact(350, true), false),
+            SlideAction::Nothing
+        );
+        assert_eq!(
+            body_slide_action(&tuning, &contact(351, true), false),
+            SlideAction::Post
+        );
+        assert_eq!(
+            body_slide_action(&tuning, &contact(900, false), false),
+            SlideAction::Nothing
+        );
+        assert_eq!(
+            body_slide_action(&tuning, &contact(151, true), true),
+            SlideAction::Keep
+        );
+        assert_eq!(
+            body_slide_action(&tuning, &contact(150, true), true),
+            SlideAction::Release
+        );
+        assert_eq!(
+            body_slide_action(&tuning, &contact(900, false), true),
+            SlideAction::Release
+        );
     }
 
     #[test]
@@ -520,20 +587,39 @@ mod tests {
             }
         }
         body_slide_update(&mut words, &tuning, &inputs, &Reads);
-        assert_eq!(words, [32767, 0xFFFF, 0x1004, 1000, 25000, 0, 0, 0x2000, 2, 1, 500, 7]);
+        assert_eq!(
+            words,
+            [
+                32767, 0xFFFF, 0x1004, 1000, 25000, 0, 0, 0x2000, 2, 1, 500, 7
+            ]
+        );
     }
 
     #[test]
     fn cloth_falls_posts_on_the_bail_edge_and_releases_at_its_end() {
         let tuning = falls_tuning();
-        let mut inputs = ClothFallsInputs { body_speed_328: 1.0, limb_speed_672: 3.0, bail_676: true, ..Default::default() };
+        let mut inputs = ClothFallsInputs {
+            body_speed_328: 1.0,
+            limb_speed_672: 3.0,
+            bail_676: true,
+            ..Default::default()
+        };
         assert_eq!(cloth_falls_speeds(&tuning, &inputs), (200, 600));
         assert_eq!(cloth_falls_action(&inputs, false, false), SlideAction::Post);
-        assert_eq!(cloth_falls_action(&inputs, true, false), SlideAction::Nothing);
+        assert_eq!(
+            cloth_falls_action(&inputs, true, false),
+            SlideAction::Nothing
+        );
         assert_eq!(cloth_falls_action(&inputs, true, true), SlideAction::Keep);
         inputs.bail_over_677 = true;
-        assert_eq!(cloth_falls_action(&inputs, true, true), SlideAction::Release);
-        assert_eq!(cloth_falls_constructor(&tuning, 200), [0, 0, 0, 200, 25000, 0, 0, 0, 0, 5]);
+        assert_eq!(
+            cloth_falls_action(&inputs, true, true),
+            SlideAction::Release
+        );
+        assert_eq!(
+            cloth_falls_constructor(&tuning, 200),
+            [0, 0, 0, 200, 25000, 0, 0, 0, 0, 5]
+        );
         assert_eq!(cloth_falls_constructor(&tuning, 1600)[3], 1000);
     }
 
@@ -547,14 +633,23 @@ mod tests {
         state.body_material_560[5] = 16;
         state.face_contact_593 = true;
         let slide = BodySlideInputs::from_state(&state).unwrap();
-        assert_eq!((slide.body_speed_328, slide.slide_528[5], slide.material_560[5]), (2.0, 1.5, 16));
+        assert_eq!(
+            (
+                slide.body_speed_328,
+                slide.slide_528[5],
+                slide.material_560[5]
+            ),
+            (2.0, 1.5, 16)
+        );
         assert!(slide.flag_593);
         let falls = ClothFallsInputs::from_state(&state).unwrap();
         assert_eq!((falls.body_speed_328, falls.limb_speed_672), (2.0, 3.0));
     }
 
     fn vault() -> Option<Collections> {
-        let root = std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+        let root = std::path::PathBuf::from(
+            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets",
+        );
         root.join("private/stock/skater-collections.json")
             .exists()
             .then(|| Collections::load(&root).unwrap())
@@ -564,7 +659,16 @@ mod tests {
     fn clothing_tuning_reads_the_vault() {
         let Some(vault) = vault() else { return };
         let slide = BodySlideTuning::load(&vault).unwrap();
-        assert_eq!((slide.speed_divisor, slide.start_speed, slide.keep_speed, slide.body_divisor, slide.eq), (4.5, 350, 150, 8.0, 7));
+        assert_eq!(
+            (
+                slide.speed_divisor,
+                slide.start_speed,
+                slide.keep_speed,
+                slide.body_divisor,
+                slide.eq
+            ),
+            (4.5, 350, 150, 8.0, 7)
+        );
         // Element 94 (materials ≥ 94) has body slide type 2.
         assert_eq!(slide.surfaces.lookup(94, 40), 2);
         let falls = ClothFallsTuning::load(&vault).unwrap();
@@ -578,7 +682,9 @@ mod tests {
     /// The local skater's rows. Message objects and nodes are reused across skaters, so a post
     /// is local when the next update of its payload is, and a release when the last update of
     /// its node was.
-    fn local_rows(rows: &[capture::Row]) -> (Vec<&capture::Row>, Vec<&capture::Row>, Vec<&capture::Row>) {
+    fn local_rows(
+        rows: &[capture::Row],
+    ) -> (Vec<&capture::Row>, Vec<&capture::Row>, Vec<&capture::Row>) {
         let updates: Vec<&capture::Row> = rows.iter().filter(|r| r.kind == "UP").collect();
         let posts = rows
             .iter()
@@ -601,7 +707,10 @@ mod tests {
                     .is_some_and(|u| u.ctrl == LOCAL)
             })
             .collect();
-        let updates = rows.iter().filter(|r| r.kind == "UP" && r.ctrl == LOCAL).collect();
+        let updates = rows
+            .iter()
+            .filter(|r| r.kind == "UP" && r.ctrl == LOCAL)
+            .collect();
         (posts, releases, updates)
     }
 
@@ -635,8 +744,10 @@ mod tests {
             let (mut previous_bail, mut level) = (false, 0);
             let mut ours = [vec![], vec![], vec![], vec![], vec![], vec![]];
             for (&frame, _) in states.range(2709..) {
-                let (Some(earlier), Some(state)) = (states.get(&(frame - update_lag)), states.get(&(frame - process_lag)))
-                else {
+                let (Some(earlier), Some(state)) = (
+                    states.get(&(frame - update_lag)),
+                    states.get(&(frame - process_lag)),
+                ) else {
                     continue;
                 };
                 let slide_in = BodySlideInputs::from_capture(earlier);
@@ -705,7 +816,12 @@ mod tests {
             let frames = |rows: &[&capture::Row]| rows.iter().map(|r| r.frame).collect::<Vec<_>>();
             let same = |a: &[u32], b: &[u32]| a.iter().filter(|f| b.contains(f)).count();
             let report = |name: &str, retail: Vec<u32>, ours: &[u32]| {
-                println!("{name}: retail {} ours {} same-frame {}", retail.len(), ours.len(), same(&retail, ours));
+                println!(
+                    "{name}: retail {} ours {} same-frame {}",
+                    retail.len(),
+                    ours.len(),
+                    same(&retail, ours)
+                );
                 if retail.len() < 60 {
                     println!("   retail {retail:?}\n   ours   {ours:?}");
                 }
@@ -715,7 +831,11 @@ mod tests {
             report("body slide update frames", frames(&slide_updates), &ours[2]);
             report("cloth falls posts", frames(&falls_posts), &ours[3]);
             report("cloth falls releases", frames(&falls_releases), &ours[4]);
-            report("cloth falls update frames", frames(&falls_updates), &ours[5]);
+            report(
+                "cloth falls update frames",
+                frames(&falls_updates),
+                &ours[5],
+            );
         }
     }
 }

@@ -32,10 +32,10 @@
 //! (host+208), not to the count `sub_8294DD20` filled. [`check_capacities`] reports whether the two
 //! agree for a given file, and for `MixMapSK8.mxb` they do.
 
-use super::controller::{CONTROLLER_VTABLE, set_inputs, set_outputs};
-use super::tables::{K_FRAMES_TO_MS, K_ONE, K_ZERO, mb_to_lin};
 use super::Listener;
+use super::controller::{CONTROLLER_VTABLE, set_inputs, set_outputs};
 use super::offsets as H;
+use super::tables::{K_FRAMES_TO_MS, K_ONE, K_ZERO, mb_to_lin};
 use crate::fp::{load_single, mul_single, store_single, word_to_single};
 use crate::patch::Heap;
 use crate::vmx::Fpscr;
@@ -79,7 +79,10 @@ fn instances(g: &Guest, h: u32, slot: u32) -> Result<u32> {
 fn alloc(g: &mut Guest, heap: &mut dyn Heap, size: u32) -> Result<u32> {
     let at = heap.alloc(g, size, 16)?;
     if at == 0 && size != 0 {
-        return Err(Error::new(0x825E_7458, format!("guest allocator out of memory ({size} B)")));
+        return Err(Error::new(
+            0x825E_7458,
+            format!("guest allocator out of memory ({size} B)"),
+        ));
     }
     Ok(at)
 }
@@ -158,11 +161,19 @@ fn idle_bind(g: &Guest, y: u32, host: u32) -> Result<()> {
     if rd(g, y + 4)? != 2 || host == 0 || rd(g, y + 20)? == 0 {
         return Ok(());
     }
-    Err(Error::new(0x8294_C348, "MixMap Y object in state 2: not ported (never reached by sub_82484FE8)"))
+    Err(Error::new(
+        0x8294_C348,
+        "MixMap Y object in state 2: not ported (never reached by sub_82484FE8)",
+    ))
 }
 
 /// `sub_8294BDC8(X)`.
-fn build_descriptor(g: &mut Guest, heap: &mut dyn Heap, listener: &mut dyn Listener, x: u32) -> Result<()> {
+fn build_descriptor(
+    g: &mut Guest,
+    heap: &mut dyn Heap,
+    listener: &mut dyn Listener,
+    x: u32,
+) -> Result<()> {
     let h = rd(g, x)?;
     let data = rd(g, x + 4)?;
     size_host(g, heap, listener, h, data, h)?; // host vfunc4
@@ -170,7 +181,11 @@ fn build_descriptor(g: &mut Guest, heap: &mut dyn Heap, listener: &mut dyn Liste
     let slots = rd(g, x + 8)?;
     for s in 0..slots {
         let data_slots = rd(g, rd(g, h + H::DATA)? + 4)?;
-        let v = if (s as i32) < data_slots as i32 { rd(g, h + 8 + 4 * s)? } else { 0 };
+        let v = if (s as i32) < data_slots as i32 {
+            rd(g, h + 8 + 4 * s)?
+        } else {
+            0
+        };
         wr(g, x + 12 + 4 * s, v)?;
     }
     for s in 0..rd(g, x + 8)? {
@@ -272,9 +287,9 @@ fn zero_counters(g: &mut Guest, h: u32) -> Result<()> {
         wr(g, h + 224 + 8 * k, 0)?;
     }
     for off in [
-        468, 480, 180, 184, 188, 352, 356, 360, 364, 368, 372, 124, 128, 308, 312, 472, 300, 328, 332,
-        336, 476, 304, 340, 344, 348, 524, 488, 544, 548, 552, 540, 536, 532, 528, 492, 496, 500, 504,
-        452, 456, 460, 484, 200, 204, 208, 508, 512, 156,
+        468, 480, 180, 184, 188, 352, 356, 360, 364, 368, 372, 124, 128, 308, 312, 472, 300, 328,
+        332, 336, 476, 304, 340, 344, 348, 524, 488, 544, 548, 552, 540, 536, 532, 528, 492, 496,
+        500, 504, 452, 456, 460, 484, 200, 204, 208, 508, 512, 156,
     ] {
         wr(g, h + off, 0)?;
     }
@@ -297,7 +312,14 @@ fn ref_weight(g: &Guest, h: u32, first: u32, n: u32, own: u32) -> Result<u32> {
     Ok(sum)
 }
 
-fn size_section(g: &mut Guest, heap: &mut dyn Heap, h: u32, sec: u32, slot: u32, count: u32) -> Result<()> {
+fn size_section(
+    g: &mut Guest,
+    heap: &mut dyn Heap,
+    h: u32,
+    sec: u32,
+    slot: u32,
+    count: u32,
+) -> Result<()> {
     let add = |g: &mut Guest, off: u32, v: u32| -> Result<()> {
         let cur = g.u32(h + off)?;
         g.set_u32(h + off, cur.wrapping_add(v))
@@ -562,7 +584,14 @@ fn input_entry(g: &mut Guest, h: u32, key: u32) -> Result<u32> {
 /// `sub_8294DE10` (refs at `rec+8`) and `sub_8294DF08` (refs at `rec+24`, with an early exit when
 /// the reference array is full): expand a record's references over the referenced slot's
 /// instances into host+384, write the expanded count into `[rec+4]`'s top byte, return the start.
-fn expand_refs(g: &mut Guest, h: u32, rec: u32, j: u32, first: u32, full_check: bool) -> Result<u32> {
+fn expand_refs(
+    g: &mut Guest,
+    h: u32,
+    rec: u32,
+    j: u32,
+    first: u32,
+    full_check: bool,
+) -> Result<u32> {
     if full_check && rd(g, h + 216)? == rd(g, h + 212)? {
         return Ok(0);
     }
@@ -614,7 +643,10 @@ fn depth(g: &Guest, w: u32) -> Result<(Option<u32>, u32)> {
 
 /// The instance-independent key the A builder files its 16-byte constants under.
 fn product_key(w0: u32, data_word0: u32, index: u32) -> u32 {
-    ((((w0 as i32) >> 16) as u32) & 0xE000) | ((data_word0 << 8) & 0xFFFF_FF00) | (w0 & 0x0FFF_0000) | index
+    ((((w0 as i32) >> 16) as u32) & 0xE000)
+        | ((data_word0 << 8) & 0xFFFF_FF00)
+        | (w0 & 0x0FFF_0000)
+        | index
 }
 
 /// `sub_82951E00(inst)` — A records: one product per record, fed by an input entry.
@@ -631,7 +663,11 @@ fn build_products(g: &mut Guest, inst: u32) -> Result<()> {
         return Ok(());
     }
     let h = rd(g, inst + 4)?;
-    wr(g, inst + 8, rd(g, h + 400)?.wrapping_add(rd(g, h + 316)? << 3))?;
+    wr(
+        g,
+        inst + 8,
+        rd(g, h + 400)?.wrapping_add(rd(g, h + 316)? << 3),
+    )?;
     let mut rec = a + 16;
     let mut k = 0u32;
     loop {
@@ -700,7 +736,11 @@ fn build_lookups(g: &mut Guest, inst: u32) -> Result<()> {
         return Ok(());
     }
     let h = rd(g, inst + 4)?;
-    wr(g, inst + 20, rd(g, h + 416)?.wrapping_add(rd(g, h + 352)? << 3))?;
+    wr(
+        g,
+        inst + 20,
+        rd(g, h + 416)?.wrapping_add(rd(g, h + 352)? << 3),
+    )?;
     let one = rd(g, K_ONE)?;
     let mut rec = b + 16;
     let mut k = 0u32;
@@ -738,7 +778,11 @@ fn build_lookups(g: &mut Guest, inst: u32) -> Result<()> {
             store_single(g, st + 32 + 8 * i as u32, word_to_single(lo))?;
             store_single(g, st + 36 + 8 * i as u32, word_to_single(hi))?;
         }
-        wr(g, st + 4, 0x6000_0000 | ((j << 11) & 0x1FFF_F800) | (key & 0x1FFF_FFFF))?;
+        wr(
+            g,
+            st + 4,
+            0x6000_0000 | ((j << 11) & 0x1FFF_F800) | (key & 0x1FFF_FFFF),
+        )?;
         let c = rd(g, inst + 76)?.wrapping_add(1);
         wr(g, inst + 76, c)?;
         k += 1;
@@ -765,7 +809,11 @@ fn build_envelopes(g: &mut Guest, inst: u32) -> Result<()> {
         return Ok(());
     }
     let h = rd(g, inst + 4)?;
-    wr(g, inst + 24, rd(g, h + 404)?.wrapping_add(rd(g, h + 364)? << 3))?;
+    wr(
+        g,
+        inst + 24,
+        rd(g, h + 404)?.wrapping_add(rd(g, h + 364)? << 3),
+    )?;
     let zero = rd(g, K_ZERO)?;
     let mut rec = f + 16;
     let mut k = 0u32;
@@ -860,7 +908,11 @@ fn build_sums(g: &mut Guest, inst: u32) -> Result<()> {
         return Ok(());
     }
     let h = rd(g, inst + 4)?;
-    wr(g, inst + 12, rd(g, h + 436)?.wrapping_add(rd(g, h + 328)? << 3))?;
+    wr(
+        g,
+        inst + 12,
+        rd(g, h + 436)?.wrapping_add(rd(g, h + 328)? << 3),
+    )?;
     let mut rec = c + 16;
     let mut k = 0u32;
     loop {
@@ -917,7 +969,11 @@ fn build_outputs(g: &mut Guest, inst: u32) -> Result<()> {
     }
     let mut rec = e_tab + 16;
     let (mut prev, mut block_off, mut k) = (0u32, 0u32, 0u32);
-    wr(g, inst + 16, rd(g, h + 448)?.wrapping_add(rd(g, h + 340)? << 3))?;
+    wr(
+        g,
+        inst + 16,
+        rd(g, h + 448)?.wrapping_add(rd(g, h + 340)? << 3),
+    )?;
     loop {
         let j = rd(g, inst + 64)?;
         let (def, e, st) = if j != 0 {
@@ -1235,7 +1291,8 @@ fn expand_output_refs(g: &mut Guest, inst: u32) -> Result<()> {
 fn count_controllers(g: &mut Guest, heap: &mut dyn Heap, h: u32) -> Result<()> {
     let n_e = rdi(g, h + 476)?.max(0) as u32;
     let e_arr = rd(g, h + 448)?;
-    let e_key = |g: &Guest, i: u32| -> Result<u32> { Ok(g.u32(g.u32(e_arr + 8 * i + 4)?)? & KEY_MASK) };
+    let e_key =
+        |g: &Guest, i: u32| -> Result<u32> { Ok(g.u32(g.u32(e_arr + 8 * i + 4)?)? & KEY_MASK) };
     let n_in = rdi(g, h + H::INPUT_CAP)?.max(0) as u32;
     let inputs = rd(g, h + 388)?;
     let in_key = |g: &Guest, i: u32| -> Result<u32> { Ok(g.u32(inputs + 16 * i)? & KEY_MASK) };
@@ -1244,10 +1301,13 @@ fn count_controllers(g: &mut Guest, heap: &mut dyn Heap, h: u32) -> Result<()> {
     let ref_key = |g: &Guest, i: u32| -> Result<u32> { Ok(g.u32(refs + 4 * i)? & KEY_MASK) };
     let n_b = rdi(g, h + 468)?.max(0) as u32;
     let b_arr = rd(g, h + 416)?;
-    let b_key = |g: &Guest, i: u32| -> Result<u32> { Ok(g.u32(g.u32(b_arr + 8 * i + 4)?)? & KEY_MASK) };
+    let b_key =
+        |g: &Guest, i: u32| -> Result<u32> { Ok(g.u32(g.u32(b_arr + 8 * i + 4)?)? & KEY_MASK) };
     let n_f = rdi(g, h + 480)?.max(0) as u32;
     let f_arr = rd(g, h + 404)?;
-    let f_key = |g: &Guest, i: u32| -> Result<u32> { Ok(g.u32(g.u32(f_arr + 8 * i + 4)? + 16)? & KEY_MASK) };
+    let f_key = |g: &Guest, i: u32| -> Result<u32> {
+        Ok(g.u32(g.u32(f_arr + 8 * i + 4)? + 16)? & KEY_MASK)
+    };
     let any = |g: &Guest, n: u32, f: &dyn Fn(&Guest, u32) -> Result<u32>, k: u32| -> Result<bool> {
         for m in 0..n {
             if f(g, m)? == k {
@@ -1272,9 +1332,7 @@ fn count_controllers(g: &mut Guest, heap: &mut dyn Heap, h: u32) -> Result<()> {
     for i in 0..n_in {
         let raw = g.u32(inputs + 16 * i)?;
         let k = raw & KEY_MASK;
-        if controller_top(raw & 0xE000_0000)
-            && !any(g, i, &in_key, k)?
-            && !any(g, n_e, &e_key, k)?
+        if controller_top(raw & 0xE000_0000) && !any(g, i, &in_key, k)? && !any(g, n_e, &e_key, k)?
         {
             classify(raw & 0xE000_0000);
         }
@@ -1344,7 +1402,13 @@ fn count_controllers(g: &mut Guest, heap: &mut dyn Heap, h: u32) -> Result<()> {
 
 /// `sub_8294CB48(host, key, block)` — find the controller for a key or take the next free one; set
 /// its output block if it has none, and hand a new one to the manager (vfunc 4). Always 1.
-pub fn find_or_create_output(g: &mut Guest, listener: &mut dyn Listener, h: u32, key: u32, block: u32) -> Result<u32> {
+pub fn find_or_create_output(
+    g: &mut Guest,
+    listener: &mut dyn Listener,
+    h: u32,
+    key: u32,
+    block: u32,
+) -> Result<u32> {
     let k = key & KEY_MASK;
     let count = rd(g, h + H::CTRL_COUNT)?;
     let ptrs = rd(g, h + H::CTRL_PTRS)?;
@@ -1399,7 +1463,14 @@ fn keyed_entry(g: &Guest, obj: u32, idx: u32, count: u32, array: u32) -> Result<
 /// | `100` B lookup | `r6`: the entry itself; `r5`: `st+12` (mB); else `st+16` (linear) |
 /// | `101` F envelope | `r5`: `st+24`; else `st+28` |
 /// | other | [`NULL_INPUT`] |
-pub fn resolve(g: &mut Guest, listener: &mut dyn Listener, h: u32, key: u32, r5: u32, r6: u32) -> Result<u32> {
+pub fn resolve(
+    g: &mut Guest,
+    listener: &mut dyn Listener,
+    h: u32,
+    key: u32,
+    r5: u32,
+    r6: u32,
+) -> Result<u32> {
     let top = key & 0xE000_0000;
     let idx = key & 0xFF;
     match top {
@@ -1530,7 +1601,11 @@ fn resolve_all(g: &mut Guest, listener: &mut dyn Listener, h: u32) -> Result<()>
             rd(g, rec + 20)? & 0xFFF,
         ];
         for (n, v) in fields.into_iter().enumerate() {
-            store_single(g, st + 32 + 4 * n as u32, mul_single(word_to_single(v), scale))?;
+            store_single(
+                g,
+                st + 32 + 4 * n as u32,
+                mul_single(word_to_single(v), scale),
+            )?;
         }
         i += 1;
     }
@@ -1581,9 +1656,25 @@ pub fn check_capacities(g: &Guest, h: u32) -> Result<Vec<(&'static str, u32, u32
         ("output states 444", rd(g, h + 476)?, rd(g, h + 348)?),
         ("sum references 520", rd(g, h + 496)?, rd(g, h + 548)?),
         ("output references 516", rd(g, h + 488)?, rd(g, h + 544)?),
-        ("output blocks 376 (×16 words)", rd(g, h + 504)? * 16, rd(g, h + 552)?),
-        ("block pool 380", POOL_CAPACITY.with(|c| c.get()), rd(g, h + 188)?),
-        ("controllers 164", rd(g, h + H::CTRL_CAP)?, rd(g, h + H::CTRL_COUNT)?),
-        ("instances 156", rd(g, h + H::INSTANCES_TOTAL)? * 96, rd(g, h + 524)?),
+        (
+            "output blocks 376 (×16 words)",
+            rd(g, h + 504)? * 16,
+            rd(g, h + 552)?,
+        ),
+        (
+            "block pool 380",
+            POOL_CAPACITY.with(|c| c.get()),
+            rd(g, h + 188)?,
+        ),
+        (
+            "controllers 164",
+            rd(g, h + H::CTRL_CAP)?,
+            rd(g, h + H::CTRL_COUNT)?,
+        ),
+        (
+            "instances 156",
+            rd(g, h + H::INSTANCES_TOTAL)? * 96,
+            rd(g, h + 524)?,
+        ),
     ])
 }

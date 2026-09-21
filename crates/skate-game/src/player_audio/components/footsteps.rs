@@ -29,9 +29,9 @@
 
 use skate_data::collections::Collections;
 
+use super::super::audio_state::AudioState;
 use super::words::fctiwz;
 use super::{Component, Controls, Tick, post, redeliver};
-use super::super::audio_state::AudioState;
 
 /// The patch object both packets post to.
 pub(crate) const OBJECT: &str = "playercharacter_footstep";
@@ -136,7 +136,10 @@ impl FootstepTuning {
             .map_err(|_| format!("footstep gains {GAINS} need 6 elements"))?;
         let surfaces = array_words(vault, SURFACE_CLASS, SURFACE_KEY, SURFACE_FIELD, 72)?;
         if surfaces.len() < 95 {
-            return Err(format!("AudioSurfaceMap has {} entries, need 95", surfaces.len()));
+            return Err(format!(
+                "AudioSurfaceMap has {} entries, need 95",
+                surfaces.len()
+            ));
         }
         Ok(Self {
             speed_curve: Curve::from_vault(vault, SPEED_CURVE)?,
@@ -151,7 +154,11 @@ impl FootstepTuning {
     /// `sub_82494F58`: entry `material` if 0..=93, else entry 94; field `+24`.
     pub(crate) fn surface_step(&self, material: u32) -> u32 {
         let material = material as i32;
-        let index = if (0..94).contains(&material) { material as usize } else { 94 };
+        let index = if (0..94).contains(&material) {
+            material as usize
+        } else {
+            94
+        };
         self.surface_step[index]
     }
 }
@@ -178,9 +185,7 @@ fn array_words(
                 return Err(format!("{name}: element of {} hex digits", hex.len()));
             }
             (0..element_size / 4)
-                .map(|i| {
-                    u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).map_err(|e| e.to_string())
-                })
+                .map(|i| u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).map_err(|e| e.to_string()))
                 .collect()
         })
         .collect()
@@ -392,10 +397,26 @@ impl FootstepOwner {
         let footplant_ended = !footplant && self.footplant_prev_460;
 
         self.speed_408 = fctiwz(tuning.speed_curve.evaluate(state.com_speed_212));
-        self.horizontal_416 = fctiwz(tuning.foot_speed_curve.evaluate(state.foot_world_speed_xz_284));
-        self.horizontal_412 = fctiwz(tuning.foot_speed_curve.evaluate(state.foot_world_speed_xz_288));
-        self.vertical_424 = fctiwz(tuning.foot_vertical_curve.evaluate(state.foot_vertical_speed_292));
-        self.vertical_420 = fctiwz(tuning.foot_vertical_curve.evaluate(state.foot_vertical_speed_296));
+        self.horizontal_416 = fctiwz(
+            tuning
+                .foot_speed_curve
+                .evaluate(state.foot_world_speed_xz_284),
+        );
+        self.horizontal_412 = fctiwz(
+            tuning
+                .foot_speed_curve
+                .evaluate(state.foot_world_speed_xz_288),
+        );
+        self.vertical_424 = fctiwz(
+            tuning
+                .foot_vertical_curve
+                .evaluate(state.foot_vertical_speed_292),
+        );
+        self.vertical_420 = fctiwz(
+            tuning
+                .foot_vertical_curve
+                .evaluate(state.foot_vertical_speed_296),
+        );
 
         self.down_52 = state.foot_down_right_724;
         self.down_236 = state.foot_down_left_725;
@@ -515,7 +536,8 @@ impl Footsteps {
 
 impl Component for Footsteps {
     fn process(&mut self, tick: &mut Tick) -> Result<(), String> {
-        self.owner_inputs.push((0, if tick.audio.walking_716 { 32_767 } else { 0 }));
+        self.owner_inputs
+            .push((0, if tick.audio.walking_716 { 32_767 } else { 0 }));
         let Some(state) = FootstepInputs::from_state(tick.audio) else {
             return Ok(());
         };
@@ -540,7 +562,12 @@ impl Component for Footsteps {
         };
         for (foot, handle) in [(0, a), (1, b)] {
             let update = self.owner.foot(foot);
-            update_words(&mut self.packets[foot], &update, tick.controls, &self.tuning);
+            update_words(
+                &mut self.packets[foot],
+                &update,
+                tick.controls,
+                &self.tuning,
+            );
             redeliver(tick.runtime, handle, &self.packets[foot])?;
         }
         Ok(())
@@ -644,7 +671,12 @@ mod tests {
         // Exactly on an interior point: the next segment's start.
         assert_eq!(t.speed_curve.evaluate(2.0), 205.0);
         // A zero-width segment returns the right point's y.
-        let step = Curve { xs: [0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0], ys: [0.0; 16] };
+        let step = Curve {
+            xs: [
+                0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+            ],
+            ys: [0.0; 16],
+        };
         assert_eq!(step.evaluate(0.5), 0.0);
     }
 
@@ -728,8 +760,8 @@ mod tests {
         };
         update_words(&mut packet, &foot, &controls, &t);
         let retail = [
-            0x7FFF, 0xFF8F, 0xFF6, 0, 0x618B, 0x4D, 0x291, 0xD33, 0, 2, 0x1E4, 0, 1, 1, 0x73, 1,
-            1, 1, 0x7FFF, 0x2710, 0x3A98, 0x61A8, 0x7FFF, 0x6D60, 0xC,
+            0x7FFF, 0xFF8F, 0xFF6, 0, 0x618B, 0x4D, 0x291, 0xD33, 0, 2, 0x1E4, 0, 1, 1, 0x73, 1, 1,
+            1, 0x7FFF, 0x2710, 0x3A98, 0x61A8, 0x7FFF, 0x6D60, 0xC,
         ];
         assert_eq!(packet[..16], retail[..16]);
         assert_eq!(packet[17..], retail[17..]);
@@ -763,17 +795,27 @@ mod tests {
         }
 
         pub(super) fn run() {
-            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.local/captures/extract");
-            let assets = PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+            let root =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.local/captures/extract");
+            let assets =
+                PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
             let vault = Collections::load(&assets).expect("vault");
             let tuning = FootstepTuning::from_vault(&vault).expect("tuning");
             let mut states: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-            for line in std::fs::read_to_string(root.join("state.tsv")).unwrap().lines() {
+            for line in std::fs::read_to_string(root.join("state.tsv"))
+                .unwrap()
+                .lines()
+            {
                 let p: Vec<&str> = line.split('\t').collect();
-                let words = p[2..].iter().map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
+                let words = p[2..]
+                    .iter()
+                    .map(|w| u32::from_str_radix(w, 16).unwrap())
+                    .collect();
                 states.insert(p[0].parse().unwrap(), words);
             }
-            let rows = std::fs::read_to_string(root.join("attributed/playercharacter_footstep.tsv")).unwrap();
+            let rows =
+                std::fs::read_to_string(root.join("attributed/playercharacter_footstep.tsv"))
+                    .unwrap();
             let mut owner = FootstepOwner::default();
             let mut packets = [constructor_words(tuning.eq_chain); 2];
             let (mut total, mut exact) = ([0u32; WORDS], [0u32; WORDS]);
@@ -791,8 +833,15 @@ mod tests {
                     "PO" => {
                         if p[4] == "40C93724" || p[4] == "40C93924" {
                             posts += 1;
-                            let words: Vec<u32> = p[5].split(' ').map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
-                            assert_eq!(words[..WORDS], constructor_words(tuning.eq_chain), "post frame {frame}");
+                            let words: Vec<u32> = p[5]
+                                .split(' ')
+                                .map(|w| u32::from_str_radix(w, 16).unwrap())
+                                .collect();
+                            assert_eq!(
+                                words[..WORDS],
+                                constructor_words(tuning.eq_chain),
+                                "post frame {frame}"
+                            );
                         }
                         continue;
                     }
@@ -807,7 +856,9 @@ mod tests {
                     "40C93924" => 1,
                     _ => continue,
                 };
-                let Some(state) = states.get(&(frame - 1)) else { continue };
+                let Some(state) = states.get(&(frame - 1)) else {
+                    continue;
+                };
                 if foot == 0 {
                     // +100 (COM velocity y) is below the dump, so the jump-voice latch cannot be
                     // replayed; the replay drops it from word 11 and counts the rows it alone
@@ -820,13 +871,19 @@ mod tests {
                     .filter(|r| !r.is_empty())
                     .map(|r| {
                         let f: Vec<&str> = r.split(':').collect();
-                        ((f[0].parse().unwrap(), f[1].parse().unwrap()), u32::from_str_radix(f[2], 16).unwrap())
+                        (
+                            (f[0].parse().unwrap(), f[1].parse().unwrap()),
+                            u32::from_str_radix(f[2], 16).unwrap(),
+                        )
                     })
                     .collect();
                 let mut update = owner.foot(foot);
                 update.jump_voice = false;
                 update_words(&mut packets[foot], &update, &Reads(reads), &tuning);
-                let retail: Vec<u32> = p[5].split(' ').map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
+                let retail: Vec<u32> = p[5]
+                    .split(' ')
+                    .map(|w| u32::from_str_radix(w, 16).unwrap())
+                    .collect();
                 for i in 0..WORDS {
                     total[i] += 1;
                     if packets[foot][i] == retail[i] {
@@ -837,7 +894,10 @@ mod tests {
                             continue;
                         }
                         if bad[i].len() < 6 {
-                            bad[i].push(format!("f{frame}/{foot}: ours {} retail {}", packets[foot][i], retail[i]));
+                            bad[i].push(format!(
+                                "f{frame}/{foot}: ours {} retail {}",
+                                packets[foot][i], retail[i]
+                            ));
                         }
                     }
                 }
@@ -846,7 +906,9 @@ mod tests {
             for i in 0..WORDS {
                 println!("w{i:2}: {}/{} exact {:?}", exact[i], total[i], bad[i]);
             }
-            println!("w11 mismatches where retail=1 without a countdown (jump voice +444): {w11_voice_only}");
+            println!(
+                "w11 mismatches where retail=1 without a countdown (jump voice +444): {w11_voice_only}"
+            );
         }
     }
 }

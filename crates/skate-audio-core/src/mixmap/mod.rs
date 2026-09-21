@@ -133,7 +133,12 @@ pub const MANAGER_VTABLE: u32 = 0x822F_BEC8;
 /// `sub_82484FE8`'s MixMap half: allocate the manager object (the 32 bytes of `sys+4` the MixMap
 /// uses: vtable, `+4` mode = −1 as `sub_824845B8` leaves it, `+8` X, `+28` Y), init it with 14 slots,
 /// copy the file into a 16-byte aligned guest buffer, build.
-pub fn load(g: &mut Guest, heap: &mut dyn Heap, listener: &mut dyn Listener, file: &[u8]) -> Result<MixMap> {
+pub fn load(
+    g: &mut Guest,
+    heap: &mut dyn Heap,
+    listener: &mut dyn Listener,
+    file: &[u8],
+) -> Result<MixMap> {
     let manager = heap.alloc(g, 32, 16)?;
     if manager == 0 {
         return Err(Error::new(0, "guest heap exhausted (manager)"));
@@ -150,7 +155,11 @@ pub fn load(g: &mut Guest, heap: &mut dyn Heap, listener: &mut dyn Listener, fil
     }
     g.set_span(data, file)?;
     let host = build::build_host(g, heap, listener, manager, data)?;
-    Ok(MixMap { manager, host, data })
+    Ok(MixMap {
+        manager,
+        host,
+        data,
+    })
 }
 
 /// `sub_8294BAE8(mgr, dt)` — the manager's per-frame tick: the Y object (`sub_8294BF40`, inert
@@ -159,7 +168,10 @@ pub fn load(g: &mut Guest, heap: &mut dyn Heap, listener: &mut dyn Listener, fil
 pub fn tick(g: &mut Guest, manager: u32, dt: f64) -> Result<()> {
     let y = g.u32(manager + 28)?;
     if y != 0 && g.u32(y + 4)? == 2 {
-        return Err(Error::new(0x8294_BF40, "MixMap Y object in state 2: not ported"));
+        return Err(Error::new(
+            0x8294_BF40,
+            "MixMap Y object in state 2: not ported",
+        ));
     }
     let x = g.u32(manager + 8)?;
     if x == 0 || g.u8(x + 112)? == 0 {

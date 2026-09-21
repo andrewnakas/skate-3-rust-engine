@@ -26,7 +26,10 @@ fn image(dir: &Path) -> Vec<Segment> {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         if let Some(hex) = name.strip_prefix("g_").and_then(|s| s.strip_suffix(".bin")) {
             let page = u32::from_str_radix(hex, 16).unwrap();
-            segs.push(Segment { base: page << 16, bytes: std::fs::read(&path).unwrap() });
+            segs.push(Segment {
+                base: page << 16,
+                bytes: std::fs::read(&path).unwrap(),
+            });
         }
     }
     segs
@@ -78,14 +81,24 @@ fn preroll(g: &mut Guest, manager: u32, ctrls: &[(u32, u32)], bytes: &[u8], fram
 }
 
 fn main() {
-    let assets = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_ASSETS));
-    let file = std::fs::read(assets.join("private/stock/data/audio/MixMapSK8.mxb")).expect("MixMapSK8.mxb");
+    let assets = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ASSETS));
+    let file = std::fs::read(assets.join("private/stock/data/audio/MixMapSK8.mxb"))
+        .expect("MixMapSK8.mxb");
     let mut segs = image(&assets.join("private/stock/audio-runtime-image"));
     const HEAP: u32 = 0x4000_0000;
     const HEAP_LEN: u32 = 0x0080_0000;
-    segs.push(Segment { base: HEAP, bytes: vec![0; HEAP_LEN as usize] });
+    segs.push(Segment {
+        base: HEAP,
+        bytes: vec![0; HEAP_LEN as usize],
+    });
     let mut g = Guest::from_segments(segs);
-    let mut heap = BumpHeap { next: HEAP, end: HEAP + HEAP_LEN };
+    let mut heap = BumpHeap {
+        next: HEAP,
+        end: HEAP + HEAP_LEN,
+    };
     let mut listener = KeyedListener::retail();
     let mm = mixmap::load(&mut g, &mut heap, &mut listener, &file).expect("build");
     let ctrl = mixmap::find_controller(&g, mm.host, CONTACTS_KEY)
@@ -106,8 +119,13 @@ fn main() {
     for probe_input in [2u32, 1, 6] {
         let mut seen: Vec<(u32, Vec<(u32, u32, u32, u32)>)> = Vec::new();
         for value in [0u32, 16_000, 32_767] {
-            controller::set(&mut g, ctrl, 1, if probe_input == 1 { value } else { 32_767 })
-                .expect("set 1");
+            controller::set(
+                &mut g,
+                ctrl,
+                1,
+                if probe_input == 1 { value } else { 32_767 },
+            )
+            .expect("set 1");
             controller::set(&mut g, ctrl, probe_input, value).expect("set probe");
             seen.push((value, sample(&mut g, mm.host, ctrl)));
         }

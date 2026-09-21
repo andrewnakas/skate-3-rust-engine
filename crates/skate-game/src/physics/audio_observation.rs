@@ -44,7 +44,11 @@ fn speed(value: Vector3) -> f32 {
 }
 
 fn raw_vector(raw: [u32; 4]) -> [f32; 3] {
-    [f32::from_bits(raw[0]), f32::from_bits(raw[1]), f32::from_bits(raw[2])]
+    [
+        f32::from_bits(raw[0]),
+        f32::from_bits(raw[1]),
+        f32::from_bits(raw[2]),
+    ]
 }
 
 fn triple(raw: [u32; 4]) -> [f32; 3] {
@@ -286,7 +290,10 @@ fn retail_inputs(
         ],
         foot_local_velocity: feet.local_velocity.map(|v| [v[0], v[1], v[2]]),
         foot_world_velocity: feet.world_velocity.map(|v| [v[0], v[1], v[2]]),
-        wheel_contacts: physical.collision.wheel_contact_3296_3299.map(|flag| flag != 0),
+        wheel_contacts: physical
+            .collision
+            .wheel_contact_3296_3299
+            .map(|flag| flag != 0),
         truck_contacts: [
             ground.parts[BodyId::FrontTruck.index()].in_contact,
             ground.parts[BodyId::BackTruck.index()].in_contact,
@@ -329,7 +336,8 @@ fn retail_inputs(
         turn: skater.animation_input.fields.turn,
         jump_strength: skater.animation_input.extra.jump_strength,
         scorable_id: scorable_id(score.flags, trick),
-        ragdoll_spin: [23, 20, 16].map(|part| lanes(skeleton.bodies()[part].rates.angular_velocity)),
+        ragdoll_spin: [23, 20, 16]
+            .map(|part| lanes(skeleton.bodies()[part].rates.angular_velocity)),
         limb_speeds: limb_speeds(
             &skeleton.record.velocities,
             triple(physical.reckoning.vector_16),
@@ -400,8 +408,7 @@ pub(crate) fn publish(
         wheel_surface
     };
     let landing_quality = skater.landing_quality;
-    let (landing_clean, landing_sketchy) =
-        skater.scoring.classify_landing_audio(landing_quality);
+    let (landing_clean, landing_sketchy) = skater.scoring.classify_landing_audio(landing_quality);
     let observation = crate::skate_audio::PlayerAudioObservation {
         tick: output.tick,
         state,
@@ -564,9 +571,21 @@ mod tests {
             ..Default::default()
         };
         // KnownAir keeps the pair it published itself.
-        assert_eq!(air_timing(AirTimingInputs { state: 201, ..inputs }), (0.25, 4.0));
+        assert_eq!(
+            air_timing(AirTimingInputs {
+                state: 201,
+                ..inputs
+            }),
+            (0.25, 4.0)
+        );
         // PhysicsAir with no prediction: only the timer changes.
-        assert_eq!(air_timing(AirTimingInputs { state: 200, ..inputs }), (0.5, 4.0));
+        assert_eq!(
+            air_timing(AirTimingInputs {
+                state: 200,
+                ..inputs
+            }),
+            (0.5, 4.0)
+        );
         // A landing predicted 1.1 s after launch leaves 0.6 s from 0.5 s in.
         let (elapsed, remaining) = air_timing(AirTimingInputs {
             state: 202,
@@ -585,10 +604,19 @@ mod tests {
             (0.5, 4.0)
         );
         // BipedAir splits its own duration and remaining time; the sum stays the duration.
-        let (elapsed, remaining) = air_timing(AirTimingInputs { state: 501, ..inputs });
+        let (elapsed, remaining) = air_timing(AirTimingInputs {
+            state: 501,
+            ..inputs
+        });
         assert!((elapsed - 0.5).abs() < 1e-6 && remaining == 0.3);
         assert!((elapsed + remaining - 0.8).abs() < 1e-6);
         // On the ground the published pair stands.
-        assert_eq!(air_timing(AirTimingInputs { state: 100, ..inputs }), (0.25, 4.0));
+        assert_eq!(
+            air_timing(AirTimingInputs {
+                state: 100,
+                ..inputs
+            }),
+            (0.25, 4.0)
+        );
     }
 }

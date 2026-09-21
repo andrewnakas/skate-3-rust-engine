@@ -144,12 +144,20 @@ pub(crate) struct ContactMessage {
 impl ContactMessage {
     /// The material of voice record `i`, as `sub_824D1F68` indexes them (`msg+0`, `msg+4`).
     pub(crate) fn material(&self, record: usize) -> i32 {
-        if record == 0 { self.material_a } else { self.material_b }
+        if record == 0 {
+            self.material_a
+        } else {
+            self.material_b
+        }
     }
 
     /// The tier of voice record `i` (`msg+8`, `msg+12`).
     pub(crate) fn tier(&self, record: usize) -> i32 {
-        if record == 0 { self.tier_a } else { self.tier_b }
+        if record == 0 {
+            self.tier_a
+        } else {
+            self.tier_b
+        }
     }
 }
 
@@ -273,7 +281,9 @@ impl CollisionMaterials {
             for (class, (low, high)) in row.iter().enumerate() {
                 let read = |name: &str| -> Option<i32> {
                     let field = vault.field(LEVEL_CLASS, &key, name).ok()?;
-                    u32::from_str_radix(field.data.trim(), 16).ok().map(|v| v as i32)
+                    u32::from_str_radix(field.data.trim(), 16)
+                        .ok()
+                        .map(|v| v as i32)
                 };
                 if let (Some(low), Some(high)) = (read(low), read(high)) {
                     pairs[tier][class] = (low, high);
@@ -329,7 +339,10 @@ impl CollisionMaterials {
     /// For tests and for callers that already know the table.
     #[cfg(test)]
     pub(crate) fn from_categories(category: [u8; MATERIAL_COUNT]) -> Self {
-        Self { category, entries: vec![MaterialEntry::default(); MATERIAL_COUNT] }
+        Self {
+            category,
+            entries: vec![MaterialEntry::default(); MATERIAL_COUNT],
+        }
     }
 
     /// `sub_824965D0` + `sub_824967F8`: what this material plays against `other` at `tier`.
@@ -350,7 +363,11 @@ impl CollisionMaterials {
         };
         // Retail leaves its output word at 0 when the field holds nothing, and the caller reads
         // that as "no voice".
-        (sample != 0).then_some(CollisionSample { bank: fields.bank, sample, level: entry.level })
+        (sample != 0).then_some(CollisionSample {
+            bank: fields.bank,
+            sample,
+            level: entry.level,
+        })
     }
 
     /// `sub_82497910`: the paired material's class, `0..=2`. Materials 95..=113 answer from
@@ -434,8 +451,16 @@ struct KindFields {
 const COLLISION_FIELDS: KindFields = KindFields {
     bank: skate_data::audio::splice::COLLISIONS_BANK,
     tier_two: "Hash_9203DF6FD029B377",
-    tier_zero: ["Hash_BFABF634D2B1E45A", "Hash_9ABFC64574AB2F9F", "Hash_BCD5E888294F7B15"],
-    tier_other: ["Hash_EF9BD81F9CFF725F", "Hash_A3ADCA7B19287B5D", "Hash_C676C87F862C0490"],
+    tier_zero: [
+        "Hash_BFABF634D2B1E45A",
+        "Hash_9ABFC64574AB2F9F",
+        "Hash_BCD5E888294F7B15",
+    ],
+    tier_other: [
+        "Hash_EF9BD81F9CFF725F",
+        "Hash_A3ADCA7B19287B5D",
+        "Hash_C676C87F862C0490",
+    ],
 };
 
 /// Kind 1 — the `Skate_Metal` fields, offsets `+92`, `+80`/`+88`/`+100`, `+76`/`+84`/`+96`. This is
@@ -443,8 +468,16 @@ const COLLISION_FIELDS: KindFields = KindFields {
 const METAL_FIELDS: KindFields = KindFields {
     bank: METAL_BANK,
     tier_two: "Hash_F54277A83E0170FD",
-    tier_zero: ["Hash_66A95889604DED36", "Hash_595537EBA0196BE7", "Hash_79DD0E6659793D0E"],
-    tier_other: ["Hash_B722B88FE44B046E", "Hash_1411108A7E9CC74A", "Hash_50796F92F3DE449B"],
+    tier_zero: [
+        "Hash_66A95889604DED36",
+        "Hash_595537EBA0196BE7",
+        "Hash_79DD0E6659793D0E",
+    ],
+    tier_other: [
+        "Hash_B722B88FE44B046E",
+        "Hash_1411108A7E9CC74A",
+        "Hash_50796F92F3DE449B",
+    ],
 };
 
 /// Kind 2 — the `HOM_Set_1` fields, materials 102..=106.
@@ -457,7 +490,11 @@ const HOM_FIELDS: KindFields = KindFields {
     bank: HOM_BANK,
     tier_two: "Hash_3EA2579C2F3BB23B",
     tier_zero: ["", "Hash_2A2830137430BB02", "Hash_79BDE00B04DF51B9"],
-    tier_other: ["Hash_5432B35224E4B1C1", "Hash_3FCBE0407F833721", "Hash_53311C6761F135A1"],
+    tier_other: [
+        "Hash_5432B35224E4B1C1",
+        "Hash_3FCBE0407F833721",
+        "Hash_53311C6761F135A1",
+    ],
 };
 
 /// The two banks beside `Skate_Collisions.bnk` the collision materials name. Both are in a stock
@@ -576,7 +613,11 @@ impl CollisionStates {
 
     /// `sub_82486EF0`'s two hops: route to the least recently used slot, evict what it was
     /// holding, then stamp, park and activate. Returns the slot the message landed on.
-    pub(crate) fn post(&mut self, message: ContactMessage, materials: &CollisionMaterials) -> usize {
+    pub(crate) fn post(
+        &mut self,
+        message: ContactMessage,
+        materials: &CollisionMaterials,
+    ) -> usize {
         // `sub_824F1818` walks from the head and keeps a node only when it is *strictly* lower,
         // so the first slot at the minimum wins a tie — which is what `min_by_key` does too.
         let slot = (0..SLOT_COUNT)
@@ -632,9 +673,15 @@ impl CollisionStates {
             if !slot.active || !slot.started.iter().any(|started| *started) {
                 continue;
             }
-            let Some(message) = slot.message else { continue };
+            let Some(message) = slot.message else {
+                continue;
+            };
             writes.push((key, GATE_INPUT, FULL_SCALE));
-            writes.push((key, WEIGHT_INPUT, contact_weight(message.tier_a, message.tier_b)));
+            writes.push((
+                key,
+                WEIGHT_INPUT,
+                contact_weight(message.tier_a, message.tier_b),
+            ));
         }
         writes
     }
@@ -655,7 +702,13 @@ mod tests {
     }
 
     fn message(material_a: i32, material_b: i32, tier_a: i32, tier_b: i32) -> ContactMessage {
-        ContactMessage { material_a, material_b, tier_a, tier_b, ..ContactMessage::default() }
+        ContactMessage {
+            material_a,
+            material_b,
+            tier_a,
+            tier_b,
+            ..ContactMessage::default()
+        }
     }
 
     #[test]
@@ -760,16 +813,31 @@ mod tests {
         let writes = states.drive();
         let key = controller_key(slot);
         // Every slot is zeroed first, live or not.
-        assert_eq!(writes.iter().filter(|(_, id, v)| *id == GATE_INPUT && *v == 0).count(), SLOT_COUNT);
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(_, id, v)| *id == GATE_INPUT && *v == 0)
+                .count(),
+            SLOT_COUNT
+        );
         // The live slot then raises the gate and the weight, in that order, after its own zeroes.
         let mine: Vec<_> = writes.iter().filter(|(k, ..)| *k == key).copied().collect();
         assert_eq!(
             mine,
-            vec![(key, GATE_INPUT, 0), (key, WEIGHT_INPUT, 0), (key, GATE_INPUT, FULL_SCALE), (key, WEIGHT_INPUT, 20_000)]
+            vec![
+                (key, GATE_INPUT, 0),
+                (key, WEIGHT_INPUT, 0),
+                (key, GATE_INPUT, FULL_SCALE),
+                (key, WEIGHT_INPUT, 20_000)
+            ]
         );
         // A slot nobody posted to is left at zero.
         let idle = controller_key(SLOT_COUNT - 1);
-        let theirs: Vec<_> = writes.iter().filter(|(k, ..)| *k == idle).copied().collect();
+        let theirs: Vec<_> = writes
+            .iter()
+            .filter(|(k, ..)| *k == idle)
+            .copied()
+            .collect();
         assert_eq!(theirs, vec![(idle, GATE_INPUT, 0), (idle, WEIGHT_INPUT, 0)]);
     }
 
@@ -781,16 +849,18 @@ mod tests {
     #[test]
     #[ignore = "needs the owner's assets"]
     fn the_vault_resolves_every_material_category() {
-        let assets = std::path::Path::new(
-            "C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets",
-        );
+        let assets =
+            std::path::Path::new("C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets");
         let vault = Collections::load(assets).expect("vault");
         let (materials, unresolved) = CollisionMaterials::load(&vault);
         // Exactly one material has no record: 94, whose key is all zeroes and whose sound id is
         // the table's only `-1`. (A JSON export of the vault appears to be missing five further
         // records — 77, 87, 92, 97, 98 — but the vault itself has them, which is why this test
         // reads the vault and not the export.)
-        assert_eq!(unresolved, 1, "unexpected number of materials without a vault record");
+        assert_eq!(
+            unresolved, 1,
+            "unexpected number of materials without a vault record"
+        );
         assert_eq!(materials.kind(94), -1);
         let mut seen = [0usize; 10];
         for material in 0..MATERIAL_COUNT as i32 {
@@ -799,7 +869,10 @@ mod tests {
             seen[category as usize] += 1;
         }
         // Every category is used, so the whole jump table is reachable from real data.
-        assert!(seen.iter().all(|count| *count > 0), "unused categories: {seen:?}");
+        assert!(
+            seen.iter().all(|count| *count > 0),
+            "unused categories: {seen:?}"
+        );
         println!("category histogram {seen:?}, {unresolved} materials without a record");
     }
 
@@ -810,9 +883,8 @@ mod tests {
     #[test]
     #[ignore = "needs the owner's assets"]
     fn the_chooser_picks_real_samples_out_of_the_right_banks() {
-        let assets = std::path::Path::new(
-            "C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets",
-        );
+        let assets =
+            std::path::Path::new("C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets");
         let vault = Collections::load(assets).expect("vault");
         let (m, _) = CollisionMaterials::load(&vault);
         let surfaces = SurfaceMap::load(&vault).expect("surface map");
@@ -841,7 +913,10 @@ mod tests {
         // indexes with — otherwise the material would silently resolve to nothing.
         for material in 0..NO_MATERIAL {
             let class = m.other_class(material, &surfaces);
-            assert!((0..=2).contains(&class), "material {material} has paired class {class}");
+            assert!(
+                (0..=2).contains(&class),
+                "material {material} has paired class {class}"
+            );
         }
 
         // Every tier a real onset can produce, not just the one that happened to work.
@@ -853,8 +928,12 @@ mod tests {
                 println!("tier {tier} family {family_base}: {a:?} / {b:?}");
             }
         }
-        println!("other_class(10)={} other_class(95)={} other_class(96)={}",
-            m.other_class(10, &surfaces), m.other_class(95, &surfaces), m.other_class(96, &surfaces));
+        println!(
+            "other_class(10)={} other_class(95)={} other_class(96)={}",
+            m.other_class(10, &surfaces),
+            m.other_class(95, &surfaces),
+            m.other_class(96, &surfaces)
+        );
 
         // What a rail grind actually posts: family base 95/96 as one material, the grind material
         // (143 → 10) as the other, and the same tier on both.
@@ -881,9 +960,8 @@ mod tests {
     #[test]
     #[ignore = "needs the owner's assets"]
     fn the_landing_level_follows_the_air_time() {
-        let assets = std::path::Path::new(
-            "C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets",
-        );
+        let assets =
+            std::path::Path::new("C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets");
         let vault = Collections::load(assets).expect("vault");
         let (m, _) = CollisionMaterials::load(&vault);
         let surfaces = SurfaceMap::load(&vault).expect("surface map");
@@ -897,7 +975,11 @@ mod tests {
         let level = |surface: i32, air: f32| {
             let air = (air / divisor).clamp(0.0, 1.0);
             let tier = i32::from(air >= threshold);
-            let (lo, hi) = if tier == 0 { (0.0, threshold) } else { (threshold, ceiling) };
+            let (lo, hi) = if tier == 0 {
+                (0.0, threshold)
+            } else {
+                (threshold, ceiling)
+            };
             (
                 m.contact_level(surface, board, tier, lo, hi, air, &surfaces),
                 m.contact_level(board, surface, tier, lo, hi, air, &surfaces),
@@ -936,7 +1018,12 @@ mod tests {
         assert_eq!(states.slots()[slot].message, None);
         // And it stops driving its controller.
         let key = controller_key(slot);
-        let mine: Vec<_> = states.drive().iter().filter(|(k, ..)| *k == key).copied().collect();
+        let mine: Vec<_> = states
+            .drive()
+            .iter()
+            .filter(|(k, ..)| *k == key)
+            .copied()
+            .collect();
         assert_eq!(mine, vec![(key, GATE_INPUT, 0), (key, WEIGHT_INPUT, 0)]);
     }
 }

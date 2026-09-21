@@ -21,11 +21,15 @@ use skate_audio_core::authored::{
     AuthoredRuntime,
     oneshot::{OneshotBus, OneshotHandle, OneshotVoice, Rand},
 };
-use skate_data::audio::splice::{LandingTuning, PopsTuning, SpliceBanks, SpliceState, surface_category};
+use skate_data::audio::splice::{
+    LandingTuning, PopsTuning, SpliceBanks, SpliceState, surface_category,
+};
 use skate_data::collections::Collections;
 
 use super::audio_state::AudioState;
-use super::collision_states::{CollisionMaterials, CollisionSample, CollisionStates, ContactMessage};
+use super::collision_states::{
+    CollisionMaterials, CollisionSample, CollisionStates, ContactMessage,
+};
 use super::components::contacts::{ContactSound, ContactVoices, SurfaceMap, VoiceRequest};
 
 /// Contacts controller output 15 at landing class 2, measured from the real MixMap under the
@@ -163,7 +167,11 @@ impl ContactVoices for QueuedContactVoices {
     fn play(&mut self, sound: ContactSound, request: &VoiceRequest) -> Option<u32> {
         self.next += 1;
         let id = self.next;
-        self.queued.push(Queued { id, sound, request: *request });
+        self.queued.push(Queued {
+            id,
+            sound,
+            request: *request,
+        });
         Some(id)
     }
 
@@ -239,7 +247,10 @@ pub(crate) struct ContactVoicePlayer {
 }
 
 impl ContactVoicePlayer {
-    pub(crate) fn new(assets: &std::path::Path, cache: Option<&std::path::Path>) -> Result<Self, String> {
+    pub(crate) fn new(
+        assets: &std::path::Path,
+        cache: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
         let vault = Collections::load(assets)?;
         // `sub_82496FD0` resolves a material's category through the vault one lookup at a time;
         // doing all 143 once here is the same table. Only material 94 — the silent slot, whose
@@ -254,7 +265,9 @@ impl ContactVoicePlayer {
         // `sub_824BA630` reads all three off the Contacts tuning class; the defaults are the
         // values the owner's vault holds, used only if a field is missing.
         let tuning_float = |name: &str, fallback: f32| {
-            vault.float(CONTACTS_TUNING_CLASS, "default", name).unwrap_or(fallback)
+            vault
+                .float(CONTACTS_TUNING_CLASS, "default", name)
+                .unwrap_or(fallback)
         };
         let landing_material = vault
             .field(CONTACTS_TUNING_CLASS, "default", LANDING_MATERIAL_FIELD)
@@ -380,7 +393,10 @@ impl ContactVoicePlayer {
             }
             // A contact sound that cannot resolve or play must not take the whole player-sound
             // worker down with it: report it once and carry on with the rest of the mix.
-            let members = match self.banks.resolve(bank, sample, &mut self.state, &mut self.rand) {
+            let members = match self
+                .banks
+                .resolve(bank, sample, &mut self.state, &mut self.rand)
+            {
                 Ok(members) => members,
                 Err(error) => {
                     self.report(&format!("{bank} sample {sample:#x}: {error}"));
@@ -426,26 +442,38 @@ impl ContactVoicePlayer {
                     bus,
                 }) {
                     Ok(handle) => handles.push(handle),
-                    Err(error) => self.report(&format!("{bank} sample {sample:#x} member: {error}")),
+                    Err(error) => {
+                        self.report(&format!("{bank} sample {sample:#x} member: {error}"))
+                    }
                 }
             }
-            self.live.push(Live { id: play.id, handles });
+            self.live.push(Live {
+                id: play.id,
+                handles,
+            });
         }
         // `sub_824D1E00` runs on every `SFXObj_Collision` every frame, whether or not anything was
         // posted this one: it rewrites both inputs from zero and only then decides to raise them.
         for (key, id, value) in self.collision.drive() {
-            runtime.mixmap_apply(key, &[(id, value)]).map_err(|e| e.to_string())?;
+            runtime
+                .mixmap_apply(key, &[(id, value)])
+                .map_err(|e| e.to_string())?;
         }
         for live in &mut self.live {
             for handle in &mut live.handles {
-                runtime.tick_oneshot(handle, dt).map_err(|e| e.to_string())?;
+                runtime
+                    .tick_oneshot(handle, dt)
+                    .map_err(|e| e.to_string())?;
             }
         }
         // The collision voices own themselves: tick opens the delayed ones, and a voice that has
         // finished releases itself and drops out of the list.
         let mut still_live = Vec::with_capacity(self.collision_live.len());
         for mut handle in std::mem::take(&mut self.collision_live) {
-            if runtime.tick_oneshot(&mut handle, dt).map_err(|e| e.to_string())? {
+            if runtime
+                .tick_oneshot(&mut handle, dt)
+                .map_err(|e| e.to_string())?
+            {
                 still_live.push(handle);
             }
         }
@@ -491,10 +519,22 @@ impl ContactVoicePlayer {
             tier_a: tier,
             tier_b: tier,
             level_a: self.collision_materials.contact_level(
-                board, surface, tier, lo, hi, impact, &self.surfaces,
+                board,
+                surface,
+                tier,
+                lo,
+                hi,
+                impact,
+                &self.surfaces,
             ),
             level_b: self.collision_materials.contact_level(
-                surface, board, tier, lo, hi, impact, &self.surfaces,
+                surface,
+                board,
+                tier,
+                lo,
+                hi,
+                impact,
+                &self.surfaces,
             ),
             ..ContactMessage::default()
         };
@@ -516,17 +556,22 @@ impl ContactVoicePlayer {
             let other = self
                 .collision_materials
                 .other_class(message.material(1 - record), &self.surfaces);
-            let Some(sample) =
-                self.collision_materials
-                    .sample(message.material(record), other, message.tier(record))
-            else {
+            let Some(sample) = self.collision_materials.sample(
+                message.material(record),
+                other,
+                message.tier(record),
+            ) else {
                 self.report(&format!(
                     "GrindOnset record {record} material {} against class {other} resolved to no sample",
                     message.material(record)
                 ));
                 continue;
             };
-            let level = if record == 0 { message.level_a } else { message.level_b };
+            let level = if record == 0 {
+                message.level_a
+            } else {
+                message.level_b
+            };
             self.play_collision(runtime, &sample, level, 1.0, 1.0);
         }
         Ok(())
@@ -571,10 +616,22 @@ impl ContactVoicePlayer {
         // The argument order is retail's: the first call is `sub_82496C58(r4 = surface, r5 =
         // board)` and the second `(r4 = board, r5 = surface)`.
         let level_surface = self.collision_materials.contact_level(
-            surface, board, tier, lo, hi, weight, &self.surfaces,
+            surface,
+            board,
+            tier,
+            lo,
+            hi,
+            weight,
+            &self.surfaces,
         );
         let level_board = self.collision_materials.contact_level(
-            board, surface, tier, lo, hi, weight, &self.surfaces,
+            board,
+            surface,
+            tier,
+            lo,
+            hi,
+            weight,
+            &self.surfaces,
         );
         // Each level word then gets its own vault multiplier before it reaches the message
         // (`fmuls f10,f11,f0 ; fctiwz` at 0x824BAAC0 and 0x824BAB20): 0.65 for the first,
@@ -611,14 +668,19 @@ impl ContactVoicePlayer {
             let other = self
                 .collision_materials
                 .other_class(message.material(1 - record), &self.surfaces);
-            let Some(sample) =
-                self.collision_materials
-                    .sample(message.material(record), other, message.tier(record))
-            else {
+            let Some(sample) = self.collision_materials.sample(
+                message.material(record),
+                other,
+                message.tier(record),
+            ) else {
                 continue;
             };
             // `material_a` is the board, `material_b` the surface, matching the two levels.
-            let level = if record == 0 { message.level_a } else { message.level_b };
+            let level = if record == 0 {
+                message.level_a
+            } else {
+                message.level_b
+            };
             self.play_collision(runtime, &sample, level, 1.0, LANDING_TRIM);
         }
         Ok(())
@@ -639,13 +701,20 @@ impl ContactVoicePlayer {
         // onset — the grind's voice count did not change, so it keeps `CONTACT_TRIM` alone.
         trim: f32,
     ) {
-        let members = match self.banks.resolve(sample.bank, sample.sample, &mut self.state, &mut self.rand) {
-            Ok(members) => members,
-            Err(error) => {
-                self.report(&format!("{} sample {:#x}: {error}", sample.bank, sample.sample));
-                return;
-            }
-        };
+        let members =
+            match self
+                .banks
+                .resolve(sample.bank, sample.sample, &mut self.state, &mut self.rand)
+            {
+                Ok(members) => members,
+                Err(error) => {
+                    self.report(&format!(
+                        "{} sample {:#x}: {error}",
+                        sample.bank, sample.sample
+                    ));
+                    return;
+                }
+            };
         let Some(base) = runtime.bank_base(sample.bank) else {
             self.report(&format!("Splice bank {} is not installed", sample.bank));
             return;
@@ -686,7 +755,10 @@ impl ContactVoicePlayer {
                 // playing one never released.
                 Ok(handle) => self.collision_live.push(handle),
                 Err(error) => {
-                    self.report(&format!("{} sample {:#x} member: {error}", sample.bank, sample.sample));
+                    self.report(&format!(
+                        "{} sample {:#x} member: {error}",
+                        sample.bank, sample.sample
+                    ));
                 }
             }
         }
@@ -701,7 +773,11 @@ impl ContactVoicePlayer {
     }
 
     /// `sub_824B9CC8`'s and `sub_824BA630`'s sample choice.
-    fn selection(&self, play: &Queued, audio: &AudioState) -> Option<(&'static str, u16, OneshotBus)> {
+    fn selection(
+        &self,
+        play: &Queued,
+        audio: &AudioState,
+    ) -> Option<(&'static str, u16, OneshotBus)> {
         match play.sound {
             ContactSound::Pop if self.pops_enabled => {
                 let class = usize::try_from(play.request.selector.unwrap_or(0)).unwrap_or(0);
@@ -718,9 +794,11 @@ impl ContactVoicePlayer {
                 // Replaced with the owner send bus in `drain`.
                 Some((bank, sample, OneshotBus::EqChain(self.pops.bus)))
             }
-            ContactSound::Landing => {
-                Some((self.landing.bank(), self.landing.sample, OneshotBus::Default))
-            }
+            ContactSound::Landing => Some((
+                self.landing.bank(),
+                self.landing.sample,
+                OneshotBus::Default,
+            )),
             // `sub_824BA630` @ 0x824BAC50: the ladder voice's column is `sub_82494D78` of the
             // deck material — which is `AudioSurfaceMap` lane +8, the same lookup the pops use,
             // with retail's own clamp to element 94 for anything out of range. Retail takes
@@ -827,9 +905,16 @@ mod tests {
             landing_send_scale(Some(2)),
         );
         assert!(c0 < c1 && c1 < c2, "{c0} {c1} {c2}");
-        assert_eq!(c2, 1.0, "class 2 is the reference and keeps the measured level");
+        assert_eq!(
+            c2, 1.0,
+            "class 2 is the reference and keeps the measured level"
+        );
         // The real MixMap's spread, class 0 to class 2, is 3.0 dB.
-        assert!((db(c2) - db(c0) - 3.0).abs() < 0.1, "spread {} dB", db(c2) - db(c0));
+        assert!(
+            (db(c2) - db(c0) - 3.0).abs() < 0.1,
+            "spread {} dB",
+            db(c2) - db(c0)
+        );
         // An unknown class must not attenuate, and no class must ever mute the landing.
         assert_eq!(landing_send_scale(None), 1.0);
         assert!(landing_send_scale(Some(99)) >= super::LANDING_SEND_FLOOR);

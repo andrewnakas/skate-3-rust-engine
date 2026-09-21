@@ -35,8 +35,8 @@ use skate_data::collections::Collections;
 
 use super::super::audio_state::AudioState;
 use super::contacts::{clamp_word, vault_word};
-use super::words::{fctiwz, KMH_PER_MS, THOUSAND};
-use super::{post, redeliver, release, Component, Controls, Tick};
+use super::words::{KMH_PER_MS, THOUSAND, fctiwz};
+use super::{Component, Controls, Tick, post, redeliver, release};
 
 const TUNING_CLASS: &str = "Hash_6E878344774A7999";
 const DEFAULT_KEY: &str = "Hash_D7EDBD362D7D2152";
@@ -73,14 +73,27 @@ pub(crate) struct SpeedTuning {
 
 impl SpeedTuning {
     pub(crate) fn load(vault: &Collections) -> Result<Self, String> {
-        let int = |name: &str| vault.integer(TUNING_CLASS, DEFAULT_KEY, name).map(|v| v as i32);
+        let int = |name: &str| {
+            vault
+                .integer(TUNING_CLASS, DEFAULT_KEY, name)
+                .map(|v| v as i32)
+        };
         let float = |name: &str| vault.float(TUNING_CLASS, DEFAULT_KEY, name);
         Ok(Self {
             rattle_level: int("Hash_EB224272A924C135")?,
             wind_level: int("Hash_1BBA9174BD1B2D88")?,
-            rattle_kmh: [float("Hash_F57A74AFD22AD030")?, float("Hash_12275AA8AC4A63FB")?],
-            wind_kmh: [float("Hash_8B4DECD646B13210")?, float("Hash_73E9A42D88C51169")?],
-            bail_kmh: [float("Hash_3BDFAC298128131F")?, float("Hash_7BCB09DF227EDDAC")?],
+            rattle_kmh: [
+                float("Hash_F57A74AFD22AD030")?,
+                float("Hash_12275AA8AC4A63FB")?,
+            ],
+            wind_kmh: [
+                float("Hash_8B4DECD646B13210")?,
+                float("Hash_73E9A42D88C51169")?,
+            ],
+            bail_kmh: [
+                float("Hash_3BDFAC298128131F")?,
+                float("Hash_7BCB09DF227EDDAC")?,
+            ],
             wind_words: [
                 int("Hash_4381FEC9776F5EC9")?,
                 int("Hash_F7A8067CAE4C51D3")?,
@@ -95,7 +108,11 @@ impl SpeedTuning {
 
     /// The wind bounds: the bail pair while `+676`.
     fn wind_bounds(&self, audio: &AudioState) -> [f32; 2] {
-        if audio.bail_676 { self.bail_kmh } else { self.wind_kmh }
+        if audio.bail_676 {
+            self.bail_kmh
+        } else {
+            self.wind_kmh
+        }
     }
 }
 
@@ -143,22 +160,40 @@ pub(crate) fn wind_constructor(tuning: &SpeedTuning, intensity: i32) -> [u32; WI
 }
 
 /// `sub_824E7CB0`'s rattle rewrite.
-pub(crate) fn rattle_update(words: &mut [u32; RATTLE_WORDS], tuning: &SpeedTuning, audio: &AudioState, controls: &dyn Controls) {
+pub(crate) fn rattle_update(
+    words: &mut [u32; RATTLE_WORDS],
+    tuning: &SpeedTuning,
+    audio: &AudioState,
+    controls: &dyn Controls,
+) {
     words[0] = clamp_word(tuning.rattle_level, 0, 32_767);
     words[1] = clamp_word(controls.raw(0) as i32, 0, 0xFFFF);
     words[2] = clamp_word(controls.pitch(2), 0, 8_192);
     words[6] = 0;
     words[7] = clamp_word(controls.level(1) as i32, 0, 32_767);
-    words[3] = clamp_word(update_intensity(audio.ground_speed_208, tuning.rattle_kmh), 0, 1_000);
+    words[3] = clamp_word(
+        update_intensity(audio.ground_speed_208, tuning.rattle_kmh),
+        0,
+        1_000,
+    );
 }
 
 /// `sub_824E7CB0`'s wind rewrite (w1 keeps the constructor's 0).
-pub(crate) fn wind_update(words: &mut [u32; WIND_WORDS], tuning: &SpeedTuning, audio: &AudioState, controls: &dyn Controls) {
+pub(crate) fn wind_update(
+    words: &mut [u32; WIND_WORDS],
+    tuning: &SpeedTuning,
+    audio: &AudioState,
+    controls: &dyn Controls,
+) {
     words[0] = clamp_word(tuning.wind_level, 0, 32_767);
     words[2] = clamp_word(controls.pitch(3), 0, 8_192);
     words[6] = 0;
     words[7] = clamp_word(controls.level(4) as i32, 0, 32_767);
-    words[3] = clamp_word(update_intensity(audio.com_speed_212, tuning.wind_bounds(audio)), 0, 1_000);
+    words[3] = clamp_word(
+        update_intensity(audio.com_speed_212, tuning.wind_bounds(audio)),
+        0,
+        1_000,
+    );
 }
 
 /// The rocket layer's vault values (holder `+132`, class `6E878344774A7999`).
@@ -195,11 +230,20 @@ pub(crate) fn rocket_step(kmh: f32, start_kmh: f32, running: bool) -> Option<boo
 }
 
 /// `sub_824E7CB0`'s rocket record.
-pub(crate) fn rocket_record(speed: f32, tuning: &RocketTuning, level_5: u32, pitch_3: i32) -> GrainRecord {
+pub(crate) fn rocket_record(
+    speed: f32,
+    tuning: &RocketTuning,
+    level_5: u32,
+    pitch_3: i32,
+) -> GrainRecord {
     const INV_32767: f32 = f32::from_bits(0x3800_0100);
     const INV_4096: f32 = f32::from_bits(0x3980_0000);
     // fmsubs f12 = v·3.6 − start, fused.
-    let over = -nmsub_single(f64::from(speed), f64::from(KMH_PER_MS), f64::from(tuning.start_kmh)) as f32;
+    let over = -nmsub_single(
+        f64::from(speed),
+        f64::from(KMH_PER_MS),
+        f64::from(tuning.start_kmh),
+    ) as f32;
     let ratio = over / (tuning.top_kmh - tuning.start_kmh);
     let clamped = if -ratio >= 0.0 { 0.0 } else { ratio };
     let position = if ONE - clamped >= 0.0 { clamped } else { ONE };
@@ -243,20 +287,36 @@ impl SenseOfSpeed {
     }
 
     fn with_tuning(tuning: SpeedTuning) -> Self {
-        Self { tuning, local_72: true, rattle: None, wind: None, rocket: None }
+        Self {
+            tuning,
+            local_72: true,
+            rattle: None,
+            wind: None,
+            rocket: None,
+        }
     }
 
     /// [`SenseOfSpeed::new`] plus the rocket layer: place `x_jet_rolling.grain` (from the loaded
     /// `grains.big` members) and create its player (`sub_824E7658`, `sub_824E78F0`).
-    pub(crate) fn with_rocket(tick: &mut Tick, vault: &Collections, grains: &[GrainMember]) -> Result<Self, String> {
+    pub(crate) fn with_rocket(
+        tick: &mut Tick,
+        vault: &Collections,
+        grains: &[GrainMember],
+    ) -> Result<Self, String> {
         const MEMBER: &str = "x_jet_rolling.grain";
         let member = grains
             .iter()
             .find(|m| m.name.eq_ignore_ascii_case(MEMBER))
             .ok_or_else(|| format!("{MEMBER} is not loaded"))?;
         let mut g = tick.runtime.grains();
-        g.load(&member.name, &member.bytes, member.samples.clone(), member.channels, member.rate)
-            .map_err(|e| e.to_string())?;
+        g.load(
+            &member.name,
+            &member.bytes,
+            member.samples.clone(),
+            member.channels,
+            member.rate,
+        )
+        .map_err(|e| e.to_string())?;
         let player = g.create_player().map_err(|e| e.to_string())?;
         let mut this = Self::new(vault)?;
         this.rocket = Some(Rocket {
@@ -300,13 +360,17 @@ impl SenseOfSpeed {
             return Ok(());
         };
         let c = tick.controls;
-        let record = rocket_record(tick.audio.ground_speed_208, &rocket.tuning, c.level(5), c.pitch(3));
+        let record = rocket_record(
+            tick.audio.ground_speed_208,
+            &rocket.tuning,
+            c.level(5),
+            c.pitch(3),
+        );
         tick.runtime
             .grains()
             .set_record(rocket.player, record)
             .map_err(|e| e.to_string())
     }
-
 
     /// `sub_824E7980` (without the rocket grain).
     pub(crate) fn step_process(&self, audio: &AudioState) -> SpeedEvents {
@@ -327,7 +391,10 @@ impl SenseOfSpeed {
         let kmh = audio.com_speed_212 * KMH_PER_MS;
         if kmh >= bounds[0] {
             if self.wind.is_none() {
-                events.post_wind = Some(wind_constructor(&self.tuning, process_intensity(kmh, bounds)));
+                events.post_wind = Some(wind_constructor(
+                    &self.tuning,
+                    process_intensity(kmh, bounds),
+                ));
             }
         } else {
             events.release_wind = self.wind.is_some();
@@ -425,21 +492,37 @@ mod tests {
             wind_constructor(&tuning(), 13),
             [0, 0, 4096, 13, 25000, 0, 0, 0, 7, 32767, 17000, 17000, 6750]
         );
-        assert_eq!(rattle_constructor(&tuning(), 8), [0, 0, 4096, 8, 25000, 0, 0, 0, 7, 32767, 23000]);
+        assert_eq!(
+            rattle_constructor(&tuning(), 8),
+            [0, 0, 4096, 8, 25000, 0, 0, 0, 7, 32767, 23000]
+        );
     }
 
     #[test]
     fn posts_and_releases_at_the_low_bound_and_bail_switches_the_wind_pair() {
         let mut sos = SenseOfSpeed::with_tuning(tuning());
         // 20 km/h COM, 10 km/h ground: wind only.
-        let audio = { let mut s = AudioState::default(); s.com_speed_212 = 20.0 / 3.6; s.ground_speed_208 = 10.0 / 3.6; s };
+        let audio = {
+            let mut s = AudioState::default();
+            s.com_speed_212 = 20.0 / 3.6;
+            s.ground_speed_208 = 10.0 / 3.6;
+            s
+        };
         let events = sos.step_process(&audio);
         assert!(events.post_wind.is_some() && events.post_rattle.is_none());
         sos.apply_local(&events);
         // Slow COM releases wind, unless bailing (1..10 km/h).
-        let slow = { let mut s = AudioState::default(); s.com_speed_212 = 5.0 / 3.6; s };
+        let slow = {
+            let mut s = AudioState::default();
+            s.com_speed_212 = 5.0 / 3.6;
+            s
+        };
         assert!(sos.step_process(&slow).release_wind);
-        let bail = { let mut s = slow.clone(); s.bail_676 = true; s };
+        let bail = {
+            let mut s = slow.clone();
+            s.bail_676 = true;
+            s
+        };
         assert!(!sos.step_process(&bail).release_wind);
         let mut words = sos.wind.unwrap().1;
         wind_update(&mut words, &tuning(), &bail, &Captured::default());
@@ -451,7 +534,11 @@ mod tests {
     fn update_intensity_is_fused() {
         // Both roundings agree away from ties; the fused form never differs by more than a unit.
         let v = f32::from_bits(0x4105_5555);
-        assert!((update_intensity(v, [30.0, 80.0]) - process_intensity(v * KMH_PER_MS, [30.0, 80.0])).abs() <= 1);
+        assert!(
+            (update_intensity(v, [30.0, 80.0]) - process_intensity(v * KMH_PER_MS, [30.0, 80.0]))
+                .abs()
+                <= 1
+        );
     }
 
     /// Replays the retail capture: posts/releases at process F (state F) and the updates of
@@ -464,13 +551,19 @@ mod tests {
         let group = |object: &str| {
             let mut map = std::collections::BTreeMap::<(u32, String), Vec<capture::Row>>::new();
             for row in capture::rows(&root, object) {
-                map.entry((row.frame, row.kind.clone())).or_default().push(row);
+                map.entry((row.frame, row.kind.clone()))
+                    .or_default()
+                    .push(row);
             }
             map
         };
         let (rattle, wind) = (group("SenseOfSpeed_rattle"), group("SenseOfSpeed_wind"));
-        let get = |map: &std::collections::BTreeMap<(u32, String), Vec<capture::Row>>, frame: u32, kind: &str| {
-            map.get(&(frame, kind.to_string())).cloned().unwrap_or_default()
+        let get = |map: &std::collections::BTreeMap<(u32, String), Vec<capture::Row>>,
+                   frame: u32,
+                   kind: &str| {
+            map.get(&(frame, kind.to_string()))
+                .cloned()
+                .unwrap_or_default()
         };
         let mut sos = SenseOfSpeed::with_tuning(tuning());
         let mut rattle_up = Matches::new("SenseOfSpeed_rattle update", RATTLE_WORDS);
@@ -489,11 +582,18 @@ mod tests {
                     .chain(get(&wind, frame, "UP").iter())
                     .flat_map(|r| r.reads.clone())
                     .collect();
-                sos.rewrite(&audio, &Captured::from_reads(&reads, 0x824E_7CB0..0x824E_80D0));
+                sos.rewrite(
+                    &audio,
+                    &Captured::from_reads(&reads, 0x824E_7CB0..0x824E_80D0),
+                );
                 for row in get(&rattle, frame, "UP") {
                     if let Some((_, words)) = sos.rattle.as_ref() {
                         rattle_up.add(frame, &row.words[..RATTLE_WORDS], words);
-                        let plain = process_intensity(audio.ground_speed_208 * KMH_PER_MS, tuning().rattle_kmh).clamp(0, 1_000) as u32;
+                        let plain = process_intensity(
+                            audio.ground_speed_208 * KMH_PER_MS,
+                            tuning().rattle_kmh,
+                        )
+                        .clamp(0, 1_000) as u32;
                         fused_diff += usize::from(words[3] != row.words[3]);
                         plain_diff += usize::from(plain != row.words[3]);
                     }
@@ -515,8 +615,18 @@ mod tests {
                 if let (Some(words), Some(row)) = (events.post_wind, w_po.first()) {
                     wind_po.add(frame, &row.words[..WIND_WORDS], &words);
                 }
-                let ours = (events.post_rattle.is_some(), events.post_wind.is_some(), events.release_rattle, events.release_wind);
-                let retail = (!r_po.is_empty(), !w_po.is_empty(), !r_rl.is_empty(), !w_rl.is_empty());
+                let ours = (
+                    events.post_rattle.is_some(),
+                    events.post_wind.is_some(),
+                    events.release_rattle,
+                    events.release_wind,
+                );
+                let retail = (
+                    !r_po.is_empty(),
+                    !w_po.is_empty(),
+                    !r_rl.is_empty(),
+                    !w_rl.is_empty(),
+                );
                 if ours == retail {
                     timing_ok += 1;
                 } else if timing_bad.len() < 12 {
@@ -530,7 +640,9 @@ mod tests {
         rattle_up.print();
         wind_up.print();
         println!("rattle w3 mismatches: fused {fused_diff}, unfused {plain_diff}");
-        println!("frames with matching post/release {timing_ok}; mismatches (frame, ours, retail) {timing_bad:?}");
+        println!(
+            "frames with matching post/release {timing_ok}; mismatches (frame, ours, retail) {timing_bad:?}"
+        );
     }
 
     fn rocket_tuning() -> RocketTuning {
@@ -539,7 +651,14 @@ mod tests {
             start_kmh: 35.0,
             top_kmh: 60.0,
             gain: 22_000.0,
-            params: [0x3DCC_CCCD, 0x3ECC_CCCD, 0x3DCC_CCCD, 0x4019_999A, 0x3DCC_CCCD].map(f32::from_bits),
+            params: [
+                0x3DCC_CCCD,
+                0x3ECC_CCCD,
+                0x3DCC_CCCD,
+                0x4019_999A,
+                0x3DCC_CCCD,
+            ]
+            .map(f32::from_bits),
         }
     }
 
@@ -557,14 +676,42 @@ mod tests {
     fn rocket_records_match_the_retail_picks() {
         let t = rocket_tuning();
         for (speed, level, pitch, words) in [
-            (0x412D_AA75u32, 1165u32, 4086i32, [0x3CC3_8DA6u32, 0x3F7F_6000, 0x3E26_E788]),
-            (0x413A_68E6, 1270, 4086, [0x3CD5_2DA5, 0x3F7F_6000, 0x3E8E_2D18]),
-            (0x412B_062C, 1295, 4086, [0x3CD9_5FEE, 0x3F7F_6000, 0x3E0E_8EE3]),
-            (0x413D_A31D, 1428, 4086, [0x3CEF_B31E, 0x3F7F_6000, 0x3E9D_0C4B]),
-            (0x411E_BB0D, 1332, 4086, [0x3CDF_95DE, 0x3F7F_6000, 0x3CEA_1825]),
+            (
+                0x412D_AA75u32,
+                1165u32,
+                4086i32,
+                [0x3CC3_8DA6u32, 0x3F7F_6000, 0x3E26_E788],
+            ),
+            (
+                0x413A_68E6,
+                1270,
+                4086,
+                [0x3CD5_2DA5, 0x3F7F_6000, 0x3E8E_2D18],
+            ),
+            (
+                0x412B_062C,
+                1295,
+                4086,
+                [0x3CD9_5FEE, 0x3F7F_6000, 0x3E0E_8EE3],
+            ),
+            (
+                0x413D_A31D,
+                1428,
+                4086,
+                [0x3CEF_B31E, 0x3F7F_6000, 0x3E9D_0C4B],
+            ),
+            (
+                0x411E_BB0D,
+                1332,
+                4086,
+                [0x3CDF_95DE, 0x3F7F_6000, 0x3CEA_1825],
+            ),
         ] {
             let r = rocket_record(f32::from_bits(speed), &t, level, pitch);
-            assert_eq!([r.gain.to_bits(), r.pitch.to_bits(), r.position.to_bits()], words);
+            assert_eq!(
+                [r.gain.to_bits(), r.pitch.to_bits(), r.position.to_bits()],
+                words
+            );
         }
     }
 
@@ -576,12 +723,15 @@ mod tests {
         use super::super::wheels::tests::Fixed;
         use skate_audio_core::authored::AuthoredRuntime;
         use skate_data::audio::catalog::PlayerAudioCatalog;
-        let assets = std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+        let assets = std::path::PathBuf::from(
+            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets",
+        );
         let cache = std::env::var_os("LOCALAPPDATA")
             .map(std::path::PathBuf::from)
             .map(|p| p.join("Skate3RustEngine/audio-pcm-cache"));
         let catalog = PlayerAudioCatalog::from_assets(&assets, cache.as_deref()).unwrap();
-        let mut runtime = AuthoredRuntime::new(catalog.guest, catalog.projects, catalog.banks).unwrap();
+        let mut runtime =
+            AuthoredRuntime::new(catalog.guest, catalog.projects, catalog.banks).unwrap();
         let vault = Collections::load(&assets).unwrap();
         let grains = skate_data::audio::grains::load_grains(
             &assets.join("private/stock/data/audio/grains.big"),
@@ -592,15 +742,31 @@ mod tests {
         let controls = Fixed(&[(60, 5, 20_000), (56, 3, 4096)]);
         let mut audio = AudioState::default();
         let mut speed = {
-            let mut tick = Tick { runtime: &mut runtime, audio: &audio, controls: &controls, dt: 1.0 / 60.0, tick: 0 };
+            let mut tick = Tick {
+                runtime: &mut runtime,
+                audio: &audio,
+                controls: &controls,
+                dt: 1.0 / 60.0,
+                tick: 0,
+            };
             SenseOfSpeed::with_rocket(&mut tick, &vault, &grains).unwrap()
         };
         let mut rms = Vec::new();
         let mut blocks = 0.0f64;
         for frame in 0..180u64 {
-            audio.ground_speed_208 = if (10..120).contains(&frame) { 14.0 } else { 5.0 };
+            audio.ground_speed_208 = if (10..120).contains(&frame) {
+                14.0
+            } else {
+                5.0
+            };
             {
-                let mut tick = Tick { runtime: &mut runtime, audio: &audio, controls: &controls, dt: 1.0 / 60.0, tick: frame };
+                let mut tick = Tick {
+                    runtime: &mut runtime,
+                    audio: &audio,
+                    controls: &controls,
+                    dt: 1.0 / 60.0,
+                    tick: frame,
+                };
                 speed.rocket_process(&mut tick).unwrap();
                 speed.rocket_update(&mut tick).unwrap();
             }
@@ -609,14 +775,19 @@ mod tests {
             while blocks >= 1.0 {
                 blocks -= 1.0;
                 let pcm = runtime.pump_once().unwrap();
-                sum += pcm.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>();
+                sum += pcm
+                    .iter()
+                    .map(|s| f64::from(*s) * f64::from(*s))
+                    .sum::<f64>();
                 n += pcm.len();
             }
             rms.push((sum / n.max(1) as f64).sqrt());
         }
         let loud = rms[20..115].iter().filter(|r| **r > 1e-4).count();
         let after = rms[150..].iter().fold(0.0f64, |m, r| m.max(*r));
-        println!("frames with sound while above 35 km/h {loud}/95, max rms after the stop {after:e}");
+        println!(
+            "frames with sound while above 35 km/h {loud}/95, max rms after the stop {after:e}"
+        );
         assert!(loud > 85, "the rocket layer is silent");
         assert!(after < 1e-6, "the rocket layer keeps sounding");
     }

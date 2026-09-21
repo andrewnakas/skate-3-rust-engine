@@ -45,7 +45,12 @@ pub(crate) struct Entry {
 
 impl Entry {
     pub(crate) fn new(name: &'static str, controller: u32, component: Box<dyn Component>) -> Self {
-        Self { name, controller, component, last: ControlSnapshot::default() }
+        Self {
+            name,
+            controller,
+            component,
+            last: ControlSnapshot::default(),
+        }
     }
 }
 
@@ -91,14 +96,18 @@ impl PlayerSound {
         // class's writer is cited in `mixmap::inputs::FREE_SKATE_GLOBALS`).
         for &(key, id, value) in inputs::FREE_SKATE_GLOBALS {
             let ctrl = controller(runtime, key, "global")?;
-            runtime.mixmap_set(ctrl, id, value).map_err(|e| e.to_string())?;
+            runtime
+                .mixmap_set(ctrl, id, value)
+                .map_err(|e| e.to_string())?;
         }
         // APPROXIMATION: this runtime plays no retail music, so Music ids 0/3/6 and VU ids 0/1
         // hold their most frequent free-skate capture values (`FREE_SKATE_MUSIC_VU`). Retail feeds
         // them from the music player (`sub_824D1208`) and the output meters (`sub_824EDBE8`).
         for &(key, id, value) in inputs::FREE_SKATE_MUSIC_VU {
             let ctrl = controller(runtime, key, "music/VU")?;
-            runtime.mixmap_set(ctrl, id, value).map_err(|e| e.to_string())?;
+            runtime
+                .mixmap_set(ctrl, id, value)
+                .map_err(|e| e.to_string())?;
         }
         Ok(Self {
             audio: AudioState::default(),
@@ -229,8 +238,13 @@ impl PlayerSound {
                 facing_64: v4(retail.deck_forward),
                 velocity_80: v4(retail.linear_velocity),
             };
-            self.listener
-                .update(v4(camera_at), v4(camera_position), true, FRAME_SECONDS, Some(&record));
+            self.listener.update(
+                v4(camera_at),
+                v4(camera_position),
+                true,
+                FRAME_SECONDS,
+                Some(&record),
+            );
             let (skater, board) = record.emitters();
             for ((ctrl, object), emitter) in self.positions.iter_mut().zip([skater, board]) {
                 let word15 = runtime.mixmap_get(*ctrl, 15).map_err(|e| e.to_string())?;
@@ -369,7 +383,12 @@ pub(crate) fn build(
             dt: FRAME_SECONDS,
             tick: 0,
         };
-        Board::new(&mut tick, BoardVault::load(assets)?, &grains, BoardConfig::default())?
+        Board::new(
+            &mut tick,
+            BoardVault::load(assets)?,
+            &grains,
+            BoardConfig::default(),
+        )?
     };
     let (wheels_vault, wheel_members) = wheels::load(assets, cache)?;
     let (wheels_component, speed) = {
@@ -401,20 +420,56 @@ pub(crate) fn build(
             ctrl(runtime, 1, "Contacts")?,
             Box::new(contacts_owner),
         ),
-        Entry::new("SkateBoard", ctrl(runtime, 0, "SkateBoard")?, Box::new(board)),
-        Entry::new("Contacts", ctrl(runtime, 1, "Contacts")?, Box::new(FootDrag::new(&vault)?)),
-        Entry::new("Wheels", ctrl(runtime, 2, "Wheels")?, Box::new(wheels_component)),
-        Entry::new("Rail", ctrl(runtime, 3, "Rail")?, Box::new(Grind::new(&vault)?)),
-        Entry::new("Cracks", ctrl(runtime, 4, "Cracks")?, Box::new(Seams::new(&vault)?)),
-        Entry::new("Tricks", ctrl(runtime, 5, "Tricks")?, Box::new(Tricks::new(&vault)?)),
-        Entry::new("Clothing", ctrl(runtime, 6, "Clothing")?, Box::new(Clothing::new(&vault)?)),
-        Entry::new("Treatments", ctrl(runtime, 7, "Treatments")?, Box::new(Treatment::new(&vault)?)),
+        Entry::new(
+            "SkateBoard",
+            ctrl(runtime, 0, "SkateBoard")?,
+            Box::new(board),
+        ),
+        Entry::new(
+            "Contacts",
+            ctrl(runtime, 1, "Contacts")?,
+            Box::new(FootDrag::new(&vault)?),
+        ),
+        Entry::new(
+            "Wheels",
+            ctrl(runtime, 2, "Wheels")?,
+            Box::new(wheels_component),
+        ),
+        Entry::new(
+            "Rail",
+            ctrl(runtime, 3, "Rail")?,
+            Box::new(Grind::new(&vault)?),
+        ),
+        Entry::new(
+            "Cracks",
+            ctrl(runtime, 4, "Cracks")?,
+            Box::new(Seams::new(&vault)?),
+        ),
+        Entry::new(
+            "Tricks",
+            ctrl(runtime, 5, "Tricks")?,
+            Box::new(Tricks::new(&vault)?),
+        ),
+        Entry::new(
+            "Clothing",
+            ctrl(runtime, 6, "Clothing")?,
+            Box::new(Clothing::new(&vault)?),
+        ),
+        Entry::new(
+            "Treatments",
+            ctrl(runtime, 7, "Treatments")?,
+            Box::new(Treatment::new(&vault)?),
+        ),
         Entry::new(
             "SenseOfSpeed",
             ctrl(runtime, 8, "SenseOfSpeed")?,
             Box::new(speed),
         ),
-        Entry::new("OffBoard", ctrl(runtime, 9, "OffBoard")?, Box::new(Footsteps::new(&vault)?)),
+        Entry::new(
+            "OffBoard",
+            ctrl(runtime, 9, "OffBoard")?,
+            Box::new(Footsteps::new(&vault)?),
+        ),
     ];
     PlayerSound::new(runtime, tuning, entries, Some((voices, contact_player)))
 }

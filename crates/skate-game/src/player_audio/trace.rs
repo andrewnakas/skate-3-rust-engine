@@ -9,6 +9,7 @@
 //! * `RL <node> <name>` — a release;
 //! * `OP <index> byte=<b> desc=[6 words] records=[id:a/value …] -> voice=<voice>` — a voice open,
 //!   the capture's `skate3-audio-open` line; follows the post or update whose patch opened it;
+//! * `VR <voice>` — that voice released;
 //! * `AS st=<state> cat=<category> <field>=<value> …` — the physical state id and the
 //!   audio-state fields the families' triggers read;
 //! * `OUT <p0..p5> | rms <r> frames <n> ch <c>` — one per rendered block, in the retail capture's
@@ -44,6 +45,7 @@ fn with<F: FnOnce(&mut Trace)>(f: F) {
                     names: HashMap::new(),
                 });
                 skate_audio_core::voice::observe_opens(open);
+                skate_audio_core::voice::observe_releases(voice_release);
             }
         }
     });
@@ -73,6 +75,10 @@ pub(crate) fn frame(frame: u64) {
             let _ = t.out.flush();
         }
     });
+}
+
+fn voice_release(voice: u32) {
+    with(|t| t.line(format_args!("VR {voice:08X}")));
 }
 
 fn open(request: &skate_audio_core::voice::OpenRequest, records: &[(u8, i32, i32)], voice: u32) {

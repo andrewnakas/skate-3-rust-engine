@@ -108,7 +108,10 @@ fn trace_posts() -> bool {
 }
 
 /// Release a held message, if any.
-pub(crate) fn release(runtime: &mut AuthoredRuntime, holder: &mut Option<u32>) -> Result<(), String> {
+pub(crate) fn release(
+    runtime: &mut AuthoredRuntime,
+    holder: &mut Option<u32>,
+) -> Result<(), String> {
     if let Some(handle) = holder.take() {
         if trace_posts() {
             eprintln!("SKATE_PLAYER_AUDIO release handle={handle:#010x}");
@@ -119,8 +122,14 @@ pub(crate) fn release(runtime: &mut AuthoredRuntime, holder: &mut Option<u32>) -
     Ok(())
 }
 
-pub(crate) fn post(runtime: &mut AuthoredRuntime, object: &str, words: &[u32]) -> Result<u32, String> {
-    let handle = runtime.post(object, words).map_err(|error| error.to_string())?;
+pub(crate) fn post(
+    runtime: &mut AuthoredRuntime,
+    object: &str,
+    words: &[u32],
+) -> Result<u32, String> {
+    let handle = runtime
+        .post(object, words)
+        .map_err(|error| error.to_string())?;
     if trace_posts() {
         eprintln!("SKATE_PLAYER_AUDIO post {object} handle={handle:#010x} words={words:x?}");
     }
@@ -128,7 +137,13 @@ pub(crate) fn post(runtime: &mut AuthoredRuntime, object: &str, words: &[u32]) -
     Ok(handle)
 }
 
-pub(crate) fn redeliver(runtime: &mut AuthoredRuntime, handle: u32, words: &[u32]) -> Result<(), String> {
+pub(crate) fn redeliver(
+    runtime: &mut AuthoredRuntime,
+    handle: u32,
+    words: &[u32],
+) -> Result<(), String> {
     super::trace::update(handle, words);
-    runtime.redeliver(handle, words).map_err(|error| error.to_string())
+    runtime
+        .redeliver(handle, words)
+        .map_err(|error| error.to_string())
 }

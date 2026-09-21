@@ -18,8 +18,8 @@
 use skate_data::collections::Collections;
 
 use super::super::audio_state::AudioState;
-use super::words::{fctiwz, KMH_PER_MS, TEN_THOUSAND};
-use super::{post, redeliver, release, Component, Controls, Tick};
+use super::words::{KMH_PER_MS, TEN_THOUSAND, fctiwz};
+use super::{Component, Controls, Tick, post, redeliver, release};
 
 /// Holder +24 (`sub_8279C948` class) and holder +140 (eEQChain) collections.
 const TUNING_CLASS: &str = "Hash_C26949FCB638A2CA";
@@ -54,9 +54,18 @@ pub(crate) fn clamp_word(value: i32, low: i32, high: i32) -> u32 {
 
 /// The first 32-bit lane of a vault field, whatever its reflection type (eEQChain enums are
 /// 32-bit values the code reads with `lwz`).
-pub(crate) fn vault_word(vault: &Collections, class: &str, key: &str, name: &str) -> Result<u32, String> {
+pub(crate) fn vault_word(
+    vault: &Collections,
+    class: &str,
+    key: &str,
+    name: &str,
+) -> Result<u32, String> {
     let data = &vault.field(class, key, name)?.data;
-    let hex: String = data.chars().filter(|c| !c.is_whitespace()).take(8).collect();
+    let hex: String = data
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(8)
+        .collect();
     u32::from_str_radix(&hex, 16).map_err(|e| format!("{class}/{key}/{name}: {e}"))
 }
 
@@ -80,24 +89,35 @@ impl SurfaceMap {
             .map(|item| {
                 let hex: String = item.chars().filter(|c| !c.is_whitespace()).collect();
                 if hex.len() != 144 {
-                    return Err(format!("AudioSurfaceMap element of {} hex digits", hex.len()));
+                    return Err(format!(
+                        "AudioSurfaceMap element of {} hex digits",
+                        hex.len()
+                    ));
                 }
                 let mut words = [0; 18];
                 for (i, word) in words.iter_mut().enumerate() {
-                    *word = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16).map_err(|e| e.to_string())?;
+                    *word = u32::from_str_radix(&hex[i * 8..i * 8 + 8], 16)
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(words)
             })
             .collect::<Result<Vec<_>, String>>()?;
         if entries.len() < 95 {
-            return Err(format!("AudioSurfaceMap has {} elements, retail reads 95", entries.len()));
+            return Err(format!(
+                "AudioSurfaceMap has {} elements, retail reads 95",
+                entries.len()
+            ));
         }
         Ok(Self { entries })
     }
 
     /// The 32-bit word at byte `offset` of the material's element.
     pub(crate) fn lookup(&self, material: i32, offset: usize) -> u32 {
-        let index = if (0..94).contains(&material) { material as usize } else { 94 };
+        let index = if (0..94).contains(&material) {
+            material as usize
+        } else {
+            94
+        };
         self.entries[index][offset / 4]
     }
 
@@ -162,7 +182,11 @@ pub(crate) struct FootDragTuning {
 
 impl FootDragTuning {
     pub(crate) fn load(vault: &Collections) -> Result<Self, String> {
-        let int = |name: &str| vault.integer(TUNING_CLASS, DEFAULT_KEY, name).map(|v| v as i32);
+        let int = |name: &str| {
+            vault
+                .integer(TUNING_CLASS, DEFAULT_KEY, name)
+                .map(|v| v as i32)
+        };
         Ok(Self {
             speed_offset: vault.float(TUNING_CLASS, DEFAULT_KEY, "Hash_E5A6D8AC6EB9B5AB")?,
             top_kmh: vault.float(TUNING_CLASS, DEFAULT_KEY, "Hash_B2C81577820408BE")?,
@@ -192,14 +216,22 @@ fn drag_speed(inputs: &FootDragInputs, offset: f32, top_kmh: f32, local: bool) -
     let low = fsel(-x, 0.0, x);
     let unit = fsel(1.0 - low, low, 1.0);
     let speed = fctiwz(unit * TEN_THOUSAND);
-    if local && inputs.hold_expired_310 { 500 } else { speed }
+    if local && inputs.hold_expired_310 {
+        500
+    } else {
+        speed
+    }
 }
 
 /// `sub_824BA390`: the foot surface from wheel 2's material while `+339`, else wheel 0's;
 /// material ≥ 143 (none) → 0; AudioSurfaceMap `+20`; with `+339`, surface 1 → 0.
 pub(crate) fn foot_surface(inputs: &FootDragInputs, surfaces: &SurfaceMap) -> i32 {
     let manual = inputs.manual_brake_339;
-    let material = if manual { inputs.wheel_material_628 } else { inputs.wheel_material_620 };
+    let material = if manual {
+        inputs.wheel_material_628
+    } else {
+        inputs.wheel_material_620
+    };
     if material >= 143 {
         return 0;
     }
@@ -208,9 +240,17 @@ pub(crate) fn foot_surface(inputs: &FootDragInputs, surfaces: &SurfaceMap) -> i3
 }
 
 /// `sub_824BB540` → `sub_824AF498`: the posted packet.
-pub(crate) fn foot_drag_constructor(tuning: &FootDragTuning, inputs: &FootDragInputs, local: bool) -> [u32; FOOT_DRAG_WORDS] {
+pub(crate) fn foot_drag_constructor(
+    tuning: &FootDragTuning,
+    inputs: &FootDragInputs,
+    local: bool,
+) -> [u32; FOOT_DRAG_WORDS] {
     let speed = drag_speed(inputs, tuning.speed_offset, tuning.top_kmh, local);
-    let eq = if inputs.manual_brake_339 { tuning.eq_manual } else { tuning.eq_brake };
+    let eq = if inputs.manual_brake_339 {
+        tuning.eq_manual
+    } else {
+        tuning.eq_brake
+    };
     let mut words = [0; FOOT_DRAG_WORDS];
     words[1] = 32_767;
     words[5] = 25_000;
@@ -235,7 +275,11 @@ pub(crate) fn foot_drag_update(
     let speed = drag_speed(inputs, UPDATER_SPEED_OFFSET, tuning.top_kmh, local);
     words[7] = clamp_word(speed, 0, 10_000);
     words[0] = 32_767;
-    words[1] = clamp_word(controls.level(if inputs.brake_336 { 4 } else { 5 }) as i32, 0, 32_767);
+    words[1] = clamp_word(
+        controls.level(if inputs.brake_336 { 4 } else { 5 }) as i32,
+        0,
+        32_767,
+    );
     words[2] = clamp_word(controls.level(18) as i32, 0, 32_767);
     words[5] = clamp_word(controls.level(16) as i32, 0, 25_000);
     words[6] = clamp_word(controls.level(17) as i32, 0, 25_000);
@@ -684,7 +728,10 @@ impl ContactsOwner {
             } else {
                 self.tuning.roll_sample_idle
             };
-            let request = VoiceRequest { sample: Some(sample), ..VoiceRequest::default() };
+            let request = VoiceRequest {
+                sample: Some(sample),
+                ..VoiceRequest::default()
+            };
             self.held_roll_96 = self.voices.play(ContactSound::PopRoll, &request);
         }
     }
@@ -891,7 +938,10 @@ pub(crate) mod capture {
                 let mut parts = line.split('\t');
                 let frame = parts.next().unwrap().parse().unwrap();
                 parts.next();
-                (frame, parts.map(|w| u32::from_str_radix(w, 16).unwrap()).collect())
+                (
+                    frame,
+                    parts.map(|w| u32::from_str_radix(w, 16).unwrap()).collect(),
+                )
             })
             .collect()
     }
@@ -910,7 +960,8 @@ pub(crate) mod capture {
     }
 
     pub(crate) fn rows(root: &PathBuf, object: &str) -> Vec<Row> {
-        let text = std::fs::read_to_string(root.join("attributed").join(format!("{object}.tsv"))).unwrap();
+        let text =
+            std::fs::read_to_string(root.join("attributed").join(format!("{object}.tsv"))).unwrap();
         text.lines()
             .map(|line| {
                 let p: Vec<&str> = line.split('\t').collect();
@@ -920,7 +971,11 @@ pub(crate) mod capture {
                     frame: p[1].parse().unwrap(),
                     node: p[3].into(),
                     payload: p[4].into(),
-                    words: if p[5] == "-" { vec![] } else { p[5].split(' ').map(hex).collect() },
+                    words: if p[5] == "-" {
+                        vec![]
+                    } else {
+                        p[5].split(' ').map(hex).collect()
+                    },
                     ctrl: p[6].into(),
                     reads: p
                         .get(7)
@@ -929,7 +984,12 @@ pub(crate) mod capture {
                             s.split(',')
                                 .map(|r| {
                                     let f: Vec<&str> = r.split(':').collect();
-                                    (f[0].parse().unwrap(), f[1].parse().unwrap(), hex(f[2]), hex(f[3]))
+                                    (
+                                        f[0].parse().unwrap(),
+                                        f[1].parse().unwrap(),
+                                        hex(f[2]),
+                                        hex(f[3]),
+                                    )
                                 })
                                 .collect()
                         })
@@ -944,7 +1004,10 @@ pub(crate) mod capture {
     pub(crate) struct Captured(pub HashMap<(u32, u32), u32>);
 
     impl Captured {
-        pub(crate) fn from_reads(reads: &[(u32, u32, u32, u32)], lr_range: std::ops::Range<u32>) -> Self {
+        pub(crate) fn from_reads(
+            reads: &[(u32, u32, u32, u32)],
+            lr_range: std::ops::Range<u32>,
+        ) -> Self {
             Self(
                 reads
                     .iter()
@@ -977,7 +1040,12 @@ pub(crate) mod capture {
 
     impl Matches {
         pub(crate) fn new(name: &'static str, words: usize) -> Self {
-            Self { name, total: 0, exact: vec![0; words], bad: vec![vec![]; words] }
+            Self {
+                name,
+                total: 0,
+                exact: vec![0; words],
+                bad: vec![vec![]; words],
+            }
         }
         pub(crate) fn add(&mut self, frame: u32, retail: &[u32], ours: &[u32]) {
             self.total += 1;
@@ -992,7 +1060,10 @@ pub(crate) mod capture {
         pub(crate) fn print(&self) {
             println!("{}: {} rows", self.name, self.total);
             for (i, exact) in self.exact.iter().enumerate() {
-                println!("  w{i:<2} {exact}/{}  bad (frame, retail, ours) {:?}", self.total, self.bad[i]);
+                println!(
+                    "  w{i:<2} {exact}/{}  bad (frame, retail, ours) {:?}",
+                    self.total, self.bad[i]
+                );
             }
         }
     }
@@ -1021,54 +1092,94 @@ mod tests {
     struct Fixed(&'static [(u32, u32, u32)]);
     impl Controls for Fixed {
         fn raw(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 52 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 52 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
         fn pitch(&self, id: u32) -> i32 {
-            self.0.iter().find(|r| r.0 == 56 && r.1 == id).map_or(0, |r| r.2 as i32)
+            self.0
+                .iter()
+                .find(|r| r.0 == 56 && r.1 == id)
+                .map_or(0, |r| r.2 as i32)
         }
         fn level(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 60 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 60 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
     }
 
     #[test]
     fn foot_drag_posts_on_brake_and_hold_with_the_vault_levels() {
         let tuning = tuning();
-        let mut inputs = FootDragInputs { brake_336: true, ground_speed_208: 0.25, ..Default::default() };
+        let mut inputs = FootDragInputs {
+            brake_336: true,
+            ground_speed_208: 0.25,
+            ..Default::default()
+        };
         assert!(foot_drag_active(&inputs, true));
         // Retail post at frame 2746: w7 0 (below the 0.5 m/s offset), w13 = !336 = 0.
         assert_eq!(
             foot_drag_constructor(&tuning, &inputs, true),
-            [0, 32767, 0, 0, 0, 25000, 0, 0, 1, 4000, 4500, 4000, 22500, 0, 7]
+            [
+                0, 32767, 0, 0, 0, 25000, 0, 0, 1, 4000, 4500, 4000, 22500, 0, 7
+            ]
         );
         // Retail post at frame 6279: the local hold path, w7 = 500, w13 = 1.
-        inputs = FootDragInputs { hold_expired_310: true, ground_speed_208: 9.0, wheel_material_620: 143, ..Default::default() };
+        inputs = FootDragInputs {
+            hold_expired_310: true,
+            ground_speed_208: 9.0,
+            wheel_material_620: 143,
+            ..Default::default()
+        };
         assert!(foot_drag_active(&inputs, true));
         assert!(!foot_drag_active(&inputs, false));
         assert_eq!(
             foot_drag_constructor(&tuning, &inputs, true),
-            [0, 32767, 0, 0, 0, 25000, 0, 500, 0, 4000, 4500, 4000, 22500, 1, 7]
+            [
+                0, 32767, 0, 0, 0, 25000, 0, 500, 0, 4000, 4500, 4000, 22500, 1, 7
+            ]
         );
     }
 
     #[test]
     fn foot_drag_update_reads_the_contacts_controller() {
         let tuning = tuning();
-        let inputs = FootDragInputs { hold_expired_310: true, wheel_material_620: 143, ..Default::default() };
+        let inputs = FootDragInputs {
+            hold_expired_310: true,
+            wheel_material_620: 143,
+            ..Default::default()
+        };
         let mut words = foot_drag_constructor(&tuning, &inputs, true);
         // Retail update at frame 6280 (controller reads captured with it).
-        let controls = Fixed(&[(60, 5, 0x2055), (60, 18, 0x332), (60, 16, 0x618B), (60, 17, 0x4D), (52, 0, 0xFDF4), (56, 22, 0x11FD)]);
+        let controls = Fixed(&[
+            (60, 5, 0x2055),
+            (60, 18, 0x332),
+            (60, 16, 0x618B),
+            (60, 17, 0x4D),
+            (52, 0, 0xFDF4),
+            (56, 22, 0x11FD),
+        ]);
         foot_drag_update(&mut words, &tuning, &inputs, &controls, true);
         assert_eq!(
             words,
-            [0x7FFF, 0x2055, 0x332, 0xFDF4, 0x11FD, 0x618B, 0x4D, 500, 0, 4000, 4500, 4000, 22500, 1, 7]
+            [
+                0x7FFF, 0x2055, 0x332, 0xFDF4, 0x11FD, 0x618B, 0x4D, 500, 0, 4000, 4500, 4000,
+                22500, 1, 7
+            ]
         );
     }
 
     #[test]
     fn foot_surface_uses_wheel_two_on_manual_brake_and_drops_surface_one() {
         let tuning = tuning();
-        let mut inputs = FootDragInputs { wheel_material_620: 0, wheel_material_628: 0, ..Default::default() };
+        let mut inputs = FootDragInputs {
+            wheel_material_620: 0,
+            wheel_material_628: 0,
+            ..Default::default()
+        };
         assert_eq!(foot_surface(&inputs, &tuning.surfaces), 1);
         inputs.manual_brake_339 = true;
         assert_eq!(foot_surface(&inputs, &tuning.surfaces), 0);
@@ -1079,7 +1190,11 @@ mod tests {
     #[test]
     fn drag_speed_saturates_like_the_fsel_pair() {
         let tuning = tuning();
-        let mut inputs = FootDragInputs { brake_336: true, ground_speed_208: 100.0, ..Default::default() };
+        let mut inputs = FootDragInputs {
+            brake_336: true,
+            ground_speed_208: 100.0,
+            ..Default::default()
+        };
         assert_eq!(foot_drag_constructor(&tuning, &inputs, true)[7], 10_000);
         inputs.ground_speed_208 = f32::NAN;
         // fsel(−NaN) takes NaN, then fsel(1 − NaN) takes 1.0.
@@ -1090,7 +1205,9 @@ mod tests {
     }
 
     fn vault() -> Option<Collections> {
-        let root = std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+        let root = std::path::PathBuf::from(
+            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets",
+        );
         root.join("private/stock/skater-collections.json")
             .exists()
             .then(|| Collections::load(&root).unwrap())
@@ -1117,7 +1234,9 @@ mod tests {
     #[test]
     #[ignore = "needs .local/captures"]
     fn foot_drag_replays_the_retail_capture() {
-        let Some(root) = super::capture::root() else { return };
+        let Some(root) = super::capture::root() else {
+            return;
+        };
         let Some(vault) = vault() else { return };
         let tuning = FootDragTuning::load(&vault).unwrap();
         let states = super::capture::states(&root);
@@ -1128,20 +1247,28 @@ mod tests {
             let mut matches = Matches::new("foot drag updates", FOOT_DRAG_WORDS);
             let mut post_matches = Matches::new("foot drag posts", FOOT_DRAG_WORDS);
             let retail_posts: Vec<_> = rows.iter().filter(|r| r.kind == "PO").collect();
-            let local_nodes: std::collections::HashSet<_> =
-                rows.iter().filter(|r| r.kind == "UP" && r.ctrl == LOCAL).map(|r| r.node.clone()).collect();
+            let local_nodes: std::collections::HashSet<_> = rows
+                .iter()
+                .filter(|r| r.kind == "UP" && r.ctrl == LOCAL)
+                .map(|r| r.node.clone())
+                .collect();
             let retail_releases: Vec<u32> = rows
                 .iter()
                 .filter(|r| r.kind == "RL" && local_nodes.contains(&r.node))
                 .map(|r| r.frame)
                 .collect();
-            let updates: std::collections::HashMap<u32, &super::capture::Row> =
-                rows.iter().filter(|r| r.kind == "UP" && r.ctrl == LOCAL).map(|r| (r.frame, r)).collect();
+            let updates: std::collections::HashMap<u32, &super::capture::Row> = rows
+                .iter()
+                .filter(|r| r.kind == "UP" && r.ctrl == LOCAL)
+                .map(|r| (r.frame, r))
+                .collect();
             let mut held: Option<[u32; FOOT_DRAG_WORDS]> = None;
             let (mut our_posts, mut our_releases, mut our_updates) = (vec![], vec![], vec![]);
             for (&frame, _) in states.range(2709..) {
-                let (Some(earlier), Some(state)) = (states.get(&(frame - update_lag)), states.get(&(frame - process_lag)))
-                else {
+                let (Some(earlier), Some(state)) = (
+                    states.get(&(frame - update_lag)),
+                    states.get(&(frame - process_lag)),
+                ) else {
                     continue;
                 };
                 let inputs = FootDragInputs::from_capture(earlier);
@@ -1153,7 +1280,8 @@ mod tests {
                     } else {
                         our_updates.push(frame);
                         if let Some(row) = updates.get(&frame) {
-                            let controls = Captured::from_reads(&row.reads, 0x824B_EEE8..0x824B_F268);
+                            let controls =
+                                Captured::from_reads(&row.reads, 0x824B_EEE8..0x824B_F268);
                             foot_drag_update(words, &tuning, &inputs, &controls, true);
                             matches.add(frame, &row.words, words);
                         }
@@ -1185,7 +1313,10 @@ mod tests {
                 "update frames: retail {} ours {} common {}",
                 retail_update_frames.len(),
                 our_updates.len(),
-                our_updates.iter().filter(|f| updates.contains_key(f)).count()
+                our_updates
+                    .iter()
+                    .filter(|f| updates.contains_key(f))
+                    .count()
             );
         }
     }
@@ -1278,7 +1409,10 @@ mod owner_tests {
     /// class from the `+464` wheels, so a landing with no wheel down plays no class voice and
     /// writes 0 to controller input 2 — which is retail's behaviour, not a fixture accident.
     fn grounded() -> ContactsInputs {
-        ContactsInputs { wheel_landed_464: [true; 4], ..ContactsInputs::default() }
+        ContactsInputs {
+            wheel_landed_464: [true; 4],
+            ..ContactsInputs::default()
+        }
     }
 
     fn air(trick: u32) -> ContactsInputs {
@@ -1318,12 +1452,18 @@ mod owner_tests {
         // +343 clear blocks it too.
         let (mut o, sink) = owner(true);
         o.step(&ContactsInputs::default());
-        o.step(&ContactsInputs { trick_active_343: false, ..air(5) });
+        o.step(&ContactsInputs {
+            trick_active_343: false,
+            ..air(5)
+        });
         assert!(sink.take().is_empty());
 
         // Previously grinding blocks it (latch +122).
         let (mut o, sink) = owner(true);
-        o.step(&ContactsInputs { grinding_341: true, ..ContactsInputs::default() });
+        o.step(&ContactsInputs {
+            grinding_341: true,
+            ..ContactsInputs::default()
+        });
         sink.take();
         o.step(&air(5));
         assert!(sink.take().is_empty());
@@ -1334,9 +1474,15 @@ mod owner_tests {
         for (velocity, expected) in [(0.0f32, 0), (0.3, 1), (0.5, 2)] {
             let (mut o, sink) = owner(true);
             o.step(&ContactsInputs::default());
-            o.step(&ContactsInputs { jump_velocity_468: velocity, ..air(5) });
+            o.step(&ContactsInputs {
+                jump_velocity_468: velocity,
+                ..air(5)
+            });
             let played = sink.take();
-            let (_, pop) = played.iter().find(|(s, _)| *s == ContactSound::Pop).unwrap();
+            let (_, pop) = played
+                .iter()
+                .find(|(s, _)| *s == ContactSound::Pop)
+                .unwrap();
             assert_eq!(pop.selector, Some(expected), "velocity {velocity}");
             assert_eq!(o.latches().pop_selector_64, expected);
             assert_eq!(pop.eq_chain, Some(0));
@@ -1345,9 +1491,15 @@ mod owner_tests {
         for trick in [33u32, 34] {
             let (mut o, sink) = owner(true);
             o.step(&ContactsInputs::default());
-            o.step(&ContactsInputs { jump_velocity_468: 5.0, ..air(trick) });
+            o.step(&ContactsInputs {
+                jump_velocity_468: 5.0,
+                ..air(trick)
+            });
             let played = sink.take();
-            let (_, pop) = played.iter().find(|(s, _)| *s == ContactSound::Pop).unwrap();
+            let (_, pop) = played
+                .iter()
+                .find(|(s, _)| *s == ContactSound::Pop)
+                .unwrap();
             assert_eq!(pop.selector, Some(0));
         }
     }
@@ -1363,9 +1515,15 @@ mod owner_tests {
             let (mut o, sink) = owner(true);
             o.tuning = t;
             o.step(&ContactsInputs::default());
-            o.step(&ContactsInputs { ground_speed_208: speed, ..air(5) });
+            o.step(&ContactsInputs {
+                ground_speed_208: speed,
+                ..air(5)
+            });
             let played = sink.take();
-            let (_, roll) = played.iter().find(|(s, _)| *s == ContactSound::PopRoll).unwrap();
+            let (_, roll) = played
+                .iter()
+                .find(|(s, _)| *s == ContactSound::PopRoll)
+                .unwrap();
             assert_eq!(roll.sample, Some(expected), "speed {speed}");
         }
         // The roll voice is held at +96: coming down lands, and the next pop frees only the
@@ -1410,7 +1568,10 @@ mod owner_tests {
             assert_eq!(inputs[0], (0, 0), "bucket {bucket}");
             assert_eq!(inputs[1], (1, 0), "bucket {bucket}");
             assert_eq!(inputs[2], (6, 0), "bucket {bucket}");
-            assert!(inputs.contains(&(1, 32_767)), "landing pulse, bucket {bucket}");
+            assert!(
+                inputs.contains(&(1, 32_767)),
+                "landing pulse, bucket {bucket}"
+            );
             assert_eq!(
                 inputs.last(),
                 Some(&(2, expected)),
@@ -1483,7 +1644,10 @@ mod owner_tests {
         let (mut o, sink) = owner(true);
         o.step(&air(5));
         sink.take();
-        o.step(&ContactsInputs { grinding_341: true, ..ContactsInputs::default() });
+        o.step(&ContactsInputs {
+            grinding_341: true,
+            ..ContactsInputs::default()
+        });
         assert_eq!(sink.kinds(), vec![ContactSound::GrindOnset]);
 
         // A remote skater gets no landing voice, but the counter still resets.
@@ -1523,30 +1687,48 @@ mod owner_tests {
         });
         let played = sink.take();
         assert_eq!(
-            (played[0].1.material, played[0].1.family_base, played[0].1.tier),
+            (
+                played[0].1.material,
+                played[0].1.family_base,
+                played[0].1.tier
+            ),
             (Some(7), Some(96), Some(0))
         );
 
         // Only the rising edge fires.
-        o.step(&ContactsInputs { grinding_341: true, ..ContactsInputs::default() });
+        o.step(&ContactsInputs {
+            grinding_341: true,
+            ..ContactsInputs::default()
+        });
         assert!(sink.take().is_empty());
     }
 
     #[test]
     fn latches_track_the_retail_members() {
         let (mut o, _sink) = owner(true);
-        o.step(&ContactsInputs { air_time_236: 1.5, bail_676: true, ..air(5) });
+        o.step(&ContactsInputs {
+            air_time_236: 1.5,
+            bail_676: true,
+            ..air(5)
+        });
         let l = o.latches();
-        assert_eq!((l.airborne_120, l.bail_344, l.air_time_340), (true, true, 1.5));
+        assert_eq!(
+            (l.airborne_120, l.bail_344, l.air_time_340),
+            (true, true, 1.5)
+        );
         assert_eq!(l.frames_424, 1);
         // On the ground the air-time latch keeps its last airborne value.
-        o.step(&ContactsInputs { air_time_236: 9.0, ..ContactsInputs::default() });
+        o.step(&ContactsInputs {
+            air_time_236: 9.0,
+            ..ContactsInputs::default()
+        });
         assert_eq!(o.latches().air_time_340, 1.5);
         assert!(!o.latches().airborne_120);
     }
 
     fn owner_vault() -> Option<Collections> {
-        let root = std::path::PathBuf::from(r"C:\s3\installations8eda9dc4644496d81ae73af95ff4285ssets");
+        let root =
+            std::path::PathBuf::from(r"C:\s3\installations8eda9dc4644496d81ae73af95ff4285ssets");
         root.join("private/stock/skater-collections.json")
             .exists()
             .then(|| Collections::load(&root).unwrap())
@@ -1590,12 +1772,28 @@ mod owner_tests {
         }
         let count = |what: ContactSound| frames.iter().filter(|(_, s)| *s == what).count();
         let list = |what: ContactSound| {
-            frames.iter().filter(|(_, s)| *s == what).map(|(f, _)| *f).collect::<Vec<_>>()
+            frames
+                .iter()
+                .filter(|(_, s)| *s == what)
+                .map(|(f, _)| *f)
+                .collect::<Vec<_>>()
         };
-        println!("pops        {} {:?}", count(ContactSound::Pop), list(ContactSound::Pop));
+        println!(
+            "pops        {} {:?}",
+            count(ContactSound::Pop),
+            list(ContactSound::Pop)
+        );
         println!("pop rolls   {}", count(ContactSound::PopRoll));
-        println!("landings    {} {:?}", count(ContactSound::Landing), list(ContactSound::Landing));
-        println!("grind onset {} {:?}", count(ContactSound::GrindOnset), list(ContactSound::GrindOnset));
+        println!(
+            "landings    {} {:?}",
+            count(ContactSound::Landing),
+            list(ContactSound::Landing)
+        );
+        println!(
+            "grind onset {} {:?}",
+            count(ContactSound::GrindOnset),
+            list(ContactSound::GrindOnset)
+        );
         // Every trigger must sit on a real edge of the captured state.
         for (frame, sound) in &frames {
             let now = ContactsInputs::from_capture(&states[frame]);
@@ -1606,7 +1804,10 @@ mod owner_tests {
                 .unwrap_or_default();
             match sound {
                 ContactSound::Pop | ContactSound::PopRoll => {
-                    assert!(now.in_known_air_332 && !previous.in_known_air_332, "frame {frame}");
+                    assert!(
+                        now.in_known_air_332 && !previous.in_known_air_332,
+                        "frame {frame}"
+                    );
                     assert!(now.trick_active_343, "frame {frame}");
                 }
                 // `sub_824B8D48`'s voice is played from the same `sub_824BA630` call as the
@@ -1614,7 +1815,10 @@ mod owner_tests {
                 ContactSound::Landing
                 | ContactSound::LandingClass
                 | ContactSound::LandingLadder => {
-                    assert!(!now.in_known_air_332 && previous.in_known_air_332, "frame {frame}");
+                    assert!(
+                        !now.in_known_air_332 && previous.in_known_air_332,
+                        "frame {frame}"
+                    );
                     assert!(!now.grinding_341, "frame {frame}");
                 }
                 ContactSound::GrindOnset => {
@@ -1622,6 +1826,9 @@ mod owner_tests {
                 }
             }
         }
-        assert!(count(ContactSound::Landing) > 0, "the capture should contain landings");
+        assert!(
+            count(ContactSound::Landing) > 0,
+            "the capture should contain landings"
+        );
     }
 }

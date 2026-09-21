@@ -116,7 +116,13 @@ unsafe fn words(w: [u32; 4]) -> __m128 {
 #[inline]
 #[target_feature(enable = "sse4.1,fma")]
 unsafe fn select(a: __m128, b: __m128, mask: __m128) -> __m128 {
-    unsafe { _mm_castsi128_ps(vmx::vsel(_mm_castps_si128(a), _mm_castps_si128(b), _mm_castps_si128(mask))) }
+    unsafe {
+        _mm_castsi128_ps(vmx::vsel(
+            _mm_castps_si128(a),
+            _mm_castps_si128(b),
+            _mm_castps_si128(mask),
+        ))
+    }
 }
 
 /// The reciprocal square root every site spells out: `vrsqrtefp` then two Newton steps,
@@ -183,7 +189,10 @@ unsafe fn acos(v1: __m128) -> __m128 {
         let v60 = vmx::vmulfp(v1, v1);
         let v61 = words([ACOS_ONE_PLUS; 4]);
         let v12 = splat(0.5);
-        let v0 = _mm_castsi128_ps(_mm_andnot_si128(_mm_set1_epi32(i32::MIN), _mm_castps_si128(v1)));
+        let v0 = _mm_castsi128_ps(_mm_andnot_si128(
+            _mm_set1_epi32(i32::MIN),
+            _mm_castps_si128(v1),
+        ));
         let (v63, v62) = (words(ACOS_B), words(ACOS_A));
         let v9 = spl(v63, 3);
         let v11 = spl(v62, 3);
@@ -323,7 +332,13 @@ fn scaled_speed(v: f32, scale: u32) -> u32 {
 /// `sub_824B19C8(state, dt)`: ids 2, 10, 4, 5, 0, 1, 7, 8, 14, 6, 9, 11, 13 in that order.
 /// `distance_784` is the state's `+784` slew (updated in place); `rate`/`cap` are the vault's
 /// [`DISTANCE_RATE`]/[`DISTANCE_CAP`].
-pub fn state_inputs(s: &StateFields, distance_784: &mut f32, dt: f32, rate: f32, cap: f32) -> Vec<(u32, u32)> {
+pub fn state_inputs(
+    s: &StateFields,
+    distance_784: &mut f32,
+    dt: f32,
+    rate: f32,
+    cap: f32,
+) -> Vec<(u32, u32)> {
     let mut fpscr = Fpscr::capture();
     fpscr.disable_flush_mode_unconditional();
     let on = |b: bool| if b { 32767 } else { 0 };
@@ -499,7 +514,12 @@ impl ObjPos {
     /// `sub_824AEC70` (vtable slot 9, the per-frame update) for one object. `word15` is the
     /// controller's current input 15 (it is read back with slot 12 and or-ed). Returns the writes
     /// in order.
-    pub fn update(&mut self, listener: &Listener, emitter: &Emitter, word15: u32) -> Vec<(u32, u32)> {
+    pub fn update(
+        &mut self,
+        listener: &Listener,
+        emitter: &Emitter,
+        word15: u32,
+    ) -> Vec<(u32, u32)> {
         let mut out = Vec::with_capacity(12);
         let Some(position) = emitter.position_32 else {
             out.push((3, 0));
@@ -520,7 +540,13 @@ impl ObjPos {
     }
 
     /// `sub_824AEB28` (slot 13) and `sub_824AE6E0`.
-    fn listener_frames(&mut self, l: &Listener, position: Vec4, emitter: &Emitter, out: &mut Vec<(u32, u32)>) {
+    fn listener_frames(
+        &mut self,
+        l: &Listener,
+        position: Vec4,
+        emitter: &Emitter,
+        out: &mut Vec<(u32, u32)>,
+    ) {
         let mut fpscr = Fpscr::capture();
         fpscr.enable_flush_mode_unconditional();
         self.flag_56 = 0;
@@ -582,7 +608,14 @@ impl ObjPos {
     }
 
     /// `sub_824AEE60`: distances, signed relative speeds, the sign-change flags, ids 13 and 14.
-    fn rates(&mut self, l: &Listener, position: Vec4, velocity: Vec4, w15: &mut u32, out: &mut Vec<(u32, u32)>) {
+    fn rates(
+        &mut self,
+        l: &Listener,
+        position: Vec4,
+        velocity: Vec4,
+        w15: &mut u32,
+        out: &mut Vec<(u32, u32)>,
+    ) {
         self.dist1_prev_44 = self.dist1_40;
         self.dist0_prev_52 = self.dist0_48;
         self.rate1_prev_100 = self.rate1_96;
@@ -632,7 +665,14 @@ impl ObjPos {
 pub fn rail_inputs(grinding_341: bool, grinding_prev_342: bool) -> [(u32, u32); 2] {
     [
         (0, if grinding_341 { 32767 } else { 0 }),
-        (1, if grinding_prev_342 && !grinding_341 { 32767 } else { 0 }),
+        (
+            1,
+            if grinding_prev_342 && !grinding_341 {
+                32767
+            } else {
+                0
+            },
+        ),
     ]
 }
 
@@ -728,7 +768,11 @@ impl Pause {
         } else {
             self.armed_28 = true;
         }
-        [(0, id0), (1, if fields.state_6 { 32767 } else { 0 }), (2, id2)]
+        [
+            (0, id0),
+            (1, if fields.state_6 { 32767 } else { 0 }),
+            (2, id2),
+        ]
     }
 }
 
@@ -737,7 +781,11 @@ impl Pause {
 /// the id-2 latch. This is what the capture's pause menu writes — id 0 alone — and what an engine
 /// with a menu/pause state should write every frame, paused or not.
 pub fn pause_inputs(paused: bool) -> [(u32, u32); 3] {
-    Pause::retail().process(PauseFields { request: paused, mode_1064: true, state_6: false })
+    Pause::retail().process(PauseFields {
+        request: paused,
+        mode_1064: true,
+        state_6: false,
+    })
 }
 
 // ---------------------------------------------------------------------- the combo multiplier
@@ -836,8 +884,10 @@ impl MusicEmphasis {
                 0
             };
             // r30 = fctiwz(down × dt), r10 = fctiwz(dt × up).
-            let down = fctiwz_low_word(mul_single(f64::from(f(MUSIC_EMPHASIS_DOWN)), f64::from(dt))) as i32;
-            let up = fctiwz_low_word(mul_single(f64::from(dt), f64::from(f(MUSIC_EMPHASIS_UP)))) as i32;
+            let down = fctiwz_low_word(mul_single(f64::from(f(MUSIC_EMPHASIS_DOWN)), f64::from(dt)))
+                as i32;
+            let up =
+                fctiwz_low_word(mul_single(f64::from(dt), f64::from(f(MUSIC_EMPHASIS_UP)))) as i32;
             let current = self.value_176;
             next = target;
             if target < current {
@@ -1035,30 +1085,150 @@ pub struct JitterChannel {
 /// `default`, in ascending key order; each channel's fields resolve through the parent chain.
 /// `(key, enabled, id, params bits)`.
 pub const JITTER_VAULT: [(u64, bool, u32, [u32; 4]); 24] = [
-    (0x02D9546BE518D5A1, true, 4, [0x46800000, 0x467FFC00, 0x42C80000, 0x3F800000]),
-    (0x0DFA1456B4DE6D74, false, 0, [0x3F800000, 0x3F000000, 0x3EE66666, 0x3E800000]),
-    (0x25355B0B6BBB82A7, false, 0, [0x3F800000, 0x3F400000, 0x3F3D70A4, 0x3F266666]),
-    (0x5FBCB3B89B066128, true, 3, [0x46800000, 0x467FFC00, 0x455AC000, 0x44BB8000]),
-    (0x655F9BEE06BE269C, false, 0, [0x43C80000, 0x437A0000, 0x437A0000, 0x43480000]),
-    (0x6AEEEEB9D17C464D, true, 0, [0x46800000, 0x467FFC00, 0x46E29000, 0x46A41000]),
-    (0x7253590E0399A524, false, 0, [0x3F800000, 0x3F000000, 0x3EE66666, 0x3E800000]),
-    (0x7276EC7A5EA8BBDC, false, 0, [0x45ABE000, 0x45A41000, 0x457A0000, 0x4708B800]),
-    (0x816A58ECCCD4112D, false, 0, [0x44FA0000, 0x44BB8000, 0x43FA0000, 0x432F0000]),
-    (0x88008F15F2A4394A, false, 0, [0x3FC00000, 0x3F800000, 0x3F733333, 0x3E800000]),
-    (0x8802BC5475904597, false, 0, [0x3FE00000, 0x3FA00000, 0x3F800000, 0x3E800000]),
-    (0xB5E641CC0B983A3F, true, 1, [0x46800000, 0x467FFC00, 0x46EA6000, 0x469C4000]),
-    (0xC20C6630396E9EDB, true, 5, [0x00000000, 0x00000000, 0x00000000, 0x00000000]),
-    (0xC27373E7FD2DCE47, false, 0, [0x3FA00000, 0x3F400000, 0x3F400000, 0x3E800000]),
-    (0xD4ED2F0BA77ACAB5, false, 0, [0x40400000, 0x40300000, 0x40200000, 0x3F000000]),
-    (0xDB37CAD093CEAC1D, false, 0, [0x3F800000, 0x3F400000, 0x3F333333, 0x3F000000]),
-    (0xE0A49CF4F825146B, false, 0, [0x3FC00000, 0x3FA00000, 0x3F9EB852, 0x3F800000]),
-    (0xE17029CE4388E1E8, false, 0, [0x43C80000, 0x43960000, 0x43958000, 0x43470000]),
-    (0xE58A308607FDB428, false, 0, [0x40200000, 0x40100000, 0x40000000, 0x3FC00000]),
-    (0xE5C4194AB80920EA, false, 0, [0x459C4000, 0x455AC000, 0x451C4000, 0x43FA0000]),
-    (0xEA2ED27D25247927, false, 0, [0x40400000, 0x40200000, 0x4019999A, 0x3F800000]),
-    (0xF88F9621DE824070, false, 0, [0x43C80000, 0x43960000, 0x43938000, 0x43160000]),
-    (0xFA0359BD8FB40469, false, 0, [0x40800000, 0x40600000, 0x4059999A, 0x40400000]),
-    (0xFB7567C027EF051C, true, 2, [0x46800000, 0x467FFC00, 0x46F23000, 0x46947000]),
+    (
+        0x02D9546BE518D5A1,
+        true,
+        4,
+        [0x46800000, 0x467FFC00, 0x42C80000, 0x3F800000],
+    ),
+    (
+        0x0DFA1456B4DE6D74,
+        false,
+        0,
+        [0x3F800000, 0x3F000000, 0x3EE66666, 0x3E800000],
+    ),
+    (
+        0x25355B0B6BBB82A7,
+        false,
+        0,
+        [0x3F800000, 0x3F400000, 0x3F3D70A4, 0x3F266666],
+    ),
+    (
+        0x5FBCB3B89B066128,
+        true,
+        3,
+        [0x46800000, 0x467FFC00, 0x455AC000, 0x44BB8000],
+    ),
+    (
+        0x655F9BEE06BE269C,
+        false,
+        0,
+        [0x43C80000, 0x437A0000, 0x437A0000, 0x43480000],
+    ),
+    (
+        0x6AEEEEB9D17C464D,
+        true,
+        0,
+        [0x46800000, 0x467FFC00, 0x46E29000, 0x46A41000],
+    ),
+    (
+        0x7253590E0399A524,
+        false,
+        0,
+        [0x3F800000, 0x3F000000, 0x3EE66666, 0x3E800000],
+    ),
+    (
+        0x7276EC7A5EA8BBDC,
+        false,
+        0,
+        [0x45ABE000, 0x45A41000, 0x457A0000, 0x4708B800],
+    ),
+    (
+        0x816A58ECCCD4112D,
+        false,
+        0,
+        [0x44FA0000, 0x44BB8000, 0x43FA0000, 0x432F0000],
+    ),
+    (
+        0x88008F15F2A4394A,
+        false,
+        0,
+        [0x3FC00000, 0x3F800000, 0x3F733333, 0x3E800000],
+    ),
+    (
+        0x8802BC5475904597,
+        false,
+        0,
+        [0x3FE00000, 0x3FA00000, 0x3F800000, 0x3E800000],
+    ),
+    (
+        0xB5E641CC0B983A3F,
+        true,
+        1,
+        [0x46800000, 0x467FFC00, 0x46EA6000, 0x469C4000],
+    ),
+    (
+        0xC20C6630396E9EDB,
+        true,
+        5,
+        [0x00000000, 0x00000000, 0x00000000, 0x00000000],
+    ),
+    (
+        0xC27373E7FD2DCE47,
+        false,
+        0,
+        [0x3FA00000, 0x3F400000, 0x3F400000, 0x3E800000],
+    ),
+    (
+        0xD4ED2F0BA77ACAB5,
+        false,
+        0,
+        [0x40400000, 0x40300000, 0x40200000, 0x3F000000],
+    ),
+    (
+        0xDB37CAD093CEAC1D,
+        false,
+        0,
+        [0x3F800000, 0x3F400000, 0x3F333333, 0x3F000000],
+    ),
+    (
+        0xE0A49CF4F825146B,
+        false,
+        0,
+        [0x3FC00000, 0x3FA00000, 0x3F9EB852, 0x3F800000],
+    ),
+    (
+        0xE17029CE4388E1E8,
+        false,
+        0,
+        [0x43C80000, 0x43960000, 0x43958000, 0x43470000],
+    ),
+    (
+        0xE58A308607FDB428,
+        false,
+        0,
+        [0x40200000, 0x40100000, 0x40000000, 0x3FC00000],
+    ),
+    (
+        0xE5C4194AB80920EA,
+        false,
+        0,
+        [0x459C4000, 0x455AC000, 0x451C4000, 0x43FA0000],
+    ),
+    (
+        0xEA2ED27D25247927,
+        false,
+        0,
+        [0x40400000, 0x40200000, 0x4019999A, 0x3F800000],
+    ),
+    (
+        0xF88F9621DE824070,
+        false,
+        0,
+        [0x43C80000, 0x43960000, 0x43938000, 0x43160000],
+    ),
+    (
+        0xFA0359BD8FB40469,
+        false,
+        0,
+        [0x40800000, 0x40600000, 0x4059999A, 0x40400000],
+    ),
+    (
+        0xFB7567C027EF051C,
+        true,
+        2,
+        [0x46800000, 0x467FFC00, 0x46F23000, 0x46947000],
+    ),
 ];
 
 /// `0x82063A48` 0.001: the random step's unit.
@@ -1077,7 +1247,14 @@ impl Jitter {
             .iter()
             .map(|&(key, enabled, id, p)| {
                 let params = [f(p[0]), f(p[1]), f(p[2]), f(p[3])];
-                JitterChannel { key, enabled, id, params, value: params[0], velocity: 0.0 }
+                JitterChannel {
+                    key,
+                    enabled,
+                    id,
+                    params,
+                    value: params[0],
+                    velocity: 0.0,
+                }
             })
             .collect();
         Self { channels }
@@ -1124,7 +1301,11 @@ impl JitterChannel {
         let span = fp::sub_single(p2, p3);
         let unit = mul_single(fp::word_to_single(s as u32), f64::from(f(JITTER_UNIT)));
         let d = mul_single(span, unit);
-        let push = if d < 0.0 { fp::sub_single(d, p3) } else { fp::add_single(p3, d) };
+        let push = if d < 0.0 {
+            fp::sub_single(d, p3)
+        } else {
+            fp::add_single(p3, d)
+        };
         let vel = fp::add_single(push, f64::from(self.velocity));
         let neg = -p2;
         let lo = fsel(fp::sub_single(neg, vel), neg, vel);
@@ -1157,9 +1338,9 @@ impl JitterChannel {
 /// `0x1EBF9D2EB0DD56BA` (layout `+124`, a bool) set through its parent chain. Material 94's key is
 /// 0 (no collection: false).
 pub const LANDING_FLAG_MATERIALS: &[u32] = &[
-    7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-    32, 33, 34, 35, 36, 37, 38, 39, 46, 47, 48, 49, 50, 54, 55, 66, 67, 68, 69, 70, 71, 72, 73, 74,
-    75, 76, 81, 83, 84, 87, 88, 90, 93, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+    7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 46, 47, 48, 49, 50, 54, 55, 66, 67, 68, 69, 70, 71, 72, 73,
+    74, 75, 76, 81, 83, 84, 87, 88, 90, 93, 114, 115, 116, 117, 118, 119, 120, 121, 122,
 ];
 
 /// What SFXObj_Contacts's inputs read from the audio state.

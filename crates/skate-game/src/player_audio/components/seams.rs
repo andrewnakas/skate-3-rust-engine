@@ -46,9 +46,9 @@ use skate_data::attrib_hash::hash;
 use skate_data::collections::Collections;
 
 use super::super::audio_state::AudioState;
-use super::contacts::{clamp_word, vault_word, SurfaceMap};
+use super::contacts::{SurfaceMap, clamp_word, vault_word};
 use super::words::{fctiwz, seam_speed};
-use super::{post, redeliver, Component, Controls, Tick};
+use super::{Component, Controls, Tick, post, redeliver};
 
 /// Packet length: the constructor's 84-byte object minus the 4-byte header.
 pub(crate) const SEAM_WORDS: usize = 20;
@@ -314,15 +314,25 @@ impl SeamState {
         };
         for wheel in 0..4 {
             let surface = state.surface(tuning, inputs, wheel, false);
-            state.packets[wheel] =
-                seam_post(surface, inputs.soft_wheels, wheel as i32, tuning.eq_chain as i32);
+            state.packets[wheel] = seam_post(
+                surface,
+                inputs.soft_wheels,
+                wheel as i32,
+                tuning.eq_chain as i32,
+            );
         }
         state
     }
 
     /// `sub_824C2428`: the wheel's AudioSurfaceMap seams entry (`+32`), or the transition entry
     /// (`+36`) plus 5; 0 without a material.
-    fn surface(&self, tuning: &SeamTuning, inputs: &SeamInputs, wheel: usize, transition: bool) -> i32 {
+    fn surface(
+        &self,
+        tuning: &SeamTuning,
+        inputs: &SeamInputs,
+        wheel: usize,
+        transition: bool,
+    ) -> i32 {
         let material = inputs.wheel_material_620[wheel];
         if material >= 143 {
             return 0;
@@ -335,7 +345,14 @@ impl SeamState {
     }
 
     /// `sub_824C1DF8`: fire wheel `wheel`'s packet.
-    fn trigger(&mut self, tuning: &SeamTuning, inputs: &SeamInputs, wheel: usize, single: bool, transition: bool) {
+    fn trigger(
+        &mut self,
+        tuning: &SeamTuning,
+        inputs: &SeamInputs,
+        wheel: usize,
+        single: bool,
+        transition: bool,
+    ) {
         let packet = &mut self.packets[wheel];
         packet[9] = u32::from(single);
         let toggle = self.toggles[wheel];
@@ -349,7 +366,13 @@ impl SeamState {
     }
 
     /// `sub_824C1CA0`: has wheel `wheel` crossed a grid line on `axis` since its last check?
-    fn crossed(&mut self, tuning: &SeamTuning, inputs: &SeamInputs, wheel: usize, axis: usize) -> bool {
+    fn crossed(
+        &mut self,
+        tuning: &SeamTuning,
+        inputs: &SeamInputs,
+        wheel: usize,
+        axis: usize,
+    ) -> bool {
         if inputs.in_known_air_332 || inputs.grinding_341 {
             return false;
         }
@@ -380,7 +403,13 @@ impl SeamState {
     }
 
     /// `sub_824C1698`: the pattern trigger for one axis.
-    fn pattern(&mut self, tuning: &SeamTuning, inputs: &SeamInputs, axis: usize, dt: f32) -> Result<(), String> {
+    fn pattern(
+        &mut self,
+        tuning: &SeamTuning,
+        inputs: &SeamInputs,
+        axis: usize,
+        dt: f32,
+    ) -> Result<(), String> {
         let mut pattern = inputs.wheel_seam_636[0];
         if inputs.manual() && !inputs.wheel_landed_464 {
             pattern = inputs.wheel_seam_636[3];
@@ -411,7 +440,10 @@ impl SeamState {
             let (c, d) = if inputs.manual() {
                 (false, false)
             } else {
-                (self.crossed(tuning, inputs, 2, axis), self.crossed(tuning, inputs, 3, axis))
+                (
+                    self.crossed(tuning, inputs, 2, axis),
+                    self.crossed(tuning, inputs, 3, axis),
+                )
             };
             let both = a && b;
             if a {
@@ -460,7 +492,12 @@ impl SeamState {
     }
 
     /// `sub_824C14C8` up to its redelivery loop.
-    pub(crate) fn process(&mut self, tuning: &SeamTuning, inputs: &SeamInputs, dt: f32) -> Result<(), String> {
+    pub(crate) fn process(
+        &mut self,
+        tuning: &SeamTuning,
+        inputs: &SeamInputs,
+        dt: f32,
+    ) -> Result<(), String> {
         self.controller_writes.push(0);
         for packet in &mut self.packets {
             packet[7] = 0;
@@ -544,7 +581,9 @@ impl Seams {
     }
 
     fn redeliver_all(&self, tick: &mut Tick) -> Result<(), String> {
-        let Some(state) = &self.state else { return Ok(()) };
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
         for (handle, packet) in self.handles.iter().zip(&state.packets) {
             if let Some(handle) = handle {
                 redeliver(tick.runtime, *handle, packet)?;
@@ -579,7 +618,9 @@ impl Component for Seams {
 
     fn update(&mut self, tick: &mut Tick) -> Result<(), String> {
         let inputs = SeamInputs::from_state(tick.audio);
-        let Some(state) = self.state.as_mut() else { return Ok(()) };
+        let Some(state) = self.state.as_mut() else {
+            return Ok(());
+        };
         for wheel in 0..4 {
             state.update(&inputs, tick.controls, wheel);
             if let Some(handle) = self.handles[wheel] {
@@ -591,8 +632,15 @@ impl Component for Seams {
 
     /// The Cracks controller's input 0 writes (`Set(0, v)`), in retail order.
     fn take_owner_inputs(&mut self) -> Vec<(u32, u32)> {
-        let writes = self.state.as_mut().map(|state| std::mem::take(&mut state.controller_writes));
-        writes.unwrap_or_default().into_iter().map(|value| (0, value)).collect()
+        let writes = self
+            .state
+            .as_mut()
+            .map(|state| std::mem::take(&mut state.controller_writes));
+        writes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| (0, value))
+            .collect()
     }
 }
 
@@ -603,7 +651,14 @@ mod tests {
 
     /// The stock vault's pattern records (`skater-collections.json`, class `7242F32831ED3332`),
     /// so the unit tests need no assets; `vault_values_match_the_owner_vault` checks them.
-    fn record(gain: u32, angle: i32, grid: u32, class: i32, mode: i32, spacing: u32) -> PatternRecord {
+    fn record(
+        gain: u32,
+        angle: i32,
+        grid: u32,
+        class: i32,
+        mode: i32,
+        spacing: u32,
+    ) -> PatternRecord {
         PatternRecord {
             gain_0: f32::from_bits(gain),
             angle_4: angle,
@@ -663,7 +718,10 @@ mod tests {
     #[test]
     fn create_posts_the_constructor_packet_per_wheel() {
         // Capture frame 2707: four posts, w10 = 0 (no material), w14 = wheel, w19 = 8.
-        let inputs = SeamInputs { wheel_material_620: [143; 4], ..SeamInputs::default() };
+        let inputs = SeamInputs {
+            wheel_material_620: [143; 4],
+            ..SeamInputs::default()
+        };
         let state = SeamState::create(&tuning(), &inputs);
         for (wheel, packet) in state.packets.iter().enumerate() {
             let mut expected = [0u32; SEAM_WORDS];
@@ -694,7 +752,10 @@ mod tests {
         assert_eq!(&packet[..7], &[0x7FFF, 2896, 729, 10, 4081, 24971, 77]);
         assert_eq!(packet[8], 0);
         assert_eq!(packet[13], 10);
-        assert_eq!(packet[16], fctiwz(f32::from_bits(0x3F66_6666) * LEVEL_SCALE) as u32);
+        assert_eq!(
+            packet[16],
+            fctiwz(f32::from_bits(0x3F66_6666) * LEVEL_SCALE) as u32
+        );
         assert_eq!(packet[18], 32_767);
         // The turn slews 100 per wheel iteration: wheels 0..3 see 100, 200, 300, 350.
         assert_eq!(state.packets.map(|p| p[15]), [100, 200, 300, 350]);
@@ -792,11 +853,19 @@ mod tests {
         // 15 per frame: the front passes 100 on the 7th frame and arms the rear at 50, which
         // reaches 0 four frames later. (With the stock slats spacing of 50 the front refires,
         // re-arming the rear, on the very frame the rear would have fired.)
-        assert_eq!(fired, vec![(6, [true, true, false, false]), (10, [false, false, true, true])]);
+        assert_eq!(
+            fired,
+            vec![
+                (6, [true, true, false, false]),
+                (10, [false, false, true, true])
+            ]
+        );
     }
 
     fn assets() -> Option<Collections> {
-        let root = std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+        let root = std::path::PathBuf::from(
+            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets",
+        );
         root.join("private/stock/skater-collections.json")
             .exists()
             .then(|| Collections::load(&root).unwrap())
@@ -810,7 +879,12 @@ mod tests {
         let fixture = tuning();
         assert_eq!(loaded.default, fixture.default);
         for index in [3, 7, 9, 10] {
-            assert_eq!(loaded.patterns[index], fixture.patterns[index], "pattern {}", index + 1);
+            assert_eq!(
+                loaded.patterns[index],
+                fixture.patterns[index],
+                "pattern {}",
+                index + 1
+            );
         }
         assert_eq!(loaded.patterns[0].mode, 0); // spidercrack
         assert_eq!((loaded.surface3_scale, loaded.eq_chain), (2.0, 8));
@@ -828,34 +902,63 @@ mod tests {
     #[test]
     #[ignore]
     fn capture_replay() {
-        let (Some(root), Some(vault)) = (capture::root(), assets()) else { return };
+        let (Some(root), Some(vault)) = (capture::root(), assets()) else {
+            return;
+        };
         let tuning = SeamTuning::load(&vault).unwrap();
         let states = capture::states(&root);
         let rows = capture::rows(&root, OBJECT);
         const LOCAL: &str = "4A26A8E0";
-        let local: std::collections::HashSet<String> =
-            rows.iter().filter(|r| r.ctrl == LOCAL).map(|r| r.payload.clone()).collect();
-        let posts: Vec<_> = rows.iter().filter(|r| r.kind == "PO" && local.contains(&r.payload)).collect();
+        let local: std::collections::HashSet<String> = rows
+            .iter()
+            .filter(|r| r.ctrl == LOCAL)
+            .map(|r| r.payload.clone())
+            .collect();
+        let posts: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == "PO" && local.contains(&r.payload))
+            .collect();
         let first = posts[0].frame;
-        assert!(posts.iter().all(|p| p.frame == first), "local seams are posted once");
+        assert!(
+            posts.iter().all(|p| p.frame == first),
+            "local seams are posted once"
+        );
         for (update_lag, process_lag) in [(1u32, 0u32), (1, 1), (0, 0)] {
-            let inputs_at = |frame: u32, lag: u32| states.get(&(frame - lag)).map(|w| SeamInputs::from_capture(w));
+            let inputs_at = |frame: u32, lag: u32| {
+                states
+                    .get(&(frame - lag))
+                    .map(|w| SeamInputs::from_capture(w))
+            };
             // The capture's state rows start the frame after the posts (no wheel material yet).
-            let initial = SeamInputs { wheel_material_620: [143; 4], ..SeamInputs::default() };
-            let mut state = SeamState::create(&tuning, &inputs_at(first, process_lag).unwrap_or(initial));
+            let initial = SeamInputs {
+                wheel_material_620: [143; 4],
+                ..SeamInputs::default()
+            };
+            let mut state =
+                SeamState::create(&tuning, &inputs_at(first, process_lag).unwrap_or(initial));
             let mut post = Matches::new("post", SEAM_WORDS);
             for row in &posts {
-                post.add(row.frame, &row.words, &state.packets[row.words[14] as usize]);
+                post.add(
+                    row.frame,
+                    &row.words,
+                    &state.packets[row.words[14] as usize],
+                );
             }
             let mut update = Matches::new("update", SEAM_WORDS);
             let mut process = Matches::new("process", SEAM_WORDS);
-            let mut by_frame: std::collections::BTreeMap<u32, Vec<&capture::Row>> = Default::default();
-            for row in rows.iter().filter(|r| r.kind == "UP" && local.contains(&r.payload) && r.frame > first) {
+            let mut by_frame: std::collections::BTreeMap<u32, Vec<&capture::Row>> =
+                Default::default();
+            for row in rows
+                .iter()
+                .filter(|r| r.kind == "UP" && local.contains(&r.payload) && r.frame > first)
+            {
                 by_frame.entry(row.frame).or_default().push(row);
             }
             let mut missing = 0;
             for (&frame, frame_rows) in &by_frame {
-                let (Some(earlier), Some(inputs)) = (inputs_at(frame, update_lag), inputs_at(frame, process_lag)) else {
+                let (Some(earlier), Some(inputs)) =
+                    (inputs_at(frame, update_lag), inputs_at(frame, process_lag))
+                else {
                     missing += 1;
                     continue;
                 };
@@ -874,13 +977,19 @@ mod tests {
                     }
                 }
             }
-            println!("=== update lag {update_lag}, process lag {process_lag} (frames skipped: {missing})");
+            println!(
+                "=== update lag {update_lag}, process lag {process_lag} (frames skipped: {missing})"
+            );
             post.print();
             update.print();
             process.print();
             if (update_lag, process_lag) == (1, 0) {
                 for m in [&post, &update, &process] {
-                    assert!(m.exact.iter().all(|&e| e == m.total), "{} words drift", m.name);
+                    assert!(
+                        m.exact.iter().all(|&e| e == m.total),
+                        "{} words drift",
+                        m.name
+                    );
                 }
             }
         }

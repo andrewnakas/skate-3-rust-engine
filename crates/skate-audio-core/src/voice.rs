@@ -57,6 +57,22 @@ pub(crate) fn report_open(g: &Guest, request: &OpenRequest, voice: u32) -> Resul
     Ok(())
 }
 
+/// An observer of every voice a device releases, alongside [`observe_opens`].
+pub type ReleaseObserver = fn(u32);
+
+static RELEASE_OBSERVER: std::sync::OnceLock<ReleaseObserver> = std::sync::OnceLock::new();
+
+/// Install the release observer; only the first call takes effect.
+pub fn observe_releases(observer: ReleaseObserver) {
+    let _ = RELEASE_OBSERVER.set(observer);
+}
+
+pub(crate) fn report_release(voice: u32) {
+    if let Some(observer) = RELEASE_OBSERVER.get() {
+        observer(voice);
+    }
+}
+
 /// `lis -32003` + 13816: the device singleton's cell.
 pub const DEVICE_SLOT: u32 = 0x82FD_35F8;
 

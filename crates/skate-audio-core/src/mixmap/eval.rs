@@ -20,11 +20,12 @@
 
 use super::offsets as H;
 use super::tables::{
-    K_32767, K_25000, K_FRAMES, K_MIN_RAMP_MS, K_MS, K_NEG_ONE, K_ONE, K_SLEW, K_ZERO, cents_to_ratio,
-    curve, curve_float, lin_to_mb, mb_to_lin, ratio_to_mb,
+    K_25000, K_32767, K_FRAMES, K_MIN_RAMP_MS, K_MS, K_NEG_ONE, K_ONE, K_SLEW, K_ZERO,
+    cents_to_ratio, curve, curve_float, lin_to_mb, mb_to_lin, ratio_to_mb,
 };
 use crate::fp::{
-    add_single, div_single, fctiwz_low_word, load_single, mul_single, store_single, sub_single, word_to_single,
+    add_single, div_single, fctiwz_low_word, load_single, mul_single, store_single, sub_single,
+    word_to_single,
 };
 use crate::vmx::Fpscr;
 use crate::{Error, Guest, Result};
@@ -196,7 +197,10 @@ fn lookups(g: &mut Guest, h: u32) -> Result<()> {
                 }
                 if want == 0 {
                     // The original branches back with r8 = 0 forever.
-                    return Err(Error::new(0x8295_16F8, format!("lookup record at {rec:#010x} has no variant 0: the guest spins")));
+                    return Err(Error::new(
+                        0x8295_16F8,
+                        format!("lookup record at {rec:#010x} has no variant 0: the guest spins"),
+                    ));
                 }
                 want = 0;
             }
@@ -325,11 +329,18 @@ fn lookups(g: &mut Guest, h: u32) -> Result<()> {
             store_single(g, st + 28, one)?;
         }
         let last = load_single(g, st + 24)?;
-        let delta = if f8 > last { sub_single(f8, last) } else { sub_single(last, f8) };
+        let delta = if f8 > last {
+            sub_single(f8, last)
+        } else {
+            sub_single(last, f8)
+        };
         store_single(g, st + 28, delta)?;
         store_single(g, st + 24, f8)?;
         let r8 = rdi(g, st + 20)?;
-        let step = fctiwz_low_word(mul_single(sub_single(level, word_to_single(r8 as u32)), slew)) as i32;
+        let step = fctiwz_low_word(mul_single(
+            sub_single(level, word_to_single(r8 as u32)),
+            slew,
+        )) as i32;
         wri(g, st + 20, r8.wrapping_sub(step))?;
         i += 1;
     }
@@ -412,7 +423,10 @@ impl Env {
         }
         let start = self.w(g, 8)?;
         let f1 = curve_float(g, curve_kind, t)?;
-        let v = fctiwz_low_word(mul_single(f1, word_to_single(32767i32.wrapping_sub(start) as u32))) as i32;
+        let v = fctiwz_low_word(mul_single(
+            f1,
+            word_to_single(32767i32.wrapping_sub(start) as u32),
+        )) as i32;
         self.sw(g, 28, v.wrapping_add(start))
     }
     /// The normalised position in a ramp that started at `+12`.
@@ -467,7 +481,9 @@ fn envelopes(g: &mut Guest, h: u32) -> Result<()> {
             let d8 = rdi(g, def + 8)?;
             let level = rdi(g, st + 28)?;
             if (half as i32) > 0 {
-                let x = (level.wrapping_mul(d8) >> 15).wrapping_sub(d8).wrapping_add(32767);
+                let x = (level.wrapping_mul(d8) >> 15)
+                    .wrapping_sub(d8)
+                    .wrapping_add(32767);
                 let mb = lin_to_mb(g, x as u32, -10000)?;
                 wri(g, st + 24, rdi(g, def + 4)?.wrapping_add(mb))?;
             } else {
@@ -565,7 +581,10 @@ fn release_ramp(g: &mut Guest, env: &Env, curve_kind: u32, span: f64, elapsed: f
     let t = env.progress(g, span, elapsed)?;
     let start = env.w(g, 8)?;
     let f1 = curve_float(g, curve_kind, sub_single(env.one, t))?;
-    let v = fctiwz_low_word(mul_single(sub_single(env.one, f1), word_to_single(start as u32))) as i32;
+    let v = fctiwz_low_word(mul_single(
+        sub_single(env.one, f1),
+        word_to_single(start as u32),
+    )) as i32;
     env.sw(g, 28, start.wrapping_sub(v))
 }
 
@@ -696,7 +715,10 @@ fn envelope_adsr(g: &mut Guest, e: u32) -> Result<()> {
                 let start = env.w(g, 8)?;
                 let f1 = curve_float(g, decay, sub_single(env.one, t))?;
                 let span_level = sustain.wrapping_sub(start);
-                let v = fctiwz_low_word(mul_single(sub_single(env.one, f1), word_to_single(span_level as u32))) as i32;
+                let v = fctiwz_low_word(mul_single(
+                    sub_single(env.one, f1),
+                    word_to_single(span_level as u32),
+                )) as i32;
                 return env.sw(g, 28, v.wrapping_add(start));
             }
             env.enter(g, 3, sustain)?;
@@ -807,7 +829,13 @@ fn write_outputs(g: &mut Guest, h: u32) -> Result<()> {
                         }
                         2 => {
                             let v = sum.wrapping_add(offset);
-                            if v < -10000 { -10000 } else if v > 0 { 0 } else { v }
+                            if v < -10000 {
+                                -10000
+                            } else if v > 0 {
+                                0
+                            } else {
+                                v
+                            }
                         }
                         _ => sum,
                     }

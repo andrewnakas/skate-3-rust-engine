@@ -132,7 +132,10 @@ fn the_voice_arena_plateaus_under_repeated_voices() {
     // graph, and the free list absorbs it, but it is not zero.
     let leaked = last.1 - first.1;
     println!("residual live blocks across 30 voices: {leaked}");
-    assert!(leaked <= 30, "more than one block per voice survives teardown");
+    assert!(
+        leaked <= 30,
+        "more than one block per voice survives teardown"
+    );
 }
 
 #[test]
@@ -158,7 +161,8 @@ fn headless_rolling_through_the_retail_path() {
     let blocks_per_frame = 48_000.0 / f64::from(PCM_FRAMES_PER_BLOCK) / 60.0;
     let mut worst_ms = 0.0f64;
     for (seconds, speed) in script {
-        let (mut peak, mut energy, mut samples, mut silent, mut blocks) = (0f32, 0f64, 0usize, 0, 0);
+        let (mut peak, mut energy, mut samples, mut silent, mut blocks) =
+            (0f32, 0f64, 0usize, 0, 0);
         for _ in 0..seconds * 60 {
             sound
                 .frame(&mut runtime, &rolling(tick, speed))
@@ -177,7 +181,10 @@ fn headless_rolling_through_the_retail_path() {
                 let stereo = super::downmix(&native);
                 let block_peak = stereo.iter().fold(0f32, |p, s| p.max(s.abs()));
                 peak = peak.max(block_peak);
-                energy += stereo.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>();
+                energy += stereo
+                    .iter()
+                    .map(|s| f64::from(*s) * f64::from(*s))
+                    .sum::<f64>();
                 samples += stereo.len();
                 // Retail fades rolling in over a few frames; judge continuity after 0.25 s.
                 if block_peak < 1.0e-5 && blocks >= 47 {
@@ -192,10 +199,14 @@ fn headless_rolling_through_the_retail_path() {
             use super::components::Controls;
             let levels: Vec<u32> = (0..20).map(|id| c.level(id)).collect();
             let raw: Vec<u32> = (0..20).map(|id| c.raw(id)).collect();
-            let inputs: Vec<u32> = (0..16).map(|id| runtime.mixmap_get(ctrl, id).unwrap_or(0)).collect();
-            eprintln!("  SkateBoard {ctrl:#010x} levels {levels:?}
+            let inputs: Vec<u32> = (0..16)
+                .map(|id| runtime.mixmap_get(ctrl, id).unwrap_or(0))
+                .collect();
+            eprintln!(
+                "  SkateBoard {ctrl:#010x} levels {levels:?}
   raw {raw:?}
-  inputs {inputs:?}");
+  inputs {inputs:?}"
+            );
         }
         eprintln!(
             "speed {speed:>4.1} m/s for {seconds} s: peak {:>6.1} dBFS, rms {:>6.1} dBFS, silent blocks {silent}/{blocks}, voices opened {} live {}",
@@ -205,13 +216,70 @@ fn headless_rolling_through_the_retail_path() {
             stats.live_voices,
         );
         if speed > 1.0 {
-            assert_eq!(silent, 0, "rolling at {speed} m/s must never drop to silence");
+            assert_eq!(
+                silent, 0,
+                "rolling at {speed} m/s must never drop to silence"
+            );
         }
     }
     eprintln!("worst block render {worst_ms:.2} ms (budget 5.33 ms)");
     if let Some(path) = std::env::var_os("SKATE_HEADLESS_WAV") {
         write_wav(std::path::Path::new(&path), &wav).expect("write wav");
         eprintln!("wrote {}", std::path::Path::new(&path).display());
+    }
+}
+
+/// How loud a revert's skid is against the roll it interrupts. RevertGround (102) with State+66
+/// set drives the skid counter to its +5/frame ramp; retail's capture (music off) puts a revert
+/// at 3–6 m/s **+10.2 dB** over rolling at the same speed, and a powerslide +4.1 dB.
+#[test]
+#[ignore = "needs the owner's assets; run explicitly"]
+fn headless_revert_skid_level() {
+    use skate_audio_core::authored::PCM_FRAMES_PER_BLOCK;
+    let assets = std::env::var_os("SKATE_ASSETS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| DEFAULT_ASSETS.into());
+    let super::Prepared {
+        mut runtime,
+        mut sound,
+        ..
+    } = super::prepare(&assets).expect("prepare the retail player-sound worker");
+    let blocks_per_frame = 48_000.0 / f64::from(PCM_FRAMES_PER_BLOCK) / 60.0;
+    let (mut tick, mut owed) = (0u64, 0.0f64);
+    // (label, frames, reverting)
+    let script = [
+        ("settle", 120, false),
+        ("roll", 60, false),
+        ("revert", 40, true),
+        ("after", 60, false),
+    ];
+    for (label, frames, reverting) in script {
+        let (mut energy, mut samples, mut peak) = (0f64, 0usize, 0f32);
+        for _ in 0..frames {
+            let mut o = rolling(tick, 5.0);
+            // Deck X across the roll, so rolling has retail's slip word of 1 rather than 11.
+            o.retail.deck_rows = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]];
+            if reverting {
+                o.state = 102;
+                o.retail.state = 102;
+                o.retail.state_flags[66 - 52] = true;
+            }
+            sound.frame(&mut runtime, &o).expect("player-sound frame");
+            tick += 1;
+            owed += blocks_per_frame;
+            while owed >= 1.0 {
+                owed -= 1.0;
+                let stereo = super::downmix(&runtime.pump_once().expect("render one block"));
+                peak = stereo.iter().fold(peak, |p, s| p.max(s.abs()));
+                energy += stereo.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+                samples += stereo.len();
+            }
+        }
+        eprintln!(
+            "{label:>6} at 5 m/s: rms {:>6.1} dBFS, peak {:>6.1} dBFS",
+            10.0 * (energy / samples.max(1) as f64).max(1e-18).log10(),
+            20.0 * peak.max(1e-9).log10(),
+        );
     }
 }
 
@@ -242,8 +310,11 @@ fn headless_landing_impact_is_audible() {
     let assets = std::env::var_os("SKATE_ASSETS")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| DEFAULT_ASSETS.into());
-    let super::Prepared { mut runtime, mut sound, .. } =
-        super::prepare(&assets).expect("prepare the retail player-sound worker");
+    let super::Prepared {
+        mut runtime,
+        mut sound,
+        ..
+    } = super::prepare(&assets).expect("prepare the retail player-sound worker");
     let mut tick = 0u64;
     let mut blocks_owed = 0.0f64;
     let blocks_per_frame = 48_000.0 / f64::from(PCM_FRAMES_PER_BLOCK) / 60.0;
@@ -279,7 +350,8 @@ fn headless_landing_impact_is_audible() {
             }
             for frame in native.chunks_exact(usize::from(PCM_CHANNELS)) {
                 for (front, surround) in [(frame[0], frame[4]), (frame[1], frame[5])] {
-                    frame_matrix = frame_matrix.max((front + 0.707 * frame[2] + 0.5 * surround).abs());
+                    frame_matrix =
+                        frame_matrix.max((front + 0.707 * frame[2] + 0.5 * surround).abs());
                 }
             }
             frame_peak = super::downmix(&native)
@@ -337,4 +409,110 @@ fn write_wav(path: &std::path::Path, stereo: &[f32]) -> std::io::Result<()> {
         out.write_all(&((sample.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())?;
     }
     out.flush()
+}
+
+/// Replay one skid's exact messages from a playtest trace through the headless runtime, one game
+/// frame at a time, so a patch decision seen in game (which voices it opens) can be reproduced and
+/// bisected. `SKATE_REPLAY_TRACE=<trace>`, `SKATE_REPLAY_FROM` / `_TO` = frames (the post at or
+/// before `FROM` is used), `SKATE_REPLAY_ZERO=3,9` zeroes those update words and `SKATE_REPLAY_SET=7=3999` pins one (only within `SKATE_REPLAY_SET_FROM..=_TO` if given). Run with
+/// `SKATE_AUDIO_TRACE` set to read the `OP` lines it produces.
+#[test]
+#[ignore = "needs the owner's assets and a playtest trace; run explicitly"]
+fn headless_replay_skid_from_trace() {
+    use skate_audio_core::authored::PCM_FRAMES_PER_BLOCK;
+    let (Ok(path), Ok(from), Ok(to)) = (
+        std::env::var("SKATE_REPLAY_TRACE"),
+        std::env::var("SKATE_REPLAY_FROM"),
+        std::env::var("SKATE_REPLAY_TO"),
+    ) else {
+        eprintln!("skipped: set SKATE_REPLAY_TRACE, SKATE_REPLAY_FROM and SKATE_REPLAY_TO");
+        return;
+    };
+    let (from, to): (u64, u64) = (from.parse().unwrap(), to.parse().unwrap());
+    let zero: Vec<usize> = std::env::var("SKATE_REPLAY_ZERO")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    // `SKATE_REPLAY_SET=7=3999,10=46` pins update words to constants.
+    let set: Vec<(usize, u32)> = std::env::var("SKATE_REPLAY_SET")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.trim().parse().ok()?, v.trim().parse().ok()?))
+        })
+        .collect();
+    let words = |line: &str| -> Vec<u32> {
+        line.split('|')
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .map(|w| u32::from_str_radix(w, 16).unwrap())
+            .collect()
+    };
+    let (mut post, mut updates) = (None, Vec::new());
+    let text = String::from_utf8_lossy(&std::fs::read(&path).expect("read trace")).into_owned();
+    for line in text.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(_), Some(frame), Some(tag)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let Ok(frame) = frame.parse::<u64>() else {
+            continue;
+        };
+        if !line.contains("Class_wheels_skid") || frame > to {
+            continue;
+        }
+        if tag == "PO" && frame <= from {
+            post = Some((frame, words(line)));
+            updates.clear();
+        } else if tag == "UP" && post.is_some() {
+            updates.push((frame, words(line)));
+        }
+    }
+    let (posted_at, post) = post.expect("a skid post at or before FROM");
+    let assets = std::env::var_os("SKATE_ASSETS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| DEFAULT_ASSETS.into());
+    let super::Prepared { mut runtime, .. } =
+        super::prepare(&assets).expect("prepare the retail player-sound worker");
+    let blocks_per_frame = 48_000.0 / f64::from(PCM_FRAMES_PER_BLOCK) / 60.0;
+    let mut owed = 0.0f64;
+    let mut pump = |runtime: &mut skate_audio_core::authored::AuthoredRuntime, owed: &mut f64| {
+        *owed += blocks_per_frame;
+        while *owed >= 1.0 {
+            *owed -= 1.0;
+            runtime.pump_once().expect("render one block");
+        }
+    };
+    super::trace::frame(posted_at);
+    let handle = runtime
+        .post("Class_wheels_skid", &post[..18])
+        .expect("post the skid");
+    pump(&mut runtime, &mut owed);
+    for (frame, mut w) in updates {
+        for &i in &zero {
+            w[i] = 0;
+        }
+        let (set_from, set_to) = (
+            std::env::var("SKATE_REPLAY_SET_FROM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            std::env::var("SKATE_REPLAY_SET_TO")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX),
+        );
+        if (set_from..=set_to).contains(&frame) {
+            for &(i, v) in &set {
+                w[i] = v;
+            }
+        }
+        super::trace::frame(frame);
+        runtime.redeliver(handle, &w[..18]).expect("redeliver");
+        pump(&mut runtime, &mut owed);
+    }
+    eprintln!("replayed skid posted at {posted_at} through {to}");
 }

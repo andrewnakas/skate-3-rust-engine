@@ -34,9 +34,9 @@ use skate_data::collections::Collections;
 
 use super::super::audio_state::AudioState;
 use super::board::SurfacePolicy;
-use super::contacts::{clamp_word, vault_word, SurfaceMap};
-use super::words::{fctiwz, HALF, KMH_PER_MS, TEN_THOUSAND};
-use super::{post, redeliver, release, Component, Controls, Tick};
+use super::contacts::{SurfaceMap, clamp_word, vault_word};
+use super::words::{HALF, KMH_PER_MS, TEN_THOUSAND, fctiwz};
+use super::{Component, Controls, Tick, post, redeliver, release};
 
 const MATERIAL_CLASS: &str = "Hash_049861E8F9A8D16B";
 const DEFAULT_KEY: &str = "Hash_D7EDBD362D7D2152";
@@ -61,10 +61,18 @@ const SURFACE_KEYS: [u64; 14] = [
     0xEDB51E711C25AA58,
 ];
 /// `sub_824C2E48` (V, per layer 0..3) and `sub_824C2D00` (F) field keys.
-const V_FIELDS: [&str; 4] =
-    ["Hash_0ECECDAC28B2B979", "Hash_58070BF511809903", "Hash_72BA0780A8FA25D6", "Hash_721A50C80028AD69"];
-const F_FIELDS: [&str; 4] =
-    ["Hash_69969AF1BE6BB367", "Hash_0555484D6D4A3128", "Hash_C21983A2160ED3AC", "Hash_69A5FC53091ED1F8"];
+const V_FIELDS: [&str; 4] = [
+    "Hash_0ECECDAC28B2B979",
+    "Hash_58070BF511809903",
+    "Hash_72BA0780A8FA25D6",
+    "Hash_721A50C80028AD69",
+];
+const F_FIELDS: [&str; 4] = [
+    "Hash_69969AF1BE6BB367",
+    "Hash_0555484D6D4A3128",
+    "Hash_C21983A2160ED3AC",
+    "Hash_69A5FC53091ED1F8",
+];
 
 /// Packet length: the constructor's 72-byte object minus the 4-byte header.
 pub(crate) const GRIND_WORDS: usize = 17;
@@ -110,7 +118,11 @@ impl GrindTuning {
     /// `sub_824C2E48` (V) / `sub_824C2D00` (F): surfaces ≥ 14 read surface 4; layers > 3 give 1.0.
     fn value(table: &[[f32; 4]; 14], surface: u32, layer: u32) -> f32 {
         let surface = if surface >= 14 { 4 } else { surface as usize };
-        if layer > 3 { ONE } else { table[surface][layer as usize] }
+        if layer > 3 {
+            ONE
+        } else {
+            table[surface][layer as usize]
+        }
     }
 
     /// `sub_824C2E48`: `fctiwz(V × 32767)`.
@@ -135,7 +147,11 @@ pub(crate) struct GrindOwner {
 }
 
 impl GrindOwner {
-    pub(crate) const LOCAL: Self = Self { local_72: true, index_64: 0, sfx_pack_564: false };
+    pub(crate) const LOCAL: Self = Self {
+        local_72: true,
+        index_64: 0,
+        sfx_pack_564: false,
+    };
 }
 
 /// `sub_824C28B0` speed: `min(fctiwz(clamp01((v − 0.5) / T × 3.6) × 10000), 9000)`, in retail's
@@ -158,7 +174,11 @@ pub(crate) fn grind_layer(family: i32) -> u32 {
 
 /// The grind surface of state `+692`: 4 for no material, else AudioSurfaceMap `+16`.
 pub(crate) fn grind_surface(tuning: &GrindTuning, material_692: u32, policy: SurfacePolicy) -> u32 {
-    let retail = if material_692 == NO_MATERIAL { 4 } else { tuning.surfaces.lookup(material_692 as i32, 16) };
+    let retail = if material_692 == NO_MATERIAL {
+        4
+    } else {
+        tuning.surfaces.lookup(material_692 as i32, 16)
+    };
     match policy {
         SurfacePolicy::Retail => retail,
         SurfacePolicy::Default(_) if retail == SKIP_SURFACE => retail,
@@ -212,7 +232,15 @@ pub(crate) fn grind_update(
     words[0] = 32_767;
     words[1] = clamp_word(gain, 0, 32_767);
     words[2] = clamp_word(controls.level(5) as i32, 0, 32_767);
-    words[15] = clamp_word(if owner.local_72 { controls.level(6) as i32 } else { 0 }, 0, 32_767);
+    words[15] = clamp_word(
+        if owner.local_72 {
+            controls.level(6) as i32
+        } else {
+            0
+        },
+        0,
+        32_767,
+    );
     words[5] = clamp_word(controls.level(3) as i32, 0, 25_000);
     words[6] = clamp_word(controls.level(4) as i32, 0, 25_000);
     words[3] = clamp_word(controls.raw(0) as i32, 0, 0x1_0000);
@@ -245,7 +273,10 @@ pub(crate) struct Grind {
 
 impl Grind {
     pub(crate) fn new(vault: &Collections) -> Result<Self, String> {
-        Ok(Self::with_tuning(GrindTuning::load(vault)?, SurfacePolicy::Default(2)))
+        Ok(Self::with_tuning(
+            GrindTuning::load(vault)?,
+            SurfacePolicy::Default(2),
+        ))
     }
 
     fn with_tuning(tuning: GrindTuning, surfaces: SurfacePolicy) -> Self {
@@ -267,7 +298,11 @@ impl Grind {
     }
 
     /// `sub_824C28B0` (without the emitter and event helpers).
-    pub(crate) fn step_process(&mut self, audio: &AudioState, controls: &dyn Controls) -> GrindEvents {
+    pub(crate) fn step_process(
+        &mut self,
+        audio: &AudioState,
+        controls: &dyn Controls,
+    ) -> GrindEvents {
         let mut events = GrindEvents::default();
         if audio.grinding_341 {
             self.inputs.push((0, 32_767));
@@ -296,16 +331,38 @@ impl Grind {
         let family = audio.grind_family_192 as i32;
         self.family_56 = family;
         let layer = grind_layer(family);
-        let level6 = if self.owner.local_72 { controls.level(6) } else { 0 };
-        events.post[0] = Some(grind_constructor(&self.tuning, self.speed_140, surface, layer, self.owner, level6));
+        let level6 = if self.owner.local_72 {
+            controls.level(6)
+        } else {
+            0
+        };
+        events.post[0] = Some(grind_constructor(
+            &self.tuning,
+            self.speed_140,
+            surface,
+            layer,
+            self.owner,
+            level6,
+        ));
         if family == 0 {
-            events.post[1] = Some(grind_constructor(&self.tuning, self.speed_140, surface, 1, self.owner, level6));
+            events.post[1] = Some(grind_constructor(
+                &self.tuning,
+                self.speed_140,
+                surface,
+                1,
+                self.owner,
+                level6,
+            ));
         }
         events
     }
 
     /// `sub_824C39E0`'s companion changes (the rewrite is [`Grind::rewrite`]).
-    pub(crate) fn step_update(&mut self, audio: &AudioState, controls: &dyn Controls) -> GrindEvents {
+    pub(crate) fn step_update(
+        &mut self,
+        audio: &AudioState,
+        controls: &dyn Controls,
+    ) -> GrindEvents {
         let mut events = GrindEvents::default();
         if !audio.grinding_341 || self.held[0].is_none() {
             return events;
@@ -314,10 +371,21 @@ impl Grind {
         if family != self.family_56 {
             if family == 0 {
                 if self.held[1].is_none() {
-                    let surface = grind_surface(&self.tuning, audio.grind_material_692, self.surfaces);
-                    let level6 = if self.owner.local_72 { controls.level(6) } else { 0 };
-                    events.post[1] =
-                        Some(grind_constructor(&self.tuning, self.speed_140, surface, 1, self.owner, level6));
+                    let surface =
+                        grind_surface(&self.tuning, audio.grind_material_692, self.surfaces);
+                    let level6 = if self.owner.local_72 {
+                        controls.level(6)
+                    } else {
+                        0
+                    };
+                    events.post[1] = Some(grind_constructor(
+                        &self.tuning,
+                        self.speed_140,
+                        surface,
+                        1,
+                        self.owner,
+                        level6,
+                    ));
                 }
             } else if self.family_56 == 0 {
                 events.release[1] = self.held[1].is_some();
@@ -334,12 +402,25 @@ impl Grind {
         }
         for (index, slot) in self.held.iter_mut().enumerate() {
             if let Some((_, words)) = slot.as_mut() {
-                grind_update(words, index, &self.tuning, audio, controls, self.owner, self.speed_140, self.surfaces);
+                grind_update(
+                    words,
+                    index,
+                    &self.tuning,
+                    audio,
+                    controls,
+                    self.owner,
+                    self.speed_140,
+                    self.surfaces,
+                );
             }
         }
     }
 
-    fn apply(&mut self, runtime: &mut skate_audio_core::authored::AuthoredRuntime, events: &GrindEvents) -> Result<(), String> {
+    fn apply(
+        &mut self,
+        runtime: &mut skate_audio_core::authored::AuthoredRuntime,
+        events: &GrindEvents,
+    ) -> Result<(), String> {
         for index in 0..2 {
             if events.release[index] {
                 let mut handle = self.held[index].take().map(|(handle, _)| handle);
@@ -410,12 +491,33 @@ mod tests {
     fn tuning() -> GrindTuning {
         let mut v = [[1.0; 4]; 14];
         let mut f = [[1.0; 4]; 14];
-        v[4] = [f32::from_bits(0x3EB8_51EC), f32::from_bits(0x3F0F_5C29), f32::from_bits(0x3F28_F5C3), 1.0];
+        v[4] = [
+            f32::from_bits(0x3EB8_51EC),
+            f32::from_bits(0x3F0F_5C29),
+            f32::from_bits(0x3F28_F5C3),
+            1.0,
+        ];
         f[4] = [f32::from_bits(0x3F57_0A3D), 1.0, 1.0, 0.5];
-        v[6] = [f32::from_bits(0x3F07_AE14), f32::from_bits(0x3F0C_CCCD), f32::from_bits(0x3F54_7AE1), f32::from_bits(0x3F33_3333)];
+        v[6] = [
+            f32::from_bits(0x3F07_AE14),
+            f32::from_bits(0x3F0C_CCCD),
+            f32::from_bits(0x3F54_7AE1),
+            f32::from_bits(0x3F33_3333),
+        ];
         v[12] = [1.0, 0.5, 1.0, 1.0];
-        f[12] = [f32::from_bits(0x3F47_AE14), 1.0, 1.0, f32::from_bits(0x3F4C_CCCD)];
-        GrindTuning { top_kmh: 45.0, v, f, eq: 5, surfaces: surface_map() }
+        f[12] = [
+            f32::from_bits(0x3F47_AE14),
+            1.0,
+            1.0,
+            f32::from_bits(0x3F4C_CCCD),
+        ];
+        GrindTuning {
+            top_kmh: 45.0,
+            v,
+            f,
+            eq: 5,
+            surfaces: surface_map(),
+        }
     }
 
     #[test]
@@ -427,7 +529,10 @@ mod tests {
 
     #[test]
     fn grind_layers_and_surfaces_follow_retail() {
-        assert_eq!([0, 1, 2, 3, 4, 5, 6, -1].map(grind_layer), [2, 0, 0, 2, 0, 3, 2, 2]);
+        assert_eq!(
+            [0, 1, 2, 3, 4, 5, 6, -1].map(grind_layer),
+            [2, 0, 0, 2, 0, 3, 2, 2]
+        );
         let t = tuning();
         assert_eq!(grind_surface(&t, 143, SurfacePolicy::Retail), 4);
         assert_eq!(grind_surface(&t, 5, SurfacePolicy::Retail), 8);
@@ -442,7 +547,9 @@ mod tests {
         // Frame 3894: layer 2 on surface 6 (V 0.83 → 27196), speed 0x1B11, level 6 = 0x664.
         assert_eq!(
             grind_constructor(&t, 0x1B11, 6, 2, GrindOwner::LOCAL, 0x664),
-            [0, 32767, 0, 0, 0, 25000, 0, 0x1B11, 1024, 6, 2, 0x6A3C, 0, 1, 1, 0x664, 5]
+            [
+                0, 32767, 0, 0, 0, 25000, 0, 0x1B11, 1024, 6, 2, 0x6A3C, 0, 1, 1, 0x664, 5
+            ]
         );
         // Frame 20599 (second skater, family 0): the layer-1 companion on surface 6, V 0.55.
         assert_eq!(t.v_word(6, 1), 0x4665);
@@ -455,7 +562,14 @@ mod tests {
     fn family_zero_posts_a_companion_and_the_main_packet_tracks_the_layer() {
         let mut grind = Grind::with_tuning(tuning(), SurfacePolicy::Retail);
         let controls = Captured::default();
-        let audio = { let mut s = AudioState::default(); s.grinding_341 = true; s.grind_family_192 = 0; s.grind_material_692 = 143; s.ground_speed_208 = 5.0; s };
+        let audio = {
+            let mut s = AudioState::default();
+            s.grinding_341 = true;
+            s.grind_family_192 = 0;
+            s.grind_material_692 = 143;
+            s.ground_speed_208 = 5.0;
+            s
+        };
         let events = grind.step_process(&audio, &controls);
         assert_eq!(events.post[0].map(|w| w[10]), Some(2));
         assert_eq!(events.post[1].map(|w| w[10]), Some(1));
@@ -466,23 +580,46 @@ mod tests {
         assert_eq!(grind.held[0].unwrap().1[10], 2);
         assert_eq!(grind.held[1].unwrap().1[10], 1);
         // Family 2: the companion goes, the main packet takes layer 0.
-        let audio = { let mut s = audio.clone(); s.grind_family_192 = 2; s };
+        let audio = {
+            let mut s = audio.clone();
+            s.grind_family_192 = 2;
+            s
+        };
         let events = grind.step_update(&audio, &controls);
         assert!(events.release[1]);
         grind.apply_local(&events);
         grind.rewrite(&audio, &controls);
         assert_eq!(grind.held[0].unwrap().1[10], 0);
         // Grinding stops: what is held is released.
-        let events = grind.step_process(&{ let mut s = AudioState::default(); s.grinding_prev_342 = true; s }, &controls);
+        let events = grind.step_process(
+            &{
+                let mut s = AudioState::default();
+                s.grinding_prev_342 = true;
+                s
+            },
+            &controls,
+        );
         assert_eq!(events.release, [true, false]);
-        assert_eq!(grind.take_controller_inputs(), [(0, 32_767), (1, 0), (0, 0), (1, 32_767)]);
+        assert_eq!(
+            grind.take_controller_inputs(),
+            [(0, 32_767), (1, 0), (0, 0), (1, 32_767)]
+        );
     }
 
     #[test]
     fn map_result_14_posts_nothing() {
         let mut grind = Grind::with_tuning(tuning(), SurfacePolicy::Retail);
-        let audio = { let mut s = AudioState::default(); s.grinding_341 = true; s.grind_family_192 = 2; s.grind_material_692 = 20; s };
-        assert_eq!(grind.step_process(&audio, &Captured::default()), GrindEvents::default());
+        let audio = {
+            let mut s = AudioState::default();
+            s.grinding_341 = true;
+            s.grind_family_192 = 2;
+            s.grind_material_692 = 20;
+            s
+        };
+        assert_eq!(
+            grind.step_process(&audio, &Captured::default()),
+            GrindEvents::default()
+        );
     }
 
     /// Replays the retail capture (local player's rows: w14 = 1) with the real vault tuning.
@@ -490,18 +627,25 @@ mod tests {
     #[ignore = "needs the retail capture in .local and the owner's vault"]
     fn grind_replays_the_retail_capture() {
         let Some(root) = capture::root() else { return };
-        let assets = std::env::var("SKATE_ASSETS")
-            .unwrap_or_else(|_| r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets".into());
+        let assets = std::env::var("SKATE_ASSETS").unwrap_or_else(|_| {
+            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets".into()
+        });
         let vault = Collections::load(std::path::Path::new(&assets)).unwrap();
         let tuning = GrindTuning::load(&vault).unwrap();
         let states = capture::states(&root);
         let rows = capture::rows(&root, "Class_grind");
         let mut by_frame = std::collections::BTreeMap::<u32, Vec<capture::Row>>::new();
-        for row in rows.iter().filter(|r| r.kind == "RL" || r.words.get(14) == Some(&1)) {
+        for row in rows
+            .iter()
+            .filter(|r| r.kind == "RL" || r.words.get(14) == Some(&1))
+        {
             by_frame.entry(row.frame).or_default().push(row.clone());
         }
-        let local_nodes: std::collections::HashSet<String> =
-            rows.iter().filter(|r| r.kind == "UP" && r.words.get(14) == Some(&1)).map(|r| r.node.clone()).collect();
+        let local_nodes: std::collections::HashSet<String> = rows
+            .iter()
+            .filter(|r| r.kind == "UP" && r.words.get(14) == Some(&1))
+            .map(|r| r.node.clone())
+            .collect();
         let mut grind = Grind::with_tuning(tuning, SurfacePolicy::Retail);
         let mut updates = Matches::new("Class_grind update", GRIND_WORDS);
         let mut posts = Matches::new("Class_grind post", GRIND_WORDS);
@@ -526,13 +670,19 @@ mod tests {
                 }
                 for up in &ups {
                     // The companion is the held packet whose constructor V word (w11) matches.
-                    let index = usize::from(grind.held[1].is_some_and(|(_, w)| w[11] == up.words[11]) && grind.held[0].is_some_and(|(_, w)| w[11] != up.words[11]));
+                    let index = usize::from(
+                        grind.held[1].is_some_and(|(_, w)| w[11] == up.words[11])
+                            && grind.held[0].is_some_and(|(_, w)| w[11] != up.words[11]),
+                    );
                     if let Some((_, words)) = grind.held[index].as_ref() {
                         updates.add(frame, &up.words[..GRIND_WORDS], words);
                     }
                 }
             }
-            let retail_rl = here.iter().filter(|r| r.kind == "RL" && local_nodes.contains(&r.node)).count();
+            let retail_rl = here
+                .iter()
+                .filter(|r| r.kind == "RL" && local_nodes.contains(&r.node))
+                .count();
             let pos: Vec<_> = here.iter().filter(|r| r.kind == "PO").collect();
             let mut ours_po = 0;
             if let Some(state) = states.get(&frame) {
@@ -559,6 +709,8 @@ mod tests {
         }
         posts.print();
         updates.print();
-        println!("frames with matching post/release counts {timing_ok}; mismatches (frame, ours po, retail po, ours rl, retail rl) {timing_bad:?}");
+        println!(
+            "frames with matching post/release counts {timing_ok}; mismatches (frame, ours po, retail po, ours rl, retail rl) {timing_bad:?}"
+        );
     }
 }

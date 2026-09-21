@@ -75,7 +75,11 @@ fn material(value: u32) -> u32 {
         return 143;
     }
     let value = value - 1;
-    if value > 143 || value < 0 { 143 } else { value as u32 }
+    if value > 143 || value < 0 {
+        143
+    } else {
+        value as u32
+    }
 }
 
 /// `sub_82D2D908`: the category of a physical state id.
@@ -416,8 +420,8 @@ impl Conditioner {
             self.grind_family_672 = inputs.grind_family;
             self.grind_material_676 = inputs.grind_audio_surface;
         }
-        self.output.grinding_208 = inputs.state_category == 400
-            || (inputs.state == 701 && inputs.grind_flag_323);
+        self.output.grinding_208 =
+            inputs.state_category == 400 || (inputs.state == 701 && inputs.grind_flag_323);
         self.output.grind_family_28 = self.grind_family_672;
         self.output.grind_material_40 = self.grind_material_676;
         if !(inputs.grind_impact_speed <= 0.0) {
@@ -831,10 +835,8 @@ impl AudioState {
         self.pump_absorption_712 = inputs.pump_absorption;
         self.walking_716 = category(inputs.state) == 500;
         self.bridge_offboard_air(inputs.filtered_state == 7);
-        self.foot_down_right_724 = inputs.offboard_feet[1]
-            || inputs.footplant[1]
-            || self.push_right_334
-            || self.brake_336;
+        self.foot_down_right_724 =
+            inputs.offboard_feet[1] || inputs.footplant[1] || self.push_right_334 || self.brake_336;
         self.foot_down_left_725 =
             inputs.offboard_feet[0] || inputs.footplant[0] || self.push_left_333;
 
@@ -1143,7 +1145,11 @@ mod tests {
         AudioTuning {
             slip_divisor: 45.0,
             slip_offset: -0.75,
-            landing_thresholds: [1.5, f32::from_bits(0x4026_6666), f32::from_bits(0x405C_CCCD)],
+            landing_thresholds: [
+                1.5,
+                f32::from_bits(0x4026_6666),
+                f32::from_bits(0x405C_CCCD),
+            ],
             jump_thresholds: [f32::from_bits(0x3EE6_6666), 0.75],
             wheel_impact_divisor: 9.0,
             wheel_bucket_high: 0.5,
@@ -1200,7 +1206,11 @@ mod tests {
         let mut state = AudioState::default();
         let mut observe = |flags: &[usize]| {
             state.update(&inputs_with(flags), &tuning);
-            (state.push_plant_335, state.push_left_333, state.push_right_334)
+            (
+                state.push_plant_335,
+                state.push_left_333,
+                state.push_right_334,
+            )
         };
         // Left-toe push: event present, planted.
         assert_eq!(observe(&[56, 55]), (true, true, false));
@@ -1427,7 +1437,13 @@ mod tests {
         let tuning = tuning();
         let mut state = AudioState::default();
         let mut inputs = RetailAudioInputs::default();
-        for (strength, bucket) in [(0.2, 0), (tuning.jump_thresholds[0], 0), (0.5, 1), (0.75, 1), (0.8, 2)] {
+        for (strength, bucket) in [
+            (0.2, 0),
+            (tuning.jump_thresholds[0], 0),
+            (0.5, 1),
+            (0.75, 1),
+            (0.8, 2),
+        ] {
             inputs.jump_strength = strength;
             state.update(&inputs, &tuning);
             assert_eq!(state.jump_bucket_304, bucket, "strength {strength}");
@@ -1523,11 +1539,17 @@ mod tests {
         let mut inputs = RetailAudioInputs::default();
         state.update(&inputs, &tuning);
         assert!(!state.trick_active_343);
-        assert_eq!((state.audio_trick_348, state.audio_trick_352), (u32::MAX, u32::MAX));
+        assert_eq!(
+            (state.audio_trick_348, state.audio_trick_352),
+            (u32::MAX, u32::MAX)
+        );
         inputs.scorable_id = 96;
         state.update(&inputs, &tuning);
         assert!(state.trick_active_343 && state.trick_flag_344);
-        assert_eq!((state.audio_trick_348, state.audio_trick_352), (0, u32::MAX));
+        assert_eq!(
+            (state.audio_trick_348, state.audio_trick_352),
+            (0, u32::MAX)
+        );
         // A scorable without an audio record is still an active trick.
         inputs.scorable_id = HIPPY_JUMP;
         state.update(&inputs, &tuning);
@@ -1579,7 +1601,14 @@ mod tests {
         let tuning = tuning();
         let mut state = AudioState::default();
         let mut inputs = RetailAudioInputs::default();
-        for (scrape, expected) in [(0.5, 0.5), (0.25, 0.5), (0.0, 0.5), (0.0, 0.5), (0.0, 0.25), (0.0, 0.0)] {
+        for (scrape, expected) in [
+            (0.5, 0.5),
+            (0.25, 0.5),
+            (0.0, 0.5),
+            (0.0, 0.5),
+            (0.0, 0.25),
+            (0.0, 0.0),
+        ] {
             inputs.deck_scrape = scrape;
             state.update(&inputs, &tuning);
             assert_eq!(state.deck_scrape_668, expected);
@@ -1636,7 +1665,10 @@ mod tests {
         let state = AudioState::from_capture(&words);
         assert!(state.in_known_air_332 && state.push_plant_335);
         assert!(!state.push_left_333 && !state.push_right_334);
-        assert_eq!((state.foot_surface_736, state.foot_surface_738), (0xB084, 0x83));
+        assert_eq!(
+            (state.foot_surface_736, state.foot_surface_738),
+            (0xB084, 0x83)
+        );
         assert_eq!(state.offboard_air_countdown_720, 20);
         assert_eq!(state.ground_speed_208, 2.5);
         let mut words = [0u32; CAPTURE_WORDS];
@@ -1665,7 +1697,10 @@ mod tests {
         for pair in rows.windows(2) {
             let (previous, current) = (&pair[0].1, &pair[1].1);
             assert_eq!(current.grinding_prev_342, previous.grinding_341);
-            assert_eq!(current.com_speed_216.to_bits(), current.com_speed_212.to_bits());
+            assert_eq!(
+                current.com_speed_216.to_bits(),
+                current.com_speed_212.to_bits()
+            );
             assert!(current.wheel_material_620.iter().all(|&m| m <= 143));
             assert!((1..=5).contains(&current.step_code_740));
             // +496..+524 are clamped conditioner impacts (0, or 0.001..1) times the holder +36
@@ -1677,7 +1712,10 @@ mod tests {
             );
             for impact in current.body_impact_496 {
                 let raw = impact / scale;
-                assert!(impact == 0.0 || (raw >= 0.000_999 && raw <= 1.000_001), "{raw}");
+                assert!(
+                    impact == 0.0 || (raw >= 0.000_999 && raw <= 1.000_001),
+                    "{raw}"
+                );
             }
 
             let mut state = previous.clone();
@@ -1686,8 +1724,14 @@ mod tests {
             state.wheel_landed_464 = current.wheel_landed_464;
             state.grinding_341 = current.grinding_341;
             state.bridge_wheel_landing(&tuning);
-            assert_eq!(bits(state.wheel_air_factor_244), bits(current.wheel_air_factor_244));
-            assert_eq!(state.wheel_landing_bucket_448, current.wheel_landing_bucket_448);
+            assert_eq!(
+                bits(state.wheel_air_factor_244),
+                bits(current.wheel_air_factor_244)
+            );
+            assert_eq!(
+                state.wheel_landing_bucket_448,
+                current.wheel_landing_bucket_448
+            );
 
             // When the forcing rule applies, the capture must hold 1 whatever the ring said.
             let mut state = previous.clone();
@@ -1706,7 +1750,11 @@ mod tests {
                 current.hold_clock_312 - previous.hold_clock_312,
             );
             assert_eq!(
-                (state.hold_expired_310, state.hold_active_311, state.hold_start_316.to_bits()),
+                (
+                    state.hold_expired_310,
+                    state.hold_active_311,
+                    state.hold_start_316.to_bits()
+                ),
                 (
                     current.hold_expired_310,
                     current.hold_active_311,
@@ -1716,7 +1764,10 @@ mod tests {
 
             let mut state = previous.clone();
             state.bridge_offboard_air(current.offboard_air_718);
-            assert_eq!(state.offboard_air_countdown_720, current.offboard_air_countdown_720);
+            assert_eq!(
+                state.offboard_air_countdown_720,
+                current.offboard_air_countdown_720
+            );
 
             let mut state = previous.clone();
             state.bridge_foot_surfaces(current.foot_surface_736, current.footplant_768);
@@ -1812,8 +1863,14 @@ mod tests {
         inputs.body_contacts.specific_current = [false, true];
         state.update(&inputs, &tuning);
         // Previous +212 is 0: graph y0 = 1.
-        assert_eq!(state.body_impact_496[..4], [0.5, BODY_IMPACT_FLOOR, 1.0, 0.0]);
-        assert_eq!((state.body_slide_528[0], state.body_material_560[0]), (2.5, 4));
+        assert_eq!(
+            state.body_impact_496[..4],
+            [0.5, BODY_IMPACT_FLOOR, 1.0, 0.0]
+        );
+        assert_eq!(
+            (state.body_slide_528[0], state.body_material_560[0]),
+            (2.5, 4)
+        );
         assert!(!state.groin_contact_592 && state.face_contact_593);
         assert_eq!(state.other_skater_604, -1);
         // Contact ends and the COM speed rises past the last graph x: held three more

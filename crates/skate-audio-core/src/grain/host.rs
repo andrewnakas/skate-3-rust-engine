@@ -374,7 +374,10 @@ impl Grains<'_> {
     pub fn place(&mut self, bytes: &[u8]) -> Result<u32> {
         let at = self.heap.alloc(self.g, bytes.len() as u32, 16)?;
         if at == 0 {
-            return Err(Error::new(0, "guest heap exhausted placing a resident file"));
+            return Err(Error::new(
+                0,
+                "guest heap exhausted placing a resident file",
+            ));
         }
         self.g.set_span(at, bytes)?;
         Ok(at)

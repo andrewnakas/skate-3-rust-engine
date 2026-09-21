@@ -27,7 +27,10 @@ fn image(dir: &Path) -> Vec<Segment> {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         if let Some(hex) = name.strip_prefix("g_").and_then(|s| s.strip_suffix(".bin")) {
             let page = u32::from_str_radix(hex, 16).unwrap();
-            segs.push(Segment { base: page << 16, bytes: std::fs::read(&path).unwrap() });
+            segs.push(Segment {
+                base: page << 16,
+                bytes: std::fs::read(&path).unwrap(),
+            });
         }
     }
     segs
@@ -38,9 +41,13 @@ fn default_capture() -> PathBuf {
     let mut logs: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
         .unwrap_or_default();
-    logs.retain(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("retail-audio-capture-")));
+    logs.retain(|p| {
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("retail-audio-capture-"))
+    });
     logs.sort();
-    logs.pop().expect("no retail-audio-capture-*.log under .local/captures")
+    logs.pop()
+        .expect("no retail-audio-capture-*.log under .local/captures")
 }
 
 struct Frame {
@@ -55,31 +62,67 @@ fn hex(s: &str) -> u32 {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let capture = args.next().filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(default_capture);
-    let assets = args.next().filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_ASSETS));
-    let max_frames: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(usize::MAX);
-    let mode = std::env::var("MODE").map(|s| hex(&s)).unwrap_or(0xFFFF_FFFF);
-    let show: usize = std::env::var("SHOW").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let capture = args
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_capture);
+    let assets = args
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ASSETS));
+    let max_frames: usize = args
+        .next()
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(usize::MAX);
+    let mode = std::env::var("MODE")
+        .map(|s| hex(&s))
+        .unwrap_or(0xFFFF_FFFF);
+    let show: usize = std::env::var("SHOW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
 
     let file = std::fs::read(assets.join("private/stock/data/audio/MixMapSK8.mxb")).expect("mxb");
     let mut segs = image(&assets.join("private/stock/audio-runtime-image"));
     const HEAP: u32 = 0x4000_0000;
     const HEAP_LEN: u32 = 0x0080_0000;
-    segs.push(Segment { base: HEAP, bytes: vec![0; HEAP_LEN as usize] });
+    segs.push(Segment {
+        base: HEAP,
+        bytes: vec![0; HEAP_LEN as usize],
+    });
     let mut g = Guest::from_segments(segs);
-    let mut heap = BumpHeap { next: HEAP, end: HEAP + HEAP_LEN };
+    let mut heap = BumpHeap {
+        next: HEAP,
+        end: HEAP + HEAP_LEN,
+    };
     let mut listener = KeyedListener::retail();
     let mm = mixmap::load(&mut g, &mut heap, &mut listener, &file).expect("build");
     g.set_u32(mm.manager + 4, mode).unwrap();
-    let by_key: HashMap<u32, u32> = mixmap::controllers(&g, mm.host).unwrap().into_iter().map(|(c, k)| (k, c)).collect();
-    eprintln!("capture {}; {} controllers; mode {mode:08X}", capture.display(), by_key.len());
+    let by_key: HashMap<u32, u32> = mixmap::controllers(&g, mm.host)
+        .unwrap()
+        .into_iter()
+        .map(|(c, k)| (k, c))
+        .collect();
+    eprintln!(
+        "capture {}; {} controllers; mode {mode:08X}",
+        capture.display(),
+        by_key.len()
+    );
     // TRACEB=<B key>: print that lookup's input block and state after every evaluation in FROM..TO.
     let trace_b: Option<u32> = std::env::var("TRACEB").ok().map(|s| {
         let e = mixmap::resolve(&mut g, &mut listener, mm.host, hex(&s), 0, 1).unwrap();
         g.u32(e + 4).unwrap()
     });
-    let from: usize = std::env::var("FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let to: usize = std::env::var("TO").ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let from: usize = std::env::var("FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let to: usize = std::env::var("TO")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     let reader = BufReader::with_capacity(1 << 22, std::fs::File::open(&capture).expect("capture"));
     let mut current: Option<Frame> = None;
@@ -99,11 +142,16 @@ fn main() {
     // RULESLOT=<n>: rebuild the sign-change bits only for that SFX slot's controllers.
     let rule_slot: Option<u32> = std::env::var("RULESLOT").ok().and_then(|s| s.parse().ok());
     // DTBIAS=<s>: add to every captured dt (the log prints dt to 6 decimals only).
-    let dt_bias: f64 = std::env::var("DTBIAS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let dt_bias: f64 = std::env::var("DTBIAS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let mut prev_rates: HashMap<u32, (f32, f32)> = HashMap::new();
     // INPUTS=<hex,hex,...>: drive only these controllers; COMPARE=<hex,...>: compare only these.
     let list = |name: &str| -> Option<Vec<u32>> {
-        std::env::var(name).ok().map(|s| s.split(',').map(hex).collect())
+        std::env::var(name)
+            .ok()
+            .map(|s| s.split(',').map(hex).collect())
     };
     let only_inputs = list("INPUTS");
     let only_compare = list("COMPARE");
@@ -120,7 +168,9 @@ fn main() {
             if only_inputs.as_ref().is_some_and(|l| !l.contains(key)) {
                 continue;
             }
-            let Some(&c) = by_key.get(key) else { panic!("capture key {key:08X} not built") };
+            let Some(&c) = by_key.get(key) else {
+                panic!("capture key {key:08X} not built")
+            };
             let block = g.u32(c + 8).unwrap();
             if block != 0 {
                 let mut words = *inputs;
@@ -158,7 +208,9 @@ fn main() {
         }
         if let Some(st) = trace_b.filter(|_| index >= from && index <= to) {
             let blk = g.u32(st + 4).unwrap();
-            let w: Vec<String> = (0..16).map(|k| format!("{:08X}", g.u32(blk + 4 * k).unwrap())).collect();
+            let w: Vec<String> = (0..16)
+                .map(|k| format!("{:08X}", g.u32(blk + 4 * k).unwrap()))
+                .collect();
             println!("f{index} in  {}", w.join(" "));
         }
         if export_path.is_some() {
@@ -185,7 +237,12 @@ fn main() {
                 export.extend_from_slice(&v.to_le_bytes());
             }
             for pk in &player_keys {
-                let outs = frame.ctrls.iter().find(|(k, _, _)| k == pk).map(|(_, _, o)| *o).unwrap_or([0; 16]);
+                let outs = frame
+                    .ctrls
+                    .iter()
+                    .find(|(k, _, _)| k == pk)
+                    .map(|(_, _, o)| *o)
+                    .unwrap_or([0; 16]);
                 for o in outs {
                     export.extend_from_slice(&o.to_le_bytes());
                 }
@@ -210,8 +267,13 @@ fn main() {
             let f = |o: u32| f32::from_bits(g.u32(st + o).unwrap());
             println!(
                 "f{index} st  i8 {} mb {} lin {} slew {} last {} delta {} dt {}",
-                g.u32(st + 8).unwrap() as i32, g.u32(st + 12).unwrap() as i32, g.u32(st + 16).unwrap() as i32,
-                g.u32(st + 20).unwrap() as i32, f(24), f(28), frame.dt
+                g.u32(st + 8).unwrap() as i32,
+                g.u32(st + 12).unwrap() as i32,
+                g.u32(st + 16).unwrap() as i32,
+                g.u32(st + 20).unwrap() as i32,
+                f(24),
+                f(28),
+                frame.dt
             );
         }
         let mut frame_bad = false;
@@ -223,7 +285,11 @@ fn main() {
             let block = g.u32(c + 12).unwrap();
             let entry = per_key.entry(*key).or_default();
             for (i, want) in outputs.iter().enumerate() {
-                let got = if block == 0 { 0 } else { g.u32(block + 4 * i as u32).unwrap() };
+                let got = if block == 0 {
+                    0
+                } else {
+                    g.u32(block + 4 * i as u32).unwrap()
+                };
                 words += 1;
                 entry.0 += 1;
                 if got != *want {
@@ -232,7 +298,9 @@ fn main() {
                     frame_bad = true;
                     if shown < show {
                         shown += 1;
-                        println!("frame {index} key {key:08X} word {i:2}: got {got:08X} want {want:08X}");
+                        println!(
+                            "frame {index} key {key:08X} word {i:2}: got {got:08X} want {want:08X}"
+                        );
                     }
                 }
             }
@@ -261,10 +329,15 @@ fn main() {
                 let _host = f.next();
                 let dt: f64 = f.next().unwrap().parse().unwrap();
                 let _ = fr;
-                current = Some(Frame { dt, ctrls: Vec::with_capacity(247) });
+                current = Some(Frame {
+                    dt,
+                    ctrls: Vec::with_capacity(247),
+                });
             }
             Some("MC") => {
-                let Some(frame) = current.as_mut() else { continue };
+                let Some(frame) = current.as_mut() else {
+                    continue;
+                };
                 let _ctrl = f.next();
                 let key = hex(f.next().unwrap());
                 let _inptr = f.next();

@@ -70,7 +70,10 @@ impl AuthoredRuntime {
         if !self.has_mixmap() {
             return Err(Error::new(MIXMAP_SPACE, "MixMap not loaded"));
         }
-        Ok((self.guest.u32(MIXMAP_SPACE + 4)?, self.guest.u32(MIXMAP_SPACE + 8)?))
+        Ok((
+            self.guest.u32(MIXMAP_SPACE + 4)?,
+            self.guest.u32(MIXMAP_SPACE + 8)?,
+        ))
     }
 
     /// The manager's per-frame tick (`sub_8294BAE8` → host slot 2, `sub_8294F5E8`).
@@ -83,7 +86,9 @@ impl AuthoredRuntime {
     /// it; `None` before [`Self::load_mixmap`] or for a key the file never names.
     pub fn mixmap_controller(&self, key: u32) -> Option<u32> {
         let (_, host) = self.mixmap_header().ok()?;
-        mixmap::find_controller(&self.guest, host, key).ok().flatten()
+        mixmap::find_controller(&self.guest, host, key)
+            .ok()
+            .flatten()
     }
 
     /// Controller slot 8 (`sub_8294BC50`): `[ctrl+8][id] = value`.
@@ -106,7 +111,9 @@ impl AuthoredRuntime {
     /// `key`, in order, through slot 8. A key the MixMap does not name is ignored, as retail's
     /// `[owner+12] == 0` check ignores an unbound owner.
     pub fn mixmap_apply(&mut self, key: u32, writes: &[(u32, u32)]) -> Result<()> {
-        let Some(ctrl) = self.mixmap_controller(key) else { return Ok(()) };
+        let Some(ctrl) = self.mixmap_controller(key) else {
+            return Ok(());
+        };
         for &(id, word) in writes {
             controller::set(&mut self.guest, ctrl, id, word)?;
         }

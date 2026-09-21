@@ -224,10 +224,16 @@ pub fn voice_values(member: &MemberValues, rand: &mut Rand) -> VoiceValues {
         // fnmsubs: 1 − (−t)·(1 − spread).
         (-(f64::from(-t).mul_add(f64::from(below), -1.0))) as f32
     };
-    let gain = (f64::from(rand.unit()).mul_add(f64::from(member.gain_range), f64::from(member.gain))) as f32;
-    let mut delay = if member.delay == 0.0 { 0.0 } else { member.delay };
+    let gain = (f64::from(rand.unit())
+        .mul_add(f64::from(member.gain_range), f64::from(member.gain))) as f32;
+    let mut delay = if member.delay == 0.0 {
+        0.0
+    } else {
+        member.delay
+    };
     if member.delay_range != 0.0 {
-        delay = (f64::from(rand.unit()).mul_add(f64::from(member.delay_range), f64::from(delay))) as f32;
+        delay = (f64::from(rand.unit()).mul_add(f64::from(member.delay_range), f64::from(delay)))
+            as f32;
     }
     VoiceValues { gain, pitch, delay }
 }
@@ -326,7 +332,15 @@ impl AuthoredRuntime {
         let system = self.guest.u32(root + 8)?;
         let graph = {
             let Self { guest, owner, .. } = self;
-            modules::build_graph(guest, &mut owner.device.heap, &mut crate::mathlib::Image, system, 4, 3, frame)?
+            modules::build_graph(
+                guest,
+                &mut owner.device.heap,
+                &mut crate::mathlib::Image,
+                system,
+                4,
+                3,
+                frame,
+            )?
         };
         if graph == 0 {
             return Err(Error::new(0, "the owner send graph was not built"));
@@ -392,7 +406,10 @@ impl AuthoredRuntime {
             owner.device.open(guest, &request)?
         };
         if opened == 0 {
-            return Err(Error::new(voice.sample, "the one-shot voice was not opened"));
+            return Err(Error::new(
+                voice.sample,
+                "the one-shot voice was not opened",
+            ));
         }
         // Retail points the voice's output send at `[voice+92]`, the owner send bus's `Sub0`
         // (`sub_82976360`). The open has already pointed it at a bus, so it is re-pointed here.

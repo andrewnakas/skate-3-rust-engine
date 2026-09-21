@@ -211,7 +211,10 @@ pub fn ratio_to_mb(g: &Guest, f1: f64) -> Result<i32> {
     };
     let r11 = fctiwz_low_word(lin);
     let r10 = lin_to_mb(g, r11, -10000)?;
-    Ok(fctiwz_low_word(mul_single(word_to_single(r10 as u32), load_single(g, scale)?)) as i32)
+    Ok(fctiwz_low_word(mul_single(
+        word_to_single(r10 as u32),
+        load_single(g, scale)?,
+    )) as i32)
 }
 
 /// `sub_8294B4D8(cents)`: `2^(cents/1200)` as the guest computes it — whole octaves by repeated

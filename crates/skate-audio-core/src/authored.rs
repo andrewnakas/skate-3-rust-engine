@@ -163,6 +163,8 @@ struct AuthoredDevice {
     players: HashMap<u32, SourceState>, // SndPlayer1 -> decoder state
     live: HashMap<u32, u32>,            // voice -> player
     opened: u64,
+    /// Voices whose player has published an active span; see `query`.
+    sounded: std::collections::HashSet<u32>,
     /// Grain-player hook (`grain::host`): grain files, pending grain plays and the plug-in clock.
     grains: crate::grain::host::GrainRuntime,
 }
@@ -244,6 +246,7 @@ impl AuthoredRuntime {
             players: HashMap::new(),
             live: HashMap::new(),
             opened: 0,
+            sounded: Default::default(),
             grains: crate::grain::host::GrainRuntime::default(),
         };
         device.initialize(&mut guest)?;
@@ -481,15 +484,15 @@ impl AuthoredDevice {
     }
 
     fn source_pump(&mut self, g: &mut Guest, stream: u32) -> Result<()> {
-        pump::pump(
-            g,
-            self,
-            stream,
-            pump::PumpConstants {
-                far_future: 1.0e30,
-                time_bump: 0.0,
-            },
-        )
+        // The pump's two image doubles, as `sub_82B31EE0` loads them (`lis -32208` − 31232, +256
+        // and +4192). The idle time is 0.0, not a far-future marker: with an invented 1e30 a
+        // finished one-shot reported an elapsed time no patch ever sees in retail, so the skid's
+        // second layer never re-triggered and a revert kept only its quiet first voice.
+        let constants = pump::PumpConstants {
+            far_future: f64::from_bits(g.u64(0x822F_8700)?),
+            time_bump: f64::from_bits(g.u64(0x822F_9660)?),
+        };
+        pump::pump(g, self, stream, constants)
     }
 
     /// `heap` is passed in rather than taken from `self`, because the command drain moves the
@@ -577,6 +580,7 @@ impl VoiceDevice for AuthoredDevice {
         );
         self.live.insert(voice, g.u32(voice + 4)?);
         self.opened += 1;
+        self.sounded.remove(&voice);
         crate::voice::report_open(g, request, voice)?;
         if std::env::var_os("SKATE_AUDIO_VOICE_TRACE").is_some() {
             eprintln!(
@@ -589,6 +593,7 @@ impl VoiceDevice for AuthoredDevice {
 
     fn release(&mut self, g: &mut Guest, voice: u32) -> Result<()> {
         if let Some(player) = self.live.remove(&voice) {
+            crate::voice::report_release(voice);
             if std::env::var_os("SKATE_AUDIO_VOICE_TRACE").is_some() {
                 eprintln!(
                     "SKATE_AUDIO_VOICE release voice={voice:08x} live={}",
@@ -657,6 +662,27 @@ impl VoiceDevice for AuthoredDevice {
         }
         out[0] = 1;
         let stream = g.u32(voice + 8)?;
+        // A voice whose player has played and then gone idle has ended.
+        //
+        // **Approximation, deliberate.** Retail reports this through the player's state byte: a
+        // finished player is retired by `sub_82B49100`, which stores 2 into `+71`, and the test
+        // above is retail's own (`sub_824A2DD8`). Nothing retires a player here, because the
+        // per-block `rw_system` driver (`sub_82B48530`, ported as `runtime::run_frame`) is not
+        // driven by this runtime and its object list at `SYSTEM+20` stays empty, so a one-shot
+        // that finished still read as live for ever. A patch that re-arms a layer when its voice
+        // ends -- the skid's second layer -- then never fired again for the life of the message:
+        // a powerslide kept one quiet voice instead of retriggering, and the revert that followed
+        // stayed ~10 dB below retail's. Replacing this with the real retirement path is the fix.
+        // `SKATE_AUDIO_NO_VOICE_END=1` restores the old behaviour, for an A/B by ear.
+        let idle = g.u64(stream + pump::END_TIME)? == 0
+            && std::env::var_os("SKATE_AUDIO_NO_VOICE_END").is_none();
+        if idle && self.sounded.contains(&voice) {
+            out[0] = 0;
+            return Ok(());
+        }
+        if !idle {
+            self.sounded.insert(voice);
+        }
         let status = g.u32(stream + 16)?;
         let duration = f64::from_bits(g.u64(voice + 56)?);
         let unit = f64::from_bits(g.u64(0x822F_8890)?);

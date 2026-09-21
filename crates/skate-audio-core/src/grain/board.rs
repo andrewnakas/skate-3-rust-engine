@@ -326,7 +326,9 @@ fn vector_length(v: [f32; 4]) -> f32 {
 /// `vnmsubfp`/`vmaddfp` (`crate::vmx`), as `sub_824C8588` and `sub_824C6198` spell it. Returns the
 /// normalised vector and `|v|²`.
 #[target_feature(enable = "sse4.1,fma")]
-unsafe fn normalise(v: std::arch::x86_64::__m128) -> (std::arch::x86_64::__m128, std::arch::x86_64::__m128) {
+unsafe fn normalise(
+    v: std::arch::x86_64::__m128,
+) -> (std::arch::x86_64::__m128, std::arch::x86_64::__m128) {
     use crate::vmx;
     use std::arch::x86_64::*;
     unsafe {

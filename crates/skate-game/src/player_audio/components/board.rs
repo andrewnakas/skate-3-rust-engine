@@ -50,12 +50,12 @@
 
 use std::collections::HashMap;
 
+use skate_audio_core::fp::{fmadd_single, nmsub_single};
 use skate_audio_core::grain::board::{
     self as grain_board, BoardInputs, ChainInputs, GrainRecord, SlewInputs, SurfaceTuning,
 };
 use skate_audio_core::grain::chain::ChainConfig;
 use skate_audio_core::grain::envelope::{Envelope, program_push};
-use skate_audio_core::fp::{fmadd_single, nmsub_single};
 use skate_data::audio::grains::{GrainMember, GrainVault};
 use skate_data::collections::Collections;
 
@@ -92,7 +92,12 @@ const NINETY: f32 = 90.0;
 const BRAKE_STEP: f32 = f32::from_bits(0x3D4C_CCCD);
 /// The title generator's state in the dumped image (`0x82FD7D74`).
 const RNG_SEED: [u32; 6] = [
-    0xF22D_0E56, 0x8831_26E9, 0xC624_DD2F, 0x0702_C49C, 0x9E35_3F7D, 0x6FDF_3B64,
+    0xF22D_0E56,
+    0x8831_26E9,
+    0xC624_DD2F,
+    0x0702_C49C,
+    0x9E35_3F7D,
+    0x6FDF_3B64,
 ];
 
 /// How [`Board::surface_of`] turns a truck's contact into a surface.
@@ -201,7 +206,8 @@ impl BoardVault {
         const EQ: &str = "Hash_42AFE160E647167C";
         const OWNER: &str = "Hash_6E878344774A7999";
         let surfaces = SurfaceMap::load(c)?;
-        let rolling_kmh = c.float_items(HOLDER, "Hash_7B0ED922C779B74C", "Hash_880C82E8EF647EC4")?;
+        let rolling_kmh =
+            c.float_items(HOLDER, "Hash_7B0ED922C779B74C", "Hash_880C82E8EF647EC4")?;
         let int = |class: &str, key: &str, name: &str| -> Result<i32, String> {
             Ok(c.words::<1>(class, key, name)?[0] as i32)
         };
@@ -299,7 +305,10 @@ impl BoardVault {
                 owner("Hash_3FFB5107C82BA3E0")?,
                 owner("Hash_D3E8894CA25A4F71")?,
             ],
-            wobble_ramp: [owner("Hash_281A501B22B6CCDF")?, owner("Hash_54CDE019E31FC04E")?],
+            wobble_ramp: [
+                owner("Hash_281A501B22B6CCDF")?,
+                owner("Hash_54CDE019E31FC04E")?,
+            ],
             wobbles: [
                 Wobble {
                     ms_low: int(OWNER, "default", "Hash_36AE41817640FE04")?,
@@ -346,7 +355,6 @@ impl BoardVault {
         }
         self.rolling_kmh.get(layer as usize).copied().unwrap_or(0.0)
     }
-
 }
 
 /// The title generator (`sub_82A8AF10`), a private instance seeded with the dumped image's state.
@@ -545,7 +553,10 @@ pub(crate) fn squeak_step(tilt: f32, sign: &mut bool, held: bool) -> (bool, bool
 /// `sub_824C7738`'s gate and threshold: `None` when the gate fails (the squeak is released);
 /// `Some(false)` below the threshold (nothing happens).
 pub(crate) fn squeak_gate(audio: &AudioState, threshold: i32) -> Option<bool> {
-    if !(audio.foot_in_deck_box_615 && audio.foot_in_deck_box_616 && audio.wheel_count_200 as i32 > 1) {
+    if !(audio.foot_in_deck_box_615
+        && audio.foot_in_deck_box_616
+        && audio.wheel_count_200 as i32 > 1)
+    {
         return None;
     }
     Some(fctiwz(audio.deck_tilt_264.abs() * SQUEAK_ANGLE) >= threshold)
@@ -656,7 +667,12 @@ pub(crate) fn squeak_post(speed: i32, turn: i32, tweak: i32) -> [u32; 11] {
 }
 
 /// `sub_824C7DD0`.
-pub(crate) fn squeak_update(words: &mut [u32; 11], c: &dyn Controls, audio: &AudioState, divisor: f32) {
+pub(crate) fn squeak_update(
+    words: &mut [u32; 11],
+    c: &dyn Controls,
+    audio: &AudioState,
+    divisor: f32,
+) {
     let speed = slow_speed(audio.ground_speed_208, THOUSAND);
     let turn = squeak_turn(audio.deck_angular_velocity_480[2], divisor);
     words[7] = clamp(speed, 1_000);
@@ -672,7 +688,20 @@ pub(crate) fn squeak_update(words: &mut [u32; 11], c: &dyn Controls, audio: &Aud
 
 /// `sub_824B0670`: the loose-board scrape post (12 words).
 pub(crate) fn board_slide_post(tweak: i32, loose: i32) -> [u32; 12] {
-    [0, 0, 4096, 0, 25_000, 0, 0, 0, clamp(tweak, 32_767), 0, clamp(loose, 3), 0]
+    [
+        0,
+        0,
+        4096,
+        0,
+        25_000,
+        0,
+        0,
+        0,
+        clamp(tweak, 32_767),
+        0,
+        clamp(loose, 3),
+        0,
+    ]
 }
 
 /// `sub_824CB4C0`.
@@ -1011,7 +1040,8 @@ impl Board {
     }
 
     fn tuning_of(&self, truck: usize) -> &SurfaceTuning {
-        self.vault.tuning(self.trucks[truck].key.unwrap_or(DEFAULT_KEY))
+        self.vault
+            .tuning(self.trucks[truck].key.unwrap_or(DEFAULT_KEY))
     }
 
     /// `sub_824C9830`.
@@ -1028,7 +1058,8 @@ impl Board {
 
     /// `sub_824CA688`, updating the `+1504` latch.
     fn manual_latch(&mut self, audio: &AudioState) -> bool {
-        self.latch_1504 = grain_board::manual_latch(self.latch_1504, audio.balance_340, audio.wheel_count_200);
+        self.latch_1504 =
+            grain_board::manual_latch(self.latch_1504, audio.balance_340, audio.wheel_count_200);
         self.latch_1504
     }
 
@@ -1051,7 +1082,14 @@ impl Board {
     /// the local player, as retail's `sub_824CA688` call does).
     pub(crate) fn surface_of(&mut self, audio: &AudioState, truck: usize) -> u32 {
         let latch = self.config.local && self.manual_latch(audio);
-        truck_surface(&self.vault, self.config.surfaces, latch, self.routing.primary, audio, truck)
+        truck_surface(
+            &self.vault,
+            self.config.surfaces,
+            latch,
+            self.routing.primary,
+            audio,
+            truck,
+        )
     }
 
     /// `sub_824C6B30(layer)`: the speed word, scaled by the push envelope while it runs.
@@ -1067,7 +1105,11 @@ impl Board {
     pub(crate) fn slope_inputs(&mut self, slope_712: f32) {
         let primary = self.routing.primary;
         let key = self.trucks[primary].key.unwrap_or(DEFAULT_KEY);
-        let levels = slope_levels(slope_712, self.routing.grain_surface[primary], self.vault.slope(key));
+        let levels = slope_levels(
+            slope_712,
+            self.routing.grain_surface[primary],
+            self.vault.slope(key),
+        );
         (self.f1508, self.f1512) = levels;
         let [a, b] = slope_words(levels);
         self.set_input(2, a);
@@ -1178,7 +1220,12 @@ impl Board {
         if audio.push_plant_335 {
             let primary_key = self.trucks[self.routing.primary].key.unwrap_or(DEFAULT_KEY);
             let push = self.vault.tuning(primary_key).push;
-            program_push(&push, audio.ground_speed_208, &mut self.scale_envelope, &mut self.shift_envelope);
+            program_push(
+                &push,
+                audio.ground_speed_208,
+                &mut self.scale_envelope,
+                &mut self.shift_envelope,
+            );
             let mut holder = self.rattle.take().map(|(h, _)| h);
             release(tick.runtime, &mut holder)?;
             if self.routing.grain_surface[self.routing.primary] {
@@ -1204,7 +1251,11 @@ impl Board {
         }
         // sub_824C8588.
         let latch = self.manual_latch(audio);
-        let ca6e0 = if latch { false } else { self.trick_latch(audio) };
+        let ca6e0 = if latch {
+            false
+        } else {
+            self.trick_latch(audio)
+        };
         let v = audio.com_velocity_96;
         let tuning = self.tuning_of(self.routing.primary).clone();
         let slew = grain_board::slew(
@@ -1265,7 +1316,10 @@ impl Board {
                     mix64_12: c.level(12) as i32,
                     mix52_0: c.raw(0) as i32,
                     mix60_13: c.level(13) as i32,
-                    local: self.config.local.then(|| (c.level(21) as i32, c.level(22) as i32)),
+                    local: self
+                        .config
+                        .local
+                        .then(|| (c.level(21) as i32, c.level(22) as i32)),
                     special,
                     f1152: (!self.shift_envelope.idle).then_some(self.shift_envelope.value),
                     boost: self.f1508,
@@ -1325,8 +1379,11 @@ impl Board {
             }
             Some(false) => {}
             Some(true) => {
-                let (drop, start) =
-                    squeak_step(audio.deck_tilt_264, &mut self.squeak_sign, self.squeak.is_some());
+                let (drop, start) = squeak_step(
+                    audio.deck_tilt_264,
+                    &mut self.squeak_sign,
+                    self.squeak.is_some(),
+                );
                 if drop {
                     let mut holder = self.squeak.take().map(|(h, _)| h);
                     release(tick.runtime, &mut holder)?;
@@ -1334,7 +1391,10 @@ impl Board {
                 if start {
                     let words = squeak_post(
                         slow_speed(audio.ground_speed_208, THOUSAND),
-                        squeak_turn(audio.deck_angular_velocity_480[2], self.vault.squeak_divisor),
+                        squeak_turn(
+                            audio.deck_angular_velocity_480[2],
+                            self.vault.squeak_divisor,
+                        ),
                         self.vault.squeak_tweak,
                     );
                     self.squeak = Some((post(tick.runtime, SQUEAKS, &words)?, words));
@@ -1459,7 +1519,10 @@ impl Board {
                 .collect();
             let grains = tick.runtime.grains();
             for record in records {
-                let module = grains.g.u32(grains.g.u32(record).map_err(|e| e.to_string())? + 16).map_err(|e| e.to_string())?;
+                let module = grains
+                    .g
+                    .u32(grains.g.u32(record).map_err(|e| e.to_string())? + 16)
+                    .map_err(|e| e.to_string())?;
                 skate_audio_core::device::post_property(grains.g, module, 0, f64::from(send))
                     .map_err(|e| e.to_string())?;
             }
@@ -1591,7 +1654,13 @@ impl Board {
     /// both are 14 and not grinding (grinding writes 13).
     fn layer_surface(&mut self, audio: &AudioState) -> Option<i32> {
         let latch = self.config.local && self.manual_latch(audio);
-        layer_surface(&self.vault, self.config.surfaces, latch, self.routing.primary, audio)
+        layer_surface(
+            &self.vault,
+            self.config.surfaces,
+            latch,
+            self.routing.primary,
+            audio,
+        )
     }
 }
 
@@ -1639,7 +1708,10 @@ pub(crate) fn slope_levels(slope: f32, grain_surface: bool, (down, up): (f32, f3
 
 /// Owner inputs 2 and 3: `fctiwz(level × 32767)` clamped to 0..32767.
 pub(crate) fn slope_words((down, up): (f32, f32)) -> [u32; 2] {
-    [clamp(fctiwz(down * LEVEL), 32_767), clamp(fctiwz(up * LEVEL), 32_767)]
+    [
+        clamp(fctiwz(down * LEVEL), 32_767),
+        clamp(fctiwz(up * LEVEL), 32_767),
+    ]
 }
 
 /// `sub_824CBAC0`: owner input 5, the slewed rate of change of `vfunc52(0)` between the last two
@@ -1655,7 +1727,9 @@ pub(crate) fn heading_rate(
     max: f32,
     step: f32,
 ) -> (f32, u32) {
-    let delta = (raw_1892 as i32).wrapping_sub(raw_1896 as i32).wrapping_abs();
+    let delta = (raw_1892 as i32)
+        .wrapping_sub(raw_1896 as i32)
+        .wrapping_abs();
     let mut f31 = delta as f32 / dt;
     if f31 > max {
         f31 = max;
@@ -1765,7 +1839,11 @@ impl Component for Board {
         let speed0 = speed_word(audio.ground_speed_208, self.vault.rolling_kmh(0));
         let speed3 = speed_word(audio.ground_speed_208, self.vault.rolling_kmh(3));
         for (layer, gain_id, speed) in [(0usize, 7u32, speed0), (3, 9, speed3)] {
-            let held = if layer == 0 { &mut self.layer0 } else { &mut self.layer3 };
+            let held = if layer == 0 {
+                &mut self.layer0
+            } else {
+                &mut self.layer3
+            };
             if let Some((handle, words)) = held.as_mut() {
                 held_rolling_update(words, c, gain_id, speed, surface, audio);
                 redeliver(tick.runtime, *handle, words)?;
@@ -1805,13 +1883,22 @@ mod tests {
     struct Fixed(&'static [(u32, u32, u32)]);
     impl Controls for Fixed {
         fn raw(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 52 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 52 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
         fn pitch(&self, id: u32) -> i32 {
-            self.0.iter().find(|r| r.0 == 56 && r.1 == id).map_or(0, |r| r.2 as i32)
+            self.0
+                .iter()
+                .find(|r| r.0 == 56 && r.1 == id)
+                .map_or(0, |r| r.2 as i32)
         }
         fn level(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 60 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 60 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
     }
 
@@ -1898,22 +1985,49 @@ mod tests {
         let v = vault();
         let s = on_ground(1);
         assert_eq!(truck_surface(&v, SurfacePolicy::Retail, false, 0, &s, 0), 9);
-        assert_eq!(truck_surface(&v, SurfacePolicy::Default(2), false, 0, &s, 0), 2);
+        assert_eq!(
+            truck_surface(&v, SurfacePolicy::Default(2), false, 0, &s, 0),
+            2
+        );
         // 143 and above: 3. Above 93: element 94.
-        assert_eq!(truck_surface(&v, SurfacePolicy::Retail, false, 0, &on_ground(143), 0), 3);
-        assert_eq!(truck_surface(&v, SurfacePolicy::Retail, false, 0, &on_ground(120), 0), 3);
+        assert_eq!(
+            truck_surface(&v, SurfacePolicy::Retail, false, 0, &on_ground(143), 0),
+            3
+        );
+        assert_eq!(
+            truck_surface(&v, SurfacePolicy::Retail, false, 0, &on_ground(120), 0),
+            3
+        );
         // Grinding, or the manual latch with the wheel up: 14 (kept by the default policy).
         let mut grinding = on_ground(1);
         grinding.grinding_341 = true;
-        assert_eq!(truck_surface(&v, SurfacePolicy::Default(2), false, 0, &grinding, 0), 14);
+        assert_eq!(
+            truck_surface(&v, SurfacePolicy::Default(2), false, 0, &grinding, 0),
+            14
+        );
         let mut manual = on_ground(0);
         manual.wheel_landed_464 = [false, true, true, true];
-        assert_eq!(truck_surface(&v, SurfacePolicy::Retail, true, 0, &manual, 0), 14);
-        assert_eq!(truck_surface(&v, SurfacePolicy::Retail, true, 0, &manual, 1), 2);
+        assert_eq!(
+            truck_surface(&v, SurfacePolicy::Retail, true, 0, &manual, 0),
+            14
+        );
+        assert_eq!(
+            truck_surface(&v, SurfacePolicy::Retail, true, 0, &manual, 1),
+            2
+        );
         // The non-primary truck reads wheel 3.
-        assert_eq!(truck_surface(&v, SurfacePolicy::Retail, true, 1, &manual, 0), 2);
-        assert_eq!(layer_surface(&v, SurfacePolicy::Retail, true, 0, &manual), Some(2));
-        assert_eq!(layer_surface(&v, SurfacePolicy::Retail, false, 0, &grinding), Some(13));
+        assert_eq!(
+            truck_surface(&v, SurfacePolicy::Retail, true, 1, &manual, 0),
+            2
+        );
+        assert_eq!(
+            layer_surface(&v, SurfacePolicy::Retail, true, 0, &manual),
+            Some(2)
+        );
+        assert_eq!(
+            layer_surface(&v, SurfacePolicy::Retail, false, 0, &grinding),
+            Some(13)
+        );
     }
 
     #[test]
@@ -1923,13 +2037,26 @@ mod tests {
         assert_eq!(
             steps,
             [
-                RouteStep::Start { truck: 0, surface: 2, sound: true },
-                RouteStep::Start { truck: 1, surface: 2, sound: false },
+                RouteStep::Start {
+                    truck: 0,
+                    surface: 2,
+                    sound: true
+                },
+                RouteStep::Start {
+                    truck: 1,
+                    surface: 2,
+                    sound: false
+                },
             ]
         );
-        assert_eq!((r.live, r.grains, r.primary), ([true, false], [true, false], 0));
+        assert_eq!(
+            (r.live, r.grains, r.primary),
+            ([true, false], [true, false], 0)
+        );
         // The primary truck lifts: the other has no live sound, so [1500] flips and nothing stops.
-        let steps = r.route(true, &mut |truck, primary| if truck == primary { 14 } else { 2 });
+        let steps = r.route(true, &mut |truck, primary| {
+            if truck == primary { 14 } else { 2 }
+        });
         assert_eq!(steps, [RouteStep::Pulse]);
         assert_eq!((r.primary, r.surface, r.live), (1, [2, 14], [true, false]));
         // A non-local skater stops its truck instead.
@@ -1940,11 +2067,22 @@ mod tests {
             steps,
             [
                 RouteStep::Pulse,
-                RouteStep::Stop { truck: 0, grain_surface: true, grains: true },
-                RouteStep::Start { truck: 0, surface: 7, sound: true },
+                RouteStep::Stop {
+                    truck: 0,
+                    grain_surface: true,
+                    grains: true
+                },
+                RouteStep::Start {
+                    truck: 0,
+                    surface: 7,
+                    sound: true
+                },
             ]
         );
-        assert_eq!((r.grain_surface[0], r.grains[0], r.live[0]), (false, false, true));
+        assert_eq!(
+            (r.grain_surface[0], r.grains[0], r.live[0]),
+            (false, false, true)
+        );
         assert_eq!(rolling_selector(7), Some(1));
         assert_eq!(rolling_selector(12), Some(11));
         assert_eq!(rolling_selector(9), None);
@@ -2013,9 +2151,15 @@ mod tests {
     #[test]
     fn heading_rate_slews_toward_the_capped_rate() {
         // |100 − 0| / 0.5 = 200, within the 1500 step.
-        assert_eq!(heading_rate(0.0, 100, 0, 0.5, 10_000.0, 3_000.0), (200.0, 655));
+        assert_eq!(
+            heading_rate(0.0, 100, 0, 0.5, 10_000.0, 3_000.0),
+            (200.0, 655)
+        );
         // |1000 − 0| / 0.25 = 4000, slewed from 0 by 3000 × 0.25 = 750: fctiwz(750 / 10000 × 32767).
-        assert_eq!(heading_rate(0.0, 0, 1000, 0.25, 10_000.0, 3_000.0), (750.0, 2457));
+        assert_eq!(
+            heading_rate(0.0, 0, 1000, 0.25, 10_000.0, 3_000.0),
+            (750.0, 2457)
+        );
         // A wrap of the raw pan saturates at the cap.
         let (f, word) = heading_rate(9_990.0, 0xFFF0, 0x10, 0.25, 10_000.0, 3_000.0);
         assert_eq!((f, word), (10_000.0, 32_767));
@@ -2029,21 +2173,50 @@ mod tests {
         // Frame 2907, held layer 3 (sub_824C9948); w6 is sub_824C82A8's surface 2.
         s.ground_speed_208 = f32::from_bits(0x3B2C_5C40);
         let mut w = [0x7FFF, 5, 0xFF6, 1, 3, 0, 2, 0, 0, 0x618B, 0x4D, 9];
-        let reads = Fixed(&[(60, 9, 0xC), (52, 0, 3), (56, 8, 0xFF6), (60, 19, 0), (60, 17, 0x618B), (60, 18, 0x4D)]);
-        held_rolling_update(&mut w, &reads, 9, speed_word(s.ground_speed_208, 70.0), Some(2), &s);
+        let reads = Fixed(&[
+            (60, 9, 0xC),
+            (52, 0, 3),
+            (56, 8, 0xFF6),
+            (60, 19, 0),
+            (60, 17, 0x618B),
+            (60, 18, 0x4D),
+        ]);
+        held_rolling_update(
+            &mut w,
+            &reads,
+            9,
+            speed_word(s.ground_speed_208, 70.0),
+            Some(2),
+            &s,
+        );
         assert_eq!(w, [0x7FFF, 3, 0xFF6, 1, 3, 0, 2, 0, 0, 0x618B, 0x4D, 0xC]);
 
         // Frame 3916, rattle (sub_824C80C0).
-        let mut w = [0x7FFF, 0x18D, 0x11C3, 0x1DA4, 3, 0, 1, 0, 0x618B, 0x4D, 0, 8];
-        let reads = Fixed(&[(56, 3, 0x11CB), (60, 6, 0), (52, 0, 0x1D6), (60, 16, 0), (60, 14, 0x618B), (60, 15, 0x4D)]);
+        let mut w = [
+            0x7FFF, 0x18D, 0x11C3, 0x1DA4, 3, 0, 1, 0, 0x618B, 0x4D, 0, 8,
+        ];
+        let reads = Fixed(&[
+            (56, 3, 0x11CB),
+            (60, 6, 0),
+            (52, 0, 0x1D6),
+            (60, 16, 0),
+            (60, 14, 0x618B),
+            (60, 15, 0x4D),
+        ]);
         rattle_update(&mut w, &reads);
-        assert_eq!(w, [0x7FFF, 0x1D6, 0x11CB, 0x1DA4, 3, 0, 1, 0, 0x618B, 0x4D, 0, 8]);
+        assert_eq!(
+            w,
+            [
+                0x7FFF, 0x1D6, 0x11CB, 0x1DA4, 3, 0, 1, 0, 0x618B, 0x4D, 0, 8
+            ]
+        );
 
         // Frame 3218, skid (sub_824C7A20), counter 0, skid surface 0.
         s.ground_speed_208 = f32::from_bits(0x3C30_54B0);
         s.slip_232 = f32::from_bits(0x3C88_B326);
         let mut w = [
-            0x7FFF, 0x48, 0xA1E, 0x33, 0xBDB, 0x618B, 0x4D, 8, 0, 0, 1, 0x59D8, 0x7FFF, 0, 1, 1, 0x72D, 5,
+            0x7FFF, 0x48, 0xA1E, 0x33, 0xBDB, 0x618B, 0x4D, 8, 0, 0, 1, 0x59D8, 0x7FFF, 0, 1, 1,
+            0x72D, 5,
         ];
         let reads = Fixed(&[
             (56, 3, 0xBD4),
@@ -2057,37 +2230,79 @@ mod tests {
         skid_update(&mut w, &reads, &s, 0, 0, true);
         assert_eq!(
             w,
-            [0x7FFF, 0x51, 0xA1E, 0x33, 0xBD4, 0x618B, 0x4D, 8, 0, 0, 1, 0x59D8, 0x7FFF, 0, 1, 1, 0x72D, 5]
+            [
+                0x7FFF, 0x51, 0xA1E, 0x33, 0xBD4, 0x618B, 0x4D, 8, 0, 0, 1, 0x59D8, 0x7FFF, 0, 1,
+                1, 0x72D, 5
+            ]
         );
 
         // Frame 4946, squeaks (sub_824C7DD0).
         s.ground_speed_208 = f32::from_bits(0x409F_F2C3);
         s.deck_angular_velocity_480 = [0.0, 0.0, f32::from_bits(0x3E21_EEEA)];
-        let mut w = [0x7FFF, 0x907, 0, 0x21B, 0xFAE, 0x618B, 0x4D, 0x18F, 0xF, 0x55, 0];
-        let reads = Fixed(&[(56, 3, 0xFC0), (60, 5, 0x907), (60, 11, 0x618B), (60, 12, 0x4D), (52, 0, 0x1ED)]);
+        let mut w = [
+            0x7FFF, 0x907, 0, 0x21B, 0xFAE, 0x618B, 0x4D, 0x18F, 0xF, 0x55, 0,
+        ];
+        let reads = Fixed(&[
+            (56, 3, 0xFC0),
+            (60, 5, 0x907),
+            (60, 11, 0x618B),
+            (60, 12, 0x4D),
+            (52, 0, 0x1ED),
+        ]);
         squeak_update(&mut w, &reads, &s, 1.5);
-        assert_eq!(w, [0x7FFF, 0x907, 0, 0x1ED, 0xFC0, 0x618B, 0x4D, 0x18F, 0xF, 0x69, 0]);
+        assert_eq!(
+            w,
+            [
+                0x7FFF, 0x907, 0, 0x1ED, 0xFC0, 0x618B, 0x4D, 0x18F, 0xF, 0x69, 0
+            ]
+        );
 
         // Frame 4190, loose-board scrape (sub_824CB4C0), +780 = 2.
         s.ground_speed_208 = f32::from_bits(0x40BD_1B84);
         s.loose_board_780 = 2;
         let mut w = [0, 0, 0x1000, 0, 0x61A8, 0, 0, 0, 7, 0, 1, 0];
-        let reads = Fixed(&[(52, 0, 0x3255), (56, 23, 0xFEA), (60, 25, 0x5A6F), (60, 26, 0x4D), (60, 27, 0xF04), (60, 24, 0x234A)]);
+        let reads = Fixed(&[
+            (52, 0, 0x3255),
+            (56, 23, 0xFEA),
+            (60, 25, 0x5A6F),
+            (60, 26, 0x4D),
+            (60, 27, 0xF04),
+            (60, 24, 0x234A),
+        ]);
         board_slide_update(&mut w, &reads, &s, &vault());
-        assert_eq!(w, [0x7FFF, 0x3255, 0xFEA, 0x2710, 0x5A6F, 0x4D, 0xF04, 0x234A, 7, 0, 1, 0x3A98]);
+        assert_eq!(
+            w,
+            [
+                0x7FFF, 0x3255, 0xFEA, 0x2710, 0x5A6F, 0x4D, 0xF04, 0x234A, 7, 0, 1, 0x3A98
+            ]
+        );
     }
 
     #[test]
     fn packets_have_the_retail_layouts() {
-        assert_eq!(rolling_post(1234, 0, 3), [0, 0, 4096, 1234, 0, 0, 3, 0, 0, 25_000, 0, 32_767]);
-        assert_eq!(rattle_post(20_000, 2, 8), [0, 0, 4096, 10_000, 2, 0, 1, 0, 25_000, 0, 32_767, 8]);
-        assert_eq!(squeak_post(12, 600, 0), [0, 32_767, 0, 0, 4096, 25_000, 0, 12, 15, 600, 0]);
-        assert_eq!(board_slide_post(7, 1), [0, 0, 4096, 0, 25_000, 0, 0, 0, 7, 0, 1, 0]);
+        assert_eq!(
+            rolling_post(1234, 0, 3),
+            [0, 0, 4096, 1234, 0, 0, 3, 0, 0, 25_000, 0, 32_767]
+        );
+        assert_eq!(
+            rattle_post(20_000, 2, 8),
+            [0, 0, 4096, 10_000, 2, 0, 1, 0, 25_000, 0, 32_767, 8]
+        );
+        assert_eq!(
+            squeak_post(12, 600, 0),
+            [0, 32_767, 0, 0, 4096, 25_000, 0, 12, 15, 600, 0]
+        );
+        assert_eq!(
+            board_slide_post(7, 1),
+            [0, 0, 4096, 0, 25_000, 0, 0, 0, 7, 0, 1, 0]
+        );
         let skid = skid_post(314, 0, 2, 2, 23_000, 32_767, 0, 1, 1, 0x6B5, 5);
         // The capture's first local skid post (frame 2718).
         assert_eq!(
             skid,
-            [0, 32_767, 0, 0, 0, 25_000, 0, 0x13A, 0, 2, 2, 0x59D8, 0x7FFF, 0, 1, 1, 0x6B5, 5]
+            [
+                0, 32_767, 0, 0, 0, 25_000, 0, 0x13A, 0, 2, 2, 0x59D8, 0x7FFF, 0, 1, 1, 0x6B5, 5
+            ]
         );
         assert_eq!(speed_word(10.0, 70.0), 5142);
     }
@@ -2190,17 +2405,22 @@ mod tests {
     #[ignore = "needs the retail capture in .local and the vault"]
     fn board_replays_the_retail_capture() {
         let Some(root) = capture::root() else { return };
-        let assets = std::path::PathBuf::from(r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets");
+        let assets = std::path::PathBuf::from(
+            r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets",
+        );
         let vault = BoardVault::load(&assets).expect("vault");
         let words = capture::states(&root);
-        let states: BTreeMap<u32, AudioState> =
-            words.iter().map(|(f, w)| (*f, AudioState::from_capture(w))).collect();
+        let states: BTreeMap<u32, AudioState> = words
+            .iter()
+            .map(|(f, w)| (*f, AudioState::from_capture(w)))
+            .collect();
         let first = *states.keys().next().unwrap();
         let last = *states.keys().last().unwrap();
         let clock = |f: u32| words.get(&f).map(|w| capture::float(w, 312));
 
         let objects = [ROLLING, RATTLE, SKID, SQUEAKS, BOARD_SLIDE];
-        let mut all: HashMap<&str, (Vec<Packet>, Vec<(usize, capture::Row)>, usize)> = HashMap::new();
+        let mut all: HashMap<&str, (Vec<Packet>, Vec<(usize, capture::Row)>, usize)> =
+            HashMap::new();
         for object in objects {
             all.insert(object, packets(&capture::rows(&root, object)));
         }
@@ -2234,10 +2454,19 @@ mod tests {
         }
         // The controller's logged inputs per frame.
         let mut inputs_log: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        for line in std::fs::read_to_string(root.join("mixmap").join(format!("{LOCAL}.tsv"))).unwrap().lines() {
+        for line in std::fs::read_to_string(root.join("mixmap").join(format!("{LOCAL}.tsv")))
+            .unwrap()
+            .lines()
+        {
             let frame: u32 = line.split('\t').next().unwrap().parse().unwrap();
             let table = line.split(" | ").nth(1).unwrap();
-            inputs_log.insert(frame, table.split(' ').map(|w| u32::from_str_radix(w, 16).unwrap()).collect());
+            inputs_log.insert(
+                frame,
+                table
+                    .split(' ')
+                    .map(|w| u32::from_str_radix(w, 16).unwrap())
+                    .collect(),
+            );
         }
 
         // --- the simulation: events and owner inputs per frame.
@@ -2285,7 +2514,11 @@ mod tests {
             // sub_824CA738 runs before the routing, on +712 (not an AudioState field yet).
             let slope = capture::float(&words[&frame], 712);
             let key = keys[routing.primary].unwrap_or(DEFAULT_KEY);
-            let levels = slope_levels(slope, routing.grain_surface[routing.primary], vault.slope(key));
+            let levels = slope_levels(
+                slope,
+                routing.grain_surface[routing.primary],
+                vault.slope(key),
+            );
             let [down, up] = slope_words(levels);
             set[2] = Some(down);
             set[3] = Some(up);
@@ -2299,13 +2532,19 @@ mod tests {
             for step in &steps {
                 match *step {
                     RouteStep::Pulse => set[0] = Some(32_767),
-                    RouteStep::Stop { grain_surface: false, .. } => {
-                        ours.entry((ROLLING, "RL")).or_default().push(frame)
-                    }
+                    RouteStep::Stop {
+                        grain_surface: false,
+                        ..
+                    } => ours.entry((ROLLING, "RL")).or_default().push(frame),
                     RouteStep::Stop { .. } => {}
-                    RouteStep::Start { truck, surface, sound } => {
+                    RouteStep::Start {
+                        truck,
+                        surface,
+                        sound,
+                    } => {
                         let soft = a.soft_wheels_684 != 0;
-                        let key = grain_board::grain_for_surface(surface, soft).map_or(DEFAULT_KEY, |c| c.key);
+                        let key = grain_board::grain_for_surface(surface, soft)
+                            .map_or(DEFAULT_KEY, |c| c.key);
                         key_760 = key;
                         keys[truck] = Some(key);
                         if sound && rolling_selector(surface).is_some() {
@@ -2316,7 +2555,11 @@ mod tests {
             }
             let metal = truck_surface(&vault, policy, latch, routing.primary, a, 0) == 9;
             set[6] = Some(if metal { 32_767 } else { 0 });
-            set[4] = Some(if a.push_left_333 || a.push_right_334 { 32_767 } else { 0 });
+            set[4] = Some(if a.push_left_333 || a.push_right_334 {
+                32_767
+            } else {
+                0
+            });
             if a.push_plant_335 {
                 if rattle_held {
                     ours.entry((RATTLE, "RL")).or_default().push(frame);
@@ -2333,7 +2576,10 @@ mod tests {
                         _ => 0,
                     };
                     let speed = rattle_speed(a.ground_speed_208, vault.rattle_kmh(key)) as i32;
-                    posts_ours.insert((RATTLE, frame), rattle_post(speed, code, vault.rattle_tweak).to_vec());
+                    posts_ours.insert(
+                        (RATTLE, frame),
+                        rattle_post(speed, code, vault.rattle_tweak).to_vec(),
+                    );
                     ours.entry((RATTLE, "PO")).or_default().push(frame);
                     rattle_held = true;
                 }
@@ -2417,8 +2663,14 @@ mod tests {
                 }
             }
             if let (Some(c1), Some(c0)) = (clock(frame), clock(frame - 1)) {
-                let (f, input) =
-                    heading_rate(f1900, raw_1892, raw_1896, c1 - c0, vault.heading_max, vault.heading_step);
+                let (f, input) = heading_rate(
+                    f1900,
+                    raw_1892,
+                    raw_1896,
+                    c1 - c0,
+                    vault.heading_max,
+                    vault.heading_step,
+                );
                 f1900 = f;
                 set[5] = Some(input);
             }
@@ -2426,12 +2678,19 @@ mod tests {
         }
 
         // --- timing.
-        println!("post/release timing (retail events, ours, same frame), frames {}..={last}", first + 1);
+        println!(
+            "post/release timing (retail events, ours, same frame), frames {}..={last}",
+            first + 1
+        );
         for object in objects {
             let (packets, _, stray) = &all[object];
             let in_range = |f: &u32| *f > first && *f <= last;
-            let posts: Vec<u32> =
-                packets.iter().filter(|p| p.local == Some(true)).map(|p| p.post).filter(in_range).collect();
+            let posts: Vec<u32> = packets
+                .iter()
+                .filter(|p| p.local == Some(true))
+                .map(|p| p.post)
+                .filter(in_range)
+                .collect();
             let releases: Vec<u32> = packets
                 .iter()
                 .filter(|p| p.local == Some(true))
@@ -2447,7 +2706,9 @@ mod tests {
                     first_differences(retail, &ours)
                 );
             }
-            println!("  {object:<22}     packets never updated (unattributed): {unattributed}, stray rows {stray}");
+            println!(
+                "  {object:<22}     packets never updated (unattributed): {unattributed}, stray rows {stray}"
+            );
         }
 
         // --- post words.
@@ -2479,9 +2740,14 @@ mod tests {
             let mut last_words: HashMap<usize, Vec<u32>> = HashMap::new();
             for (index, row) in updates {
                 let frame = row.frame;
-                let previous = last_words.get(index).cloned().unwrap_or_else(|| packets[*index].words.clone());
+                let previous = last_words
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| packets[*index].words.clone());
                 last_words.insert(*index, row.words.clone());
-                let Some(audio) = states.get(&(frame - 1)) else { continue };
+                let Some(audio) = states.get(&(frame - 1)) else {
+                    continue;
+                };
                 match object {
                     ROLLING => {
                         let mut w: [u32; 12] = previous[..12].try_into().unwrap();
@@ -2495,9 +2761,13 @@ mod tests {
                             }
                         };
                         let c = Captured::from_reads(&row.reads, HELD_LAYERS);
-                        let (r, l) = routings.get(&frame).cloned().unwrap_or((Routing::default(), false));
+                        let (r, l) = routings
+                            .get(&frame)
+                            .cloned()
+                            .unwrap_or((Routing::default(), false));
                         let surface = layer_surface(&vault, policy, l, r.primary, audio);
-                        let speed = speed_word(audio.ground_speed_208, vault.rolling_kmh(kmh_layer));
+                        let speed =
+                            speed_word(audio.ground_speed_208, vault.rolling_kmh(kmh_layer));
                         held_rolling_update(&mut w, &c, gain, speed, surface, audio);
                         held.add(frame, &row.words[..12], &w);
                     }
@@ -2539,7 +2809,9 @@ mod tests {
             let mut exact = [0usize; 7];
             let mut bad: Vec<Vec<(u32, u32, u32)>> = vec![vec![]; 7];
             for (frame, set) in &inputs_ours {
-                let Some(logged) = inputs_log.get(&(frame + lag)) else { continue };
+                let Some(logged) = inputs_log.get(&(frame + lag)) else {
+                    continue;
+                };
                 for id in 0..7 {
                     if let Some(v) = set[id] {
                         total[id] += 1;
@@ -2553,7 +2825,10 @@ mod tests {
             }
             println!("owner inputs vs the logged input table of frame F+{lag}:");
             for id in 0..7 {
-                println!("  input {id}: {}/{}  bad (frame, retail, ours) {:?}", exact[id], total[id], bad[id]);
+                println!(
+                    "  input {id}: {}/{}  bad (frame, retail, ours) {:?}",
+                    exact[id], total[id], bad[id]
+                );
             }
         }
         // Input 5 divides by dt, which the capture does not record: it is recovered from the

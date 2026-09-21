@@ -21,7 +21,10 @@ fn image(dir: &Path) -> Vec<Segment> {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         if let Some(hex) = name.strip_prefix("g_").and_then(|s| s.strip_suffix(".bin")) {
             let page = u32::from_str_radix(hex, 16).unwrap();
-            segs.push(Segment { base: page << 16, bytes: std::fs::read(&path).unwrap() });
+            segs.push(Segment {
+                base: page << 16,
+                bytes: std::fs::read(&path).unwrap(),
+            });
         }
     }
     segs
@@ -94,20 +97,38 @@ fn owner(key: u32) -> String {
 }
 
 fn main() {
-    let assets = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_ASSETS));
-    let file = std::fs::read(assets.join("private/stock/data/audio/MixMapSK8.mxb")).expect("MixMapSK8.mxb");
+    let assets = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ASSETS));
+    let file = std::fs::read(assets.join("private/stock/data/audio/MixMapSK8.mxb"))
+        .expect("MixMapSK8.mxb");
     let mut segs = image(&assets.join("private/stock/audio-runtime-image"));
     const HEAP: u32 = 0x4000_0000;
     const HEAP_LEN: u32 = 0x0080_0000;
-    segs.push(Segment { base: HEAP, bytes: vec![0; HEAP_LEN as usize] });
+    segs.push(Segment {
+        base: HEAP,
+        bytes: vec![0; HEAP_LEN as usize],
+    });
     let mut g = Guest::from_segments(segs);
-    let mut heap = BumpHeap { next: HEAP, end: HEAP + HEAP_LEN };
+    let mut heap = BumpHeap {
+        next: HEAP,
+        end: HEAP + HEAP_LEN,
+    };
     let mut listener = KeyedListener::retail();
     let mm = mixmap::load(&mut g, &mut heap, &mut listener, &file).expect("build");
-    println!("host {:#010x}  data {:#010x}  heap used {} B", mm.host, mm.data, heap.next - HEAP);
+    println!(
+        "host {:#010x}  data {:#010x}  heap used {} B",
+        mm.host,
+        mm.data,
+        heap.next - HEAP
+    );
     println!("\ncapacity vs used:");
     for (name, cap, used) in mixmap::check_capacities(&g, mm.host).unwrap() {
-        println!("  {name:32} {cap:6} {used:6}{}", if cap != used { "   <-- differs" } else { "" });
+        println!(
+            "  {name:32} {cap:6} {used:6}{}",
+            if cap != used { "   <-- differs" } else { "" }
+        );
     }
     let ctrls = mixmap::controllers(&g, mm.host).unwrap();
     println!("\n{} controllers:", ctrls.len());
@@ -142,8 +163,10 @@ fn main() {
 
     // Input sources: walk every output of every controller back to the controller input words it
     // reads, through products (A), lookups (B), envelopes (F), sums (C) and outputs (E).
-    println!("
-input sources per output controller (key: ctrl-key.id ...):");
+    println!(
+        "
+input sources per output controller (key: ctrl-key.id ...):"
+    );
     let deps = Deps::new(&g, mm.host, &ctrls);
     for (c, key) in &ctrls {
         let block = g.u32(c + 12).unwrap();
@@ -157,7 +180,10 @@ input sources per output controller (key: ctrl-key.id ...):");
                 deps.output(e, &mut found, 0);
             }
         }
-        let list: Vec<String> = found.iter().map(|(k, id)| format!("{k:08X}.{id}")).collect();
+        let list: Vec<String> = found
+            .iter()
+            .map(|(k, id)| format!("{k:08X}.{id}"))
+            .collect();
         println!("  {key:08X} {:32} <- {}", owner(*key), list.join(" "));
     }
 
@@ -165,20 +191,36 @@ input sources per output controller (key: ctrl-key.id ...):");
     // of ground speeds, printing the SkateBoard controller's rolling gains (ids 7, 9). The other 246
     // controllers need the game's inputs too (global faders, pause, speech ducking…); when the replay
     // fixture exists, its first 3600 retail evaluations are applied first so they hold retail values.
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.local/captures/extract/mixmap_replay_4400.bin");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.local/captures/extract/mixmap_replay_4400.bin");
     if let Ok(bytes) = std::fs::read(&fixture) {
         preroll(&mut g, mm.manager, &ctrls, &bytes, 3600);
-        println!("
-(pre-rolled 3600 retail evaluations from {})", fixture.display());
+        println!(
+            "
+(pre-rolled 3600 retail evaluations from {})",
+            fixture.display()
+        );
     } else {
-        println!("
-(no replay fixture: every other controller's inputs stay 0, so most gains stay 0)");
+        println!(
+            "
+(no replay fixture: every other controller's inputs stay 0, so most gains stay 0)"
+        );
     }
-    let state = mixmap::find_controller(&g, mm.host, mixmap::key(3, 1, 0, 0)).unwrap().expect("state ctrl");
-    let board = mixmap::find_controller(&g, mm.host, mixmap::key(2, 1, 0, 0)).unwrap().expect("board ctrl");
+    let state = mixmap::find_controller(&g, mm.host, mixmap::key(3, 1, 0, 0))
+        .unwrap()
+        .expect("state ctrl");
+    let board = mixmap::find_controller(&g, mm.host, mixmap::key(2, 1, 0, 0))
+        .unwrap()
+        .expect("board ctrl");
     println!("\nsimulated run (state {state:#010x}, board {board:#010x}), dt 1/70 s:");
     for frame in 0..40 {
-        let v: f64 = if frame < 5 { 0.0 } else if frame < 30 { 5.0 } else { 0.0 };
+        let v: f64 = if frame < 5 {
+            0.0
+        } else if frame < 30 {
+            5.0
+        } else {
+            0.0
+        };
         let contact = frame < 30;
         drive_state(&mut g, state, v, if contact { 4 } else { 0 });
         mixmap::tick(&mut g, mm.manager, 1.0 / 70.0).unwrap();
@@ -235,13 +277,13 @@ fn drive_state(g: &mut Guest, ctrl: u32, v: f64, wheels: u32) {
 /// Pointer → node lookups for the dependency walk.
 struct Deps<'a> {
     g: &'a Guest,
-    inputs: std::collections::HashMap<u32, u32>,   // input entry (+8/+12) → entry
+    inputs: std::collections::HashMap<u32, u32>, // input entry (+8/+12) → entry
     products: std::collections::HashMap<u32, u32>, // e2+8 → product entry (400)
-    lookups: std::collections::HashMap<u32, u32>,  // st+12/16/20 or entry → lookup entry (416)
+    lookups: std::collections::HashMap<u32, u32>, // st+12/16/20 or entry → lookup entry (416)
     envelopes: std::collections::HashMap<u32, u32>, // st+24/28 → envelope entry (404)
-    sums: std::collections::HashMap<u32, u32>,     // s+4 → sum entry (436)
-    outputs: std::collections::HashMap<u32, u32>,  // st+8 → output entry (448)
-    blocks: Vec<(u32, u32)>,                       // (input block, key)
+    sums: std::collections::HashMap<u32, u32>,   // s+4 → sum entry (436)
+    outputs: std::collections::HashMap<u32, u32>, // st+8 → output entry (448)
+    blocks: Vec<(u32, u32)>,                     // (input block, key)
 }
 
 impl<'a> Deps<'a> {
@@ -255,7 +297,11 @@ impl<'a> Deps<'a> {
             envelopes: Default::default(),
             sums: Default::default(),
             outputs: Default::default(),
-            blocks: ctrls.iter().filter(|(c, _)| rd(c + 8) != 0).map(|&(c, k)| (rd(c + 8), k)).collect(),
+            blocks: ctrls
+                .iter()
+                .filter(|(c, _)| rd(c + 8) != 0)
+                .map(|&(c, k)| (rd(c + 8), k))
+                .collect(),
         };
         for i in 0..rd(h + 208) {
             let e = rd(h + 388) + 16 * i;
@@ -293,7 +339,13 @@ impl<'a> Deps<'a> {
     fn rd(&self, a: u32) -> u32 {
         self.g.u32(a).unwrap()
     }
-    fn list(&self, ptrs: u32, n: u32, out: &mut std::collections::BTreeSet<(u32, u32)>, depth: u32) {
+    fn list(
+        &self,
+        ptrs: u32,
+        n: u32,
+        out: &mut std::collections::BTreeSet<(u32, u32)>,
+        depth: u32,
+    ) {
         for m in 0..n {
             self.pointer(self.rd(ptrs + 4 * m), out, depth);
         }

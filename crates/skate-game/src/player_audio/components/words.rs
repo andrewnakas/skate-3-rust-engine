@@ -12,7 +12,11 @@ pub(crate) const SPEED_SCALE: f32 = 0.08; // 0x8208EDA4
 
 /// PPC `fctiwz`: truncate toward zero, saturating; NaN gives `0x80000000`.
 pub(crate) fn fctiwz(value: f32) -> i32 {
-    if value.is_nan() { i32::MIN } else { value as i32 }
+    if value.is_nan() {
+        i32::MIN
+    } else {
+        value as i32
+    }
 }
 
 /// `fsel`-style clamp to `0.0..=1.0` as the updaters write it.
@@ -36,35 +40,59 @@ pub(crate) fn word(value: i32, low: i32, high: i32) -> u32 {
 /// float array `0x880C82E8EF647EC4` entry for the layer (70 for layers 0 and 3).
 /// Capture: 37,086 of 37,090 updates exact (the rest are double-precision artefacts).
 pub(crate) fn rolling_speed(ground_speed: f32, max_kmh: f32) -> u32 {
-    word(fctiwz(unit(ground_speed / max_kmh * KMH_PER_MS) * TEN_THOUSAND), 0, 10_000)
+    word(
+        fctiwz(unit(ground_speed / max_kmh * KMH_PER_MS) * TEN_THOUSAND),
+        0,
+        10_000,
+    )
 }
 
 /// `sub_824C6198` rattle speed word: `fctiwz(clamp((v − 1) × 3.6 / D, 0, 1) × 10000)`, D = vault
 /// `0x12275AA8AC4A63FB` (30 km/h).
 pub(crate) fn rattle_speed(ground_speed: f32, divisor_kmh: f32) -> u32 {
-    word(fctiwz(unit((ground_speed - 1.0) * KMH_PER_MS / divisor_kmh) * TEN_THOUSAND), 0, 10_000)
+    word(
+        fctiwz(unit((ground_speed - 1.0) * KMH_PER_MS / divisor_kmh) * TEN_THOUSAND),
+        0,
+        10_000,
+    )
 }
 
 /// `sub_824C28B0` grind speed: `min(fctiwz(clamp(3.6 × (v − 0.5) / T, 0, 1) × 10000), 9000)`,
 /// T = vault `0x4890392C91829954` (45 km/h). Recomputed only while grinding (the component keeps
 /// the last value afterwards).
 pub(crate) fn grind_speed(ground_speed: f32, top_kmh: f32) -> u32 {
-    word(fctiwz(unit(KMH_PER_MS * (ground_speed - HALF) / top_kmh) * TEN_THOUSAND), 0, 9_000)
+    word(
+        fctiwz(unit(KMH_PER_MS * (ground_speed - HALF) / top_kmh) * TEN_THOUSAND),
+        0,
+        9_000,
+    )
 }
 
 /// Skid w7 (`sub_824AF678` / `sub_824C7A20`): `fctiwz(clamp(v × 0.08, 0, 1) × 10000)`.
 pub(crate) fn skid_speed(ground_speed: f32) -> u32 {
-    word(fctiwz(unit(ground_speed * SPEED_SCALE) * TEN_THOUSAND), 0, 10_000)
+    word(
+        fctiwz(unit(ground_speed * SPEED_SCALE) * TEN_THOUSAND),
+        0,
+        10_000,
+    )
 }
 
 /// Squeaks w7 (`sub_824AFF48` / `sub_824C7DD0`): `fctiwz(clamp(v × 0.08, 0, 1) × 1000)`.
 pub(crate) fn squeak_speed(ground_speed: f32) -> u32 {
-    word(fctiwz(unit(ground_speed * SPEED_SCALE) * THOUSAND), 0, 1_000)
+    word(
+        fctiwz(unit(ground_speed * SPEED_SCALE) * THOUSAND),
+        0,
+        1_000,
+    )
 }
 
 /// Seams w8 (`sub_824C1F18`): `fctiwz(clamp((v − 0.5) × 0.08, 0, 1) × 10000)`.
 pub(crate) fn seam_speed(ground_speed: f32) -> u32 {
-    word(fctiwz(unit((ground_speed - HALF) * SPEED_SCALE) * TEN_THOUSAND), 0, 10_000)
+    word(
+        fctiwz(unit((ground_speed - HALF) * SPEED_SCALE) * TEN_THOUSAND),
+        0,
+        10_000,
+    )
 }
 
 /// SenseOfSpeed intensity (`sub_824E7980` / `sub_824E7CB0`):
@@ -72,14 +100,22 @@ pub(crate) fn seam_speed(ground_speed: f32) -> u32 {
 /// 30..80 km/h (vault `F57A74AFD22AD030` / `12275AA8AC4A63FB`); capture 3,313/3,313 exact.
 /// Wind: COM speed, 15..55 km/h, or the bail pair while bailing.
 pub(crate) fn speed_intensity(speed: f32, low_kmh: f32, high_kmh: f32) -> u32 {
-    word(fctiwz(unit((speed * KMH_PER_MS - low_kmh) / (high_kmh - low_kmh)) * THOUSAND), 0, 1_000)
+    word(
+        fctiwz(unit((speed * KMH_PER_MS - low_kmh) / (high_kmh - low_kmh)) * THOUSAND),
+        0,
+        1_000,
+    )
 }
 
 /// Class_Flips w7..w9 (`sub_824CC7D8`): a dead-zoned rotation rate,
 /// `v = min(fctiwz(|a| / D × 1000), 1000); v ≥ T ? v : 0`. Capture: 729/729 exact for each lane.
 pub(crate) fn flip_rate(rate: f32, divisor: f32, threshold: i32) -> u32 {
     let value = fctiwz(rate.abs() / divisor * THOUSAND).min(1_000);
-    if value >= threshold { value.max(0) as u32 } else { 0 }
+    if value >= threshold {
+        value.max(0) as u32
+    } else {
+        0
+    }
 }
 
 /// Treatment w7/w8 (`sub_824DD6F0`): `clamp(fctiwz(t × 1000), 0, 10000)` of KnownAir time in
@@ -93,7 +129,14 @@ pub(crate) fn air_milliseconds(seconds: f32) -> u32 {
 pub(crate) fn jump_height_word(height: f32) -> u32 {
     const SCALE: f32 = 166.667; // 0x822F9408
     let value = height * SCALE;
-    fctiwz(if value < 0.0 { 0.0 } else if value > 1_000.0 { 1_000.0 } else { value }).max(0) as u32
+    fctiwz(if value < 0.0 {
+        0.0
+    } else if value > 1_000.0 {
+        1_000.0
+    } else {
+        value
+    })
+    .max(0) as u32
 }
 
 /// Treatment/Flips w10: `clamp(fctiwz(timeScale × 500), 0, 1000)` (500 is `0x820BD5C4`).
@@ -104,13 +147,21 @@ pub(crate) fn time_scale_word(time_scale: f32) -> u32 {
 /// Foot drag w7 (`sub_824AF498` / `sub_824BEEE8`): `fctiwz(clamp((v − 0.5) / 50 × 3.6, 0, 1) ×
 /// 10000)`, 0.5 = vault `E5A6D8AC6EB9B5AB`, 50 = vault `B2C81577820408BE`.
 pub(crate) fn foot_drag_speed(ground_speed: f32, offset: f32, top_kmh: f32) -> u32 {
-    word(fctiwz(unit((ground_speed - offset) / top_kmh * KMH_PER_MS) * TEN_THOUSAND), 0, 10_000)
+    word(
+        fctiwz(unit((ground_speed - offset) / top_kmh * KMH_PER_MS) * TEN_THOUSAND),
+        0,
+        10_000,
+    )
 }
 
 /// Loose-board scrape w3 (`sub_824CB4C0`): `fctiwz(clamp((v − 0.5) / 15 × 3.6, 0, 1) × 10000)`,
 /// 15 = vault `9635B780C7472A6E`.
 pub(crate) fn board_slide_speed(ground_speed: f32, top_kmh: f32) -> u32 {
-    word(fctiwz(unit((ground_speed - HALF) / top_kmh * KMH_PER_MS) * TEN_THOUSAND), 0, 10_000)
+    word(
+        fctiwz(unit((ground_speed - HALF) / top_kmh * KMH_PER_MS) * TEN_THOUSAND),
+        0,
+        10_000,
+    )
 }
 
 #[cfg(test)]

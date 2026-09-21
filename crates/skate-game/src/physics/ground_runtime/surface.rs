@@ -43,8 +43,14 @@ mod tests {
 
     #[test]
     fn audio_vote_prefers_contact_weight_then_lower_id() {
-        assert_eq!(choose_audio_surface([7, 7, 3, 3], [true, false, true, false]), 3);
-        assert_eq!(choose_audio_surface([7, 7, 3, 3], [true, true, true, false]), 7);
+        assert_eq!(
+            choose_audio_surface([7, 7, 3, 3], [true, false, true, false]),
+            3
+        );
+        assert_eq!(
+            choose_audio_surface([7, 7, 3, 3], [true, true, true, false]),
+            7
+        );
         assert_eq!(choose_audio_surface([0, 0, 0, 0], [true; 4]), 1);
     }
 }

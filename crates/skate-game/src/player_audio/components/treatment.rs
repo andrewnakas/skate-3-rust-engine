@@ -18,8 +18,8 @@ use skate_data::collections::Collections;
 
 use super::super::audio_state::AudioState;
 use super::contacts::clamp_word;
-use super::words::{fctiwz, THOUSAND};
-use super::{post, redeliver, Component, Controls, Tick};
+use super::words::{THOUSAND, fctiwz};
+use super::{Component, Controls, Tick, post, redeliver};
 
 const TUNING_CLASS: &str = "Hash_C1831BDB6CB1B1EA";
 const TUNING_KEY: &str = "Hash_EE7B8A8A893A4E30";
@@ -65,7 +65,11 @@ pub(crate) struct TreatmentTuning {
 
 impl TreatmentTuning {
     pub(crate) fn load(vault: &Collections) -> Result<Self, String> {
-        let int = |name: &str| vault.integer(TUNING_CLASS, TUNING_KEY, name).map(|v| v as i32);
+        let int = |name: &str| {
+            vault
+                .integer(TUNING_CLASS, TUNING_KEY, name)
+                .map(|v| v as i32)
+        };
         Ok(Self {
             levels: [
                 int("Hash_32F9111CBF746F34")?,
@@ -91,11 +95,18 @@ pub(crate) struct TreatmentOwner {
 }
 
 impl TreatmentOwner {
-    pub(crate) const LOCAL: Self = Self { local_72: true, index_64: 0, sfx_pack_564: false };
+    pub(crate) const LOCAL: Self = Self {
+        local_72: true,
+        index_64: 0,
+        sfx_pack_564: false,
+    };
 }
 
 /// `sub_824DD408` → `sub_824B0080`: the posted packet.
-pub(crate) fn treatment_constructor(tuning: &TreatmentTuning, owner: TreatmentOwner) -> [u32; TREATMENT_WORDS] {
+pub(crate) fn treatment_constructor(
+    tuning: &TreatmentTuning,
+    owner: TreatmentOwner,
+) -> [u32; TREATMENT_WORDS] {
     let mut words = [0; TREATMENT_WORDS];
     words[1] = 32_767;
     words[4] = 4_096;
@@ -188,19 +199,30 @@ mod tests {
     use super::*;
 
     fn tuning() -> TreatmentTuning {
-        TreatmentTuning { levels: [7_000, 28_000, 32_767] }
+        TreatmentTuning {
+            levels: [7_000, 28_000, 32_767],
+        }
     }
 
     struct Fixed(&'static [(u32, u32, u32)]);
     impl Controls for Fixed {
         fn raw(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 52 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 52 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
         fn pitch(&self, id: u32) -> i32 {
-            self.0.iter().find(|r| r.0 == 56 && r.1 == id).map_or(0, |r| r.2 as i32)
+            self.0
+                .iter()
+                .find(|r| r.0 == 56 && r.1 == id)
+                .map_or(0, |r| r.2 as i32)
         }
         fn level(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 60 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 60 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
     }
 
@@ -209,7 +231,10 @@ mod tests {
         // Retail post, frame 2708.
         assert_eq!(
             treatment_constructor(&tuning(), TreatmentOwner::LOCAL),
-            [0, 32767, 0, 0, 4096, 25000, 0, 0, 0, 0, 500, 0, 0, 0, 0, 7000, 28000, 32767, 0, 1, 1, 8]
+            [
+                0, 32767, 0, 0, 4096, 25000, 0, 0, 0, 0, 500, 0, 0, 0, 0, 7000, 28000, 32767, 0, 1,
+                1, 8
+            ]
         );
     }
 
@@ -218,7 +243,12 @@ mod tests {
         // Frame 2710 (state 2709): reads 60:2 = 0x130F, 52:0 = 0xFFFF, 56:1 = 0xFF6.
         let mut words = treatment_constructor(&tuning(), TreatmentOwner::LOCAL);
         words[13] = 10_000;
-        let audio = { let mut s = AudioState::default(); s.time_scale_220 = 1.0; s.air_time_236 = f32::from_bits(0x3F33_3333); s };
+        let audio = {
+            let mut s = AudioState::default();
+            s.time_scale_220 = 1.0;
+            s.air_time_236 = f32::from_bits(0x3F33_3333);
+            s
+        };
         let controls = Fixed(&[(60, 2, 0x130F), (52, 0, 0xFFFF), (56, 1, 0xFF6)]);
         treatment_update(&mut words, &audio, &controls, &TreatmentGlobal::default());
         assert_eq!(words[0], 0x130F);
@@ -230,7 +260,12 @@ mod tests {
         assert_eq!(words[14], 1);
         // The updater writes w13 only while G+164 is set.
         assert_eq!((words[11], words[12], words[13]), (0, 0, 10_000));
-        let global = TreatmentGlobal { flag_16: true, value_24: 0.11, flag_164: true, value_168: 0.9758 };
+        let global = TreatmentGlobal {
+            flag_16: true,
+            value_24: 0.11,
+            flag_164: true,
+            value_168: 0.9758,
+        };
         treatment_update(&mut words, &audio, &controls, &global);
         assert_eq!((words[11], words[12], words[13]), (110, 1, 9_758));
     }
@@ -248,11 +283,19 @@ mod tests {
             match row.kind.as_str() {
                 "PO" => {
                     let ours = treatment_constructor(&tuning(), TreatmentOwner::LOCAL);
-                    assert_eq!(&row.words[..TREATMENT_WORDS], &ours, "post at {}", row.frame);
+                    assert_eq!(
+                        &row.words[..TREATMENT_WORDS],
+                        &ours,
+                        "post at {}",
+                        row.frame
+                    );
                     words = Some(ours);
                 }
                 "UP" => {
-                    let (Some(held), Some(state)) = (words.as_mut(), states.get(&(row.frame - 1))) else { continue };
+                    let (Some(held), Some(state)) = (words.as_mut(), states.get(&(row.frame - 1)))
+                    else {
+                        continue;
+                    };
                     let audio = AudioState::from_capture(state);
                     let controls = Captured::from_reads(&row.reads, 0x824D_D6F0..0x824D_DC10);
                     treatment_update(held, &audio, &controls, &TreatmentGlobal::default());

@@ -24,7 +24,7 @@ use skate_data::collections::Collections;
 use super::super::audio_state::AudioState;
 use super::contacts::{clamp_word, vault_word};
 use super::words::{fctiwz, flip_rate};
-use super::{post, redeliver, release, Component, Controls, Tick};
+use super::{Component, Controls, Tick, post, redeliver, release};
 
 const TUNING_CLASS: &str = "Hash_C1831BDB6CB1B1EA";
 const TRICKS_KEY: &str = "Hash_1FA8AC006CABEF59";
@@ -73,8 +73,16 @@ pub(crate) struct TricksTuning {
 impl TricksTuning {
     pub(crate) fn load(vault: &Collections) -> Result<Self, String> {
         let float = |name: &str| vault.float(TUNING_CLASS, TRICKS_KEY, name);
-        let int = |name: &str| vault.integer(TUNING_CLASS, TRICKS_KEY, name).map(|v| v as i32);
-        let slew = |name: &str| vault.integer(TUNING_CLASS, SLEW_KEY, name).map(|v| v as i32);
+        let int = |name: &str| {
+            vault
+                .integer(TUNING_CLASS, TRICKS_KEY, name)
+                .map(|v| v as i32)
+        };
+        let slew = |name: &str| {
+            vault
+                .integer(TUNING_CLASS, SLEW_KEY, name)
+                .map(|v| v as i32)
+        };
         Ok(Self {
             rate_divisor: [
                 float("Hash_1494BB20854C155C")?,
@@ -117,7 +125,11 @@ pub(crate) struct TricksOwner {
 }
 
 impl TricksOwner {
-    pub(crate) const LOCAL: Self = Self { local_72: true, index_64: 0, sfx_pack_564: false };
+    pub(crate) const LOCAL: Self = Self {
+        local_72: true,
+        index_64: 0,
+        sfx_pack_564: false,
+    };
 }
 
 /// The game-global words `sub_824CD170` picks the w12 target from. Unidentified: the flags
@@ -154,9 +166,17 @@ pub(crate) fn emphasis_slew(current: i32, target: i32, tuning: &TricksTuning, dt
     let down = fctiwz(tuning.slew_down * dt);
     let up = fctiwz(tuning.slew_up * dt);
     if target < current {
-        if current - target > down { current - down } else { target }
+        if current - target > down {
+            current - down
+        } else {
+            target
+        }
     } else if target > current {
-        if target - current > up { current + up } else { target }
+        if target - current > up {
+            current + up
+        } else {
+            target
+        }
     } else {
         target
     }
@@ -165,8 +185,11 @@ pub(crate) fn emphasis_slew(current: i32, target: i32, tuning: &TricksTuning, dt
 /// The three dead-zoned rotation rates (x = +480 → w9, y = +484 → w8, z = +488 → w7).
 fn rates(tuning: &TricksTuning, audio: &AudioState) -> [i32; 3] {
     std::array::from_fn(|lane| {
-        flip_rate(audio.deck_angular_velocity_480[lane], tuning.rate_divisor[lane], tuning.rate_threshold[lane])
-            as i32
+        flip_rate(
+            audio.deck_angular_velocity_480[lane],
+            tuning.rate_divisor[lane],
+            tuning.rate_threshold[lane],
+        ) as i32
     })
 }
 
@@ -180,8 +203,11 @@ fn hold_path(audio: &AudioState, owner: TricksOwner) -> bool {
 /// path, else `state+348`).
 fn flip_gate(audio: &AudioState, owner: TricksOwner) -> Option<i32> {
     let hold = hold_path(audio, owner);
-    (audio.in_known_air_332 && audio.trick_active_343 || hold)
-        .then_some(if hold { HOLD_TRICK } else { audio.audio_trick_348 as i32 })
+    (audio.in_known_air_332 && audio.trick_active_343 || hold).then_some(if hold {
+        HOLD_TRICK
+    } else {
+        audio.audio_trick_348 as i32
+    })
 }
 
 /// `sub_824CBFB8`: the id the poster posts this frame (`None` when it posts nothing).
@@ -215,7 +241,11 @@ pub(crate) fn flips_constructor(
     words[23] = clamp_word(i32::from(owner.sfx_pack_564), 0, 1);
     words[24] = clamp_word(i32::from(owner.local_72 && owner.index_64 == 0), 0, 1);
     words[25] = clamp_word(i32::from(owner.local_72), 0, 1);
-    let level6 = if owner.local_72 { controls.level(6) as i32 } else { 0 };
+    let level6 = if owner.local_72 {
+        controls.level(6) as i32
+    } else {
+        0
+    };
     words[26] = clamp_word(level6, 0, 32_767);
     words[27] = clamp_word(tuning.eq_flips, 0, 32_767);
     words
@@ -224,7 +254,11 @@ pub(crate) fn flips_constructor(
 /// `sub_824CC7D8`: whether a held flip survives this update (else it is released).
 pub(crate) fn flip_keeps(audio: &AudioState, owner: TricksOwner, posted_id: i32) -> bool {
     let hold = hold_path(audio, owner);
-    let id = if hold { HOLD_TRICK } else { audio.audio_trick_348 as i32 };
+    let id = if hold {
+        HOLD_TRICK
+    } else {
+        audio.audio_trick_348 as i32
+    };
     (audio.in_known_air_332 || hold) && id == posted_id
 }
 
@@ -250,7 +284,11 @@ pub(crate) fn flips_update(
     words[5] = clamp_word(controls.level(3) as i32, 0, 25_000);
     words[6] = 0;
     words[16] = clamp_word(i32::from(!audio.paused_224), 0, 1);
-    let level6 = if owner.local_72 { controls.level(6) as i32 } else { 0 };
+    let level6 = if owner.local_72 {
+        controls.level(6) as i32
+    } else {
+        0
+    };
     words[26] = clamp_word(level6, 0, 32_767);
     words[20] = clamp_word(controls.level(8) as i32, 0, 32_767);
     words[22] = clamp_word(controls.level(7) as i32, 0, 32_767);
@@ -335,7 +373,12 @@ pub(crate) struct TricksEvents {
 /// The runtime-free state machine; [`Component`] applies its events to the authored runtime.
 impl Tricks {
     /// `sub_824CBEB0` (without the `sub_824CD390` event triggers).
-    pub(crate) fn step_process(&mut self, audio: &AudioState, controls: &dyn Controls, dt: f32) -> TricksEvents {
+    pub(crate) fn step_process(
+        &mut self,
+        audio: &AudioState,
+        controls: &dyn Controls,
+        dt: f32,
+    ) -> TricksEvents {
         let mut events = TricksEvents::default();
         if !self.owner.local_72 {
             return events;
@@ -350,7 +393,13 @@ impl Tricks {
             if let Some(gate_id) = flip_gate(audio, self.owner) {
                 self.flip_id_52 = gate_id;
                 if !UNPOSTED.contains(&gate_id) {
-                    events.post_flips = Some(flips_constructor(&self.tuning, audio, controls, self.owner, gate_id));
+                    events.post_flips = Some(flips_constructor(
+                        &self.tuning,
+                        audio,
+                        controls,
+                        self.owner,
+                        gate_id,
+                    ));
                 }
             }
         }
@@ -384,7 +433,11 @@ impl Tricks {
         } else if self.cloth_b.is_some() {
             events.release_cloth_b = true;
         }
-        self.countdown_68 = if self.countdown_68 > 0.0 { self.countdown_68 - dt } else { 0.0 };
+        self.countdown_68 = if self.countdown_68 > 0.0 {
+            self.countdown_68 - dt
+        } else {
+            0.0
+        };
         self.prev_id_48 = id;
         self.emphasis.flags_2f0d0 = audio.multiplier_flags_2f0d0;
         let target = emphasis_target(&self.tuning, self.emphasis);
@@ -393,13 +446,24 @@ impl Tricks {
     }
 
     /// `sub_824CBF78`: releases, and rewrites of what stays held (applied to the held words).
-    pub(crate) fn step_update(&mut self, audio: &AudioState, controls: &dyn Controls) -> TricksEvents {
+    pub(crate) fn step_update(
+        &mut self,
+        audio: &AudioState,
+        controls: &dyn Controls,
+    ) -> TricksEvents {
         let mut events = TricksEvents::default();
         // sub_824CC7D8
         if self.flips.is_some() {
             if flip_keeps(audio, self.owner, self.flip_id_52) {
                 if let Some((_, words)) = self.flips.as_mut() {
-                    flips_update(words, &self.tuning, audio, controls, self.owner, self.slew_72);
+                    flips_update(
+                        words,
+                        &self.tuning,
+                        audio,
+                        controls,
+                        self.owner,
+                        self.slew_72,
+                    );
                 }
             } else {
                 events.release_flips = true;
@@ -407,7 +471,9 @@ impl Tricks {
         }
         // sub_824CCE48
         if self.cloth_a.is_some() {
-            if audio.bail_676 || (audio.audio_trick_348 as i32 == NO_TRICK && !audio.in_known_air_332) {
+            if audio.bail_676
+                || (audio.audio_trick_348 as i32 == NO_TRICK && !audio.in_known_air_332)
+            {
                 events.release_cloth_a = true;
             } else if let Some((_, words)) = self.cloth_a.as_mut() {
                 cloth_update(words, controls);
@@ -426,7 +492,11 @@ impl Tricks {
 
     /// Record a posted handle, or drop a released one, after the runtime applied `events`
     /// (a release is applied before a post of the same message).
-    fn apply(&mut self, runtime: &mut skate_audio_core::authored::AuthoredRuntime, events: &TricksEvents) -> Result<(), String> {
+    fn apply(
+        &mut self,
+        runtime: &mut skate_audio_core::authored::AuthoredRuntime,
+        events: &TricksEvents,
+    ) -> Result<(), String> {
         fn swap<const N: usize>(
             runtime: &mut skate_audio_core::authored::AuthoredRuntime,
             slot: &mut Option<(u32, [u32; N])>,
@@ -443,14 +513,37 @@ impl Tricks {
             }
             Ok(())
         }
-        swap(runtime, &mut self.flips, events.release_flips, events.post_flips, FLIPS_OBJECT)?;
-        swap(runtime, &mut self.cloth_a, events.release_cloth_a, events.post_cloth_a, CLOTH_OBJECT)?;
-        swap(runtime, &mut self.cloth_b, events.release_cloth_b, events.post_cloth_b, CLOTH_OBJECT)
+        swap(
+            runtime,
+            &mut self.flips,
+            events.release_flips,
+            events.post_flips,
+            FLIPS_OBJECT,
+        )?;
+        swap(
+            runtime,
+            &mut self.cloth_a,
+            events.release_cloth_a,
+            events.post_cloth_a,
+            CLOTH_OBJECT,
+        )?;
+        swap(
+            runtime,
+            &mut self.cloth_b,
+            events.release_cloth_b,
+            events.post_cloth_b,
+            CLOTH_OBJECT,
+        )
     }
 
     #[cfg(test)]
     fn apply_local(&mut self, events: &TricksEvents, next_handle: &mut u32) {
-        fn swap<const N: usize>(slot: &mut Option<(u32, [u32; N])>, released: bool, posted: Option<[u32; N]>, next: &mut u32) {
+        fn swap<const N: usize>(
+            slot: &mut Option<(u32, [u32; N])>,
+            released: bool,
+            posted: Option<[u32; N]>,
+            next: &mut u32,
+        ) {
             if released {
                 *slot = None;
             }
@@ -459,9 +552,24 @@ impl Tricks {
                 *slot = Some((*next, words));
             }
         }
-        swap(&mut self.flips, events.release_flips, events.post_flips, next_handle);
-        swap(&mut self.cloth_a, events.release_cloth_a, events.post_cloth_a, next_handle);
-        swap(&mut self.cloth_b, events.release_cloth_b, events.post_cloth_b, next_handle);
+        swap(
+            &mut self.flips,
+            events.release_flips,
+            events.post_flips,
+            next_handle,
+        );
+        swap(
+            &mut self.cloth_a,
+            events.release_cloth_a,
+            events.post_cloth_a,
+            next_handle,
+        );
+        swap(
+            &mut self.cloth_b,
+            events.release_cloth_b,
+            events.post_cloth_b,
+            next_handle,
+        );
     }
 }
 
@@ -491,7 +599,11 @@ mod tests {
 
     pub(super) fn tuning() -> TricksTuning {
         TricksTuning {
-            rate_divisor: [3.0, f32::from_bits(0x408C_CCCD), f32::from_bits(0x4123_3333)],
+            rate_divisor: [
+                3.0,
+                f32::from_bits(0x408C_CCCD),
+                f32::from_bits(0x4123_3333),
+            ],
             rate_threshold: [297, 703, 603],
             w17: 0x6BFE,
             w18: 0x3A00,
@@ -508,18 +620,36 @@ mod tests {
     struct Fixed(&'static [(u32, u32, u32)]);
     impl Controls for Fixed {
         fn raw(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 52 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 52 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
         fn pitch(&self, id: u32) -> i32 {
-            self.0.iter().find(|r| r.0 == 56 && r.1 == id).map_or(0, |r| r.2 as i32)
+            self.0
+                .iter()
+                .find(|r| r.0 == 56 && r.1 == id)
+                .map_or(0, |r| r.2 as i32)
         }
         fn level(&self, id: u32) -> u32 {
-            self.0.iter().find(|r| r.0 == 60 && r.1 == id).map_or(0, |r| r.2)
+            self.0
+                .iter()
+                .find(|r| r.0 == 60 && r.1 == id)
+                .map_or(0, |r| r.2)
         }
     }
 
     fn air(id: i32, latched: i32, rates: [f32; 3]) -> AudioState {
-        { let mut s = AudioState::default(); s.in_known_air_332 = true; s.trick_active_343 = id != NO_TRICK; s.audio_trick_348 = id as u32; s.audio_trick_352 = latched as u32; s.deck_angular_velocity_480 = rates; s.time_scale_220 = 1.0; s }
+        {
+            let mut s = AudioState::default();
+            s.in_known_air_332 = true;
+            s.trick_active_343 = id != NO_TRICK;
+            s.audio_trick_348 = id as u32;
+            s.audio_trick_352 = latched as u32;
+            s.deck_angular_velocity_480 = rates;
+            s.time_scale_220 = 1.0;
+            s
+        }
     }
 
     #[test]
@@ -527,12 +657,18 @@ mod tests {
         // Retail post, frame 3848 (same-frame state): ollie (28), x rate −3.828 → 1000.
         let audio = air(28, NO_TRICK, [f32::from_bits(0xC074_FDF4), -0.085, -1.109]);
         assert_eq!(flip_post_id(&audio, TricksOwner::LOCAL), Some(28));
-        let words = flips_constructor(&tuning(), &audio, &Fixed(&[(60, 6, 0)]), TricksOwner::LOCAL, 28);
+        let words = flips_constructor(
+            &tuning(),
+            &audio,
+            &Fixed(&[(60, 6, 0)]),
+            TricksOwner::LOCAL,
+            28,
+        );
         assert_eq!(
             words,
             [
-                0, 32767, 0, 0, 4096, 25000, 0, 0, 0, 1000, 500, 28, 0, 0, 0, 0, 1, 0x6BFE, 0x3A00, 0x1A00, 0,
-                10000, 0, 0, 1, 1, 0, 6
+                0, 32767, 0, 0, 4096, 25000, 0, 0, 0, 1000, 500, 28, 0, 0, 0, 0, 1, 0x6BFE, 0x3A00,
+                0x1A00, 0, 10000, 0, 0, 1, 1, 0, 6
             ]
         );
     }
@@ -542,7 +678,12 @@ mod tests {
         let owner = TricksOwner::LOCAL;
         assert_eq!(flip_post_id(&air(35, NO_TRICK, [0.0; 3]), owner), None);
         assert_eq!(flip_post_id(&air(36, NO_TRICK, [0.0; 3]), owner), None);
-        let mut ground = { let mut s = AudioState::default(); s.hold_expired_310 = true; s.audio_trick_348 = 5; s };
+        let mut ground = {
+            let mut s = AudioState::default();
+            s.hold_expired_310 = true;
+            s.audio_trick_348 = 5;
+            s
+        };
         assert_eq!(flip_post_id(&ground, owner), Some(HOLD_TRICK));
         assert!(flip_keeps(&ground, owner, HOLD_TRICK));
         ground.hold_expired_310 = false;
@@ -559,11 +700,56 @@ mod tests {
         assert_eq!(emphasis_slew(700, 0, &t, 1.0 / 60.0), 684);
         assert_eq!(emphasis_slew(700, 0, &t, 0.0), 0);
         // 0x2000 (sub_824898C8) wins over 0x8000 and 0x4000.
-        assert_eq!(emphasis_target(&t, TrickEmphasis { flags_2f0d0: 0xE000, mode_824898c8: false }), 1_000);
-        assert_eq!(emphasis_target(&t, TrickEmphasis { flags_2f0d0: 0xC000, mode_824898c8: false }), 250);
-        assert_eq!(emphasis_target(&t, TrickEmphasis { flags_2f0d0: 0x4000, mode_824898c8: false }), 700);
-        assert_eq!(emphasis_target(&t, TrickEmphasis { flags_2f0d0: 0x2000, mode_824898c8: false }), 1_000);
-        assert_eq!(emphasis_target(&t, TrickEmphasis { flags_2f0d0: 0x8000, mode_824898c8: true }), 1_000);
+        assert_eq!(
+            emphasis_target(
+                &t,
+                TrickEmphasis {
+                    flags_2f0d0: 0xE000,
+                    mode_824898c8: false
+                }
+            ),
+            1_000
+        );
+        assert_eq!(
+            emphasis_target(
+                &t,
+                TrickEmphasis {
+                    flags_2f0d0: 0xC000,
+                    mode_824898c8: false
+                }
+            ),
+            250
+        );
+        assert_eq!(
+            emphasis_target(
+                &t,
+                TrickEmphasis {
+                    flags_2f0d0: 0x4000,
+                    mode_824898c8: false
+                }
+            ),
+            700
+        );
+        assert_eq!(
+            emphasis_target(
+                &t,
+                TrickEmphasis {
+                    flags_2f0d0: 0x2000,
+                    mode_824898c8: false
+                }
+            ),
+            1_000
+        );
+        assert_eq!(
+            emphasis_target(
+                &t,
+                TrickEmphasis {
+                    flags_2f0d0: 0x8000,
+                    mode_824898c8: true
+                }
+            ),
+            1_000
+        );
         assert_eq!(emphasis_target(&t, TrickEmphasis::default()), 0);
     }
 
@@ -593,8 +779,14 @@ mod tests {
     #[test]
     fn cloth_update_matches_a_retail_row() {
         let mut words = cloth_constructor(&tuning(), 28);
-        cloth_update(&mut words, &Fixed(&[(56, 5, 0xFD0), (60, 4, 0x2D26), (52, 0, 0x1FF)]));
-        assert_eq!(words, [32767, 0x1FF, 0xFD0, 0, 25000, 0, 0, 0x2D26, 1, 28, 0]);
+        cloth_update(
+            &mut words,
+            &Fixed(&[(56, 5, 0xFD0), (60, 4, 0x2D26), (52, 0, 0x1FF)]),
+        );
+        assert_eq!(
+            words,
+            [32767, 0x1FF, 0xFD0, 0, 25000, 0, 0, 0x2D26, 1, 28, 0]
+        );
     }
 
     /// The bridge clock (+312) difference: the frame's dt.
@@ -616,20 +808,31 @@ mod tests {
         let states = capture::states(&root);
         let flips_rows = capture::rows(&root, "Class_Flips");
         let cloth_rows = capture::rows(&root, "cloth_trick");
-        let by_frame = |rows: &[capture::Row], kind: &str| -> std::collections::BTreeMap<u32, Vec<capture::Row>> {
+        let by_frame = |rows: &[capture::Row],
+                        kind: &str|
+         -> std::collections::BTreeMap<u32, Vec<capture::Row>> {
             let mut map = std::collections::BTreeMap::<u32, Vec<capture::Row>>::new();
             for row in rows.iter().filter(|r| r.kind == kind) {
                 map.entry(row.frame).or_default().push(row.clone());
             }
             map
         };
-        let (flips_po, flips_up, flips_rl) = (by_frame(&flips_rows, "PO"), by_frame(&flips_rows, "UP"), by_frame(&flips_rows, "RL"));
-        let (cloth_po, cloth_up, cloth_rl) = (by_frame(&cloth_rows, "PO"), by_frame(&cloth_rows, "UP"), by_frame(&cloth_rows, "RL"));
+        let (flips_po, flips_up, flips_rl) = (
+            by_frame(&flips_rows, "PO"),
+            by_frame(&flips_rows, "UP"),
+            by_frame(&flips_rows, "RL"),
+        );
+        let (cloth_po, cloth_up, cloth_rl) = (
+            by_frame(&cloth_rows, "PO"),
+            by_frame(&cloth_rows, "UP"),
+            by_frame(&cloth_rows, "RL"),
+        );
         let mut tricks = Tricks::with_tuning(tuning());
         let mut handles = 0;
         let mut flips_match = Matches::new("Class_Flips update", FLIPS_WORDS);
         let mut cloth_match = Matches::new("cloth_trick update", CLOTH_WORDS);
-        let (mut flips_post_ok, mut flips_post_n, mut cloth_post_ok, mut cloth_post_n) = (0, 0, 0, 0);
+        let (mut flips_post_ok, mut flips_post_n, mut cloth_post_ok, mut cloth_post_n) =
+            (0, 0, 0, 0);
         let (mut timing_ok, mut timing_bad) = (0usize, Vec::new());
         let first = *states.keys().next().unwrap();
         let last = *states.keys().last().unwrap();
@@ -650,16 +853,25 @@ mod tests {
                     tricks.slew_72 = rows[0].words[12] as i32;
                 }
                 let events = tricks.step_update(&audio, &controls);
-                let ours_rl = events.release_flips as usize + events.release_cloth_a as usize + events.release_cloth_b as usize;
-                let retail_rl = flips_rl.get(&frame).map_or(0, Vec::len) + cloth_rl.get(&frame).map_or(0, Vec::len);
+                let ours_rl = events.release_flips as usize
+                    + events.release_cloth_a as usize
+                    + events.release_cloth_b as usize;
+                let retail_rl = flips_rl.get(&frame).map_or(0, Vec::len)
+                    + cloth_rl.get(&frame).map_or(0, Vec::len);
                 tricks.apply_local(&events, &mut handles);
-                if let (Some(rows), Some((_, words))) = (flips_up.get(&frame), tricks.flips.as_ref()) {
+                if let (Some(rows), Some((_, words))) =
+                    (flips_up.get(&frame), tricks.flips.as_ref())
+                {
                     flips_match.add(frame, &rows[0].words[..FLIPS_WORDS], words);
                 }
                 if let Some(rows) = cloth_up.get(&frame) {
                     for row in rows {
                         let a = Captured::from_reads(&row.reads, 0x824C_CE48..0x824C_CFE8);
-                        let held = if a.0.is_empty() { tricks.cloth_b.as_ref() } else { tricks.cloth_a.as_ref() };
+                        let held = if a.0.is_empty() {
+                            tricks.cloth_b.as_ref()
+                        } else {
+                            tricks.cloth_a.as_ref()
+                        };
                         if let Some((_, words)) = held {
                             cloth_match.add(frame, &row.words[..CLOTH_WORDS], words);
                         }
@@ -672,15 +884,26 @@ mod tests {
                 let pevents = process_state
                     .as_ref()
                     .map(|a| {
-                        let reads: Vec<_> = flips_po.get(&frame).into_iter().flatten().flat_map(|r| r.reads.clone()).collect();
-                        tricks.step_process(a, &Captured::from_reads(&reads, 0x824C_BFB8..0x824C_C590), dt)
+                        let reads: Vec<_> = flips_po
+                            .get(&frame)
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|r| r.reads.clone())
+                            .collect();
+                        tricks.step_process(
+                            a,
+                            &Captured::from_reads(&reads, 0x824C_BFB8..0x824C_C590),
+                            dt,
+                        )
                     })
                     .unwrap_or_default();
-                let ours_rl = ours_rl + pevents.release_cloth_a as usize + pevents.release_cloth_b as usize;
+                let ours_rl =
+                    ours_rl + pevents.release_cloth_a as usize + pevents.release_cloth_b as usize;
                 let ours_po = pevents.post_flips.is_some() as usize
                     + pevents.post_cloth_a.is_some() as usize
                     + pevents.post_cloth_b.is_some() as usize;
-                let retail_po = flips_po.get(&frame).map_or(0, Vec::len) + cloth_po.get(&frame).map_or(0, Vec::len);
+                let retail_po = flips_po.get(&frame).map_or(0, Vec::len)
+                    + cloth_po.get(&frame).map_or(0, Vec::len);
                 if ours_rl == retail_rl && ours_po == retail_po {
                     timing_ok += 1;
                 } else if timing_bad.len() < 12 {
@@ -688,13 +911,22 @@ mod tests {
                 }
                 if let Some(words) = pevents.post_flips {
                     flips_post_n += 1;
-                    if flips_po.get(&frame).is_some_and(|rows| rows[0].words[..FLIPS_WORDS] == words) {
+                    if flips_po
+                        .get(&frame)
+                        .is_some_and(|rows| rows[0].words[..FLIPS_WORDS] == words)
+                    {
                         flips_post_ok += 1;
                     }
                 }
-                for words in pevents.post_cloth_a.iter().chain(pevents.post_cloth_b.iter()) {
+                for words in pevents
+                    .post_cloth_a
+                    .iter()
+                    .chain(pevents.post_cloth_b.iter())
+                {
                     cloth_post_n += 1;
-                    if cloth_po.get(&frame).is_some_and(|rows| rows.iter().any(|r| r.words[..CLOTH_WORDS] == words[..])) {
+                    if cloth_po.get(&frame).is_some_and(|rows| {
+                        rows.iter().any(|r| r.words[..CLOTH_WORDS] == words[..])
+                    }) {
                         cloth_post_ok += 1;
                     }
                 }
@@ -703,7 +935,11 @@ mod tests {
         }
         flips_match.print();
         cloth_match.print();
-        println!("flips posts exact {flips_post_ok}/{flips_post_n}, cloth posts exact {cloth_post_ok}/{cloth_post_n}");
-        println!("frames with matching post/release counts {timing_ok}, first mismatches (frame, ours po, retail po, ours rl, retail rl) {timing_bad:?}");
+        println!(
+            "flips posts exact {flips_post_ok}/{flips_post_n}, cloth posts exact {cloth_post_ok}/{cloth_post_n}"
+        );
+        println!(
+            "frames with matching post/release counts {timing_ok}, first mismatches (frame, ours po, retail po, ours rl, retail rl) {timing_bad:?}"
+        );
     }
 }
