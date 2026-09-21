@@ -261,6 +261,22 @@ impl AuthoredRuntime {
         })
     }
 
+    /// The graph arena's high-water mark and how many blocks are currently live. A long session
+    /// must see `live` plateau: it climbing without bound is the voice-graph leak that once ended
+    /// in "authored audio guest heap exhausted".
+    pub fn arena_usage(&self) -> (u32, usize) {
+        (
+            self.owner.device.heap.next - GRAPH_HEAP,
+            self.owner.device.heap.live.len(),
+        )
+    }
+
+    /// Any sample key with decoded PCM installed. For tests that need a voice to open and do not
+    /// care which sound it is.
+    pub fn any_installed_sample(&self) -> Option<u32> {
+        self.owner.device.sources.keys().min().copied()
+    }
+
     pub fn bank_base(&self, name: &str) -> Option<u32> {
         self.banks.get(name).copied()
     }
@@ -470,7 +486,10 @@ impl AuthoredDevice {
         )
     }
 
-    fn stop_graph(&mut self, g: &mut Guest, player: u32) -> Result<()> {
+    /// `heap` is passed in rather than taken from `self`, because the command drain moves the
+    /// device's arena out for the duration of the drain — freeing through `self.heap` there frees
+    /// into a temporary and silently leaks.
+    fn stop_graph(&mut self, g: &mut Guest, heap: &mut dyn Heap, player: u32) -> Result<()> {
         for i in 0..u32::from(g.u8(player + 68)?) {
             let child = g.u32(player + 80 + 4 * i)?;
             if g.u32(child)? == modules::SEND_VTABLE {
@@ -478,7 +497,7 @@ impl AuthoredDevice {
             }
             if let Some(source) = self.players.remove(&child) {
                 self.streams.detach(source.decoder);
-                self.heap.free(g, source.decoder)?;
+                heap.free(g, source.decoder)?;
                 scheduler::detach_instance(
                     g,
                     u64::from(SYSTEM + scheduler::SYSTEM_SCHEDULER),
@@ -730,8 +749,15 @@ impl commands::CommandHost for AuthoredDevice {
         self.grains.end_play();
         result
     }
-    fn stop_player(&mut self, g: &mut Guest, _heap: &mut dyn Heap, record: u32) -> Result<u32> {
-        self.stop_graph(g, g.u32(record + 4)?)?;
+    fn stop_player(&mut self, g: &mut Guest, heap: &mut dyn Heap, record: u32) -> Result<u32> {
+        let player = g.u32(record + 4)?;
+        self.stop_graph(g, heap, player)?;
+        // `build_graph` takes the whole graph — header, module table and every module — out of the
+        // arena in one allocation, and this deferred teardown is the point at which nothing
+        // references it any more. Without this the block leaked: `release` freed only the voice,
+        // so every one-shot cost a graph for the rest of the session and a long session ended in
+        // "authored audio guest heap exhausted".
+        heap.free(g, player)?;
         Ok(8)
     }
 }

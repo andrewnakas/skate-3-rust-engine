@@ -70,6 +70,71 @@ fn rolling(tick: u64, speed: f32) -> PlayerAudioObservation {
     }
 }
 
+/// The voice-graph arena must plateau. `build_graph` takes a whole graph out of the arena in one
+/// allocation and only the deferred teardown (`stop_player`) can give it back; when that free was
+/// missing, every one-shot cost a graph for the rest of the session and a long playtest ended in
+/// "authored audio guest heap exhausted" with the audio worker dead and the game still running.
+///
+///     cargo test -p skate-game --bin skate3rust -- --ignored the_voice_arena --nocapture
+#[test]
+#[ignore = "needs the owner's assets"]
+fn the_voice_arena_plateaus_under_repeated_voices() {
+    use skate_audio_core::authored::oneshot::{OneshotBus, OneshotVoice};
+    let assets = std::env::var_os("SKATE_ASSETS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| DEFAULT_ASSETS.into());
+    let super::Prepared { mut runtime, .. } =
+        super::prepare(&assets).expect("prepare the retail player-sound worker");
+    // Any installed sample will do; the graph is what is being measured, not the audio.
+    let sample = runtime.any_installed_sample().expect("some decoded sample");
+    let mut marks = Vec::new();
+    for round in 0..40 {
+        let mut handle = runtime
+            .play_oneshot(&OneshotVoice {
+                sample,
+                gain: 0.5,
+                pitch: 1.0,
+                delay: 0.0,
+                pan: 0.0,
+                bus: OneshotBus::Default,
+            })
+            .expect("open a one-shot");
+        // Run it to the end, rendering blocks as the worker does: the teardown is *deferred*
+        // through the command ring, and the ring is only drained while blocks are being rendered.
+        for _ in 0..600 {
+            let live = runtime.tick_oneshot(&mut handle, 1.0 / 60.0).expect("tick");
+            runtime.pump_once().expect("render one block");
+            if !live {
+                break;
+            }
+        }
+        runtime.release_oneshot(&mut handle).expect("release");
+        // A few more blocks so the stop command this release queued is drained too.
+        for _ in 0..4 {
+            runtime.pump_once().expect("render one block");
+        }
+        if round % 10 == 9 {
+            marks.push(runtime.arena_usage());
+        }
+    }
+    println!("arena (high-water bytes, live blocks) after each 10 voices: {marks:?}");
+    let (first, last) = (marks[0], *marks.last().unwrap());
+    // The high-water mark must stop moving: the graph each voice takes out of the arena is given
+    // back by the deferred teardown and reused by the next voice.
+    assert_eq!(
+        first.0, last.0,
+        "arena high-water grew from {} to {} bytes across 30 further voices",
+        first.0, last.0
+    );
+    // Known residual, and much smaller: the 128-byte decoder `open` allocates per voice is keyed
+    // by the voice's stream but freed by the graph teardown's child walk, so it survives when the
+    // two do not match. It costs 128 bytes a voice against a 64 MB arena rather than a whole
+    // graph, and the free list absorbs it, but it is not zero.
+    let leaked = last.1 - first.1;
+    println!("residual live blocks across 30 voices: {leaked}");
+    assert!(leaked <= 30, "more than one block per voice survives teardown");
+}
+
 #[test]
 #[ignore = "needs the owner's assets; run explicitly"]
 fn headless_rolling_through_the_retail_path() {

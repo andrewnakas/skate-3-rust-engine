@@ -367,13 +367,18 @@ fn run(
         window_blocks += 1;
         if trace && window_blocks as u64 * u64::from(PCM_FRAMES_PER_BLOCK) >= u64::from(SAMPLE_RATE) {
             let stats = runtime.stats();
+            // The graph arena: blocks live must plateau. It climbing without bound was the
+            // voice-graph leak that ended a long session in "guest heap exhausted".
+            let arena = runtime.arena_usage();
             let audio = sound.audio();
             eprintln!(
-                "SKATE_PLAYER_AUDIO second block={} peak_dbfs={:.1} opened={} live={} speed={:.2} wheels={} air={} grind={} walk={}",
+                "SKATE_PLAYER_AUDIO second block={} peak_dbfs={:.1} opened={} live={} arena={}k/{} speed={:.2} wheels={} air={} grind={} walk={}",
                 stats.blocks,
                 20.0 * window_peak.max(1.0e-9).log10(),
                 stats.voices_opened,
                 stats.live_voices,
+                arena.0 / 1024,
+                arena.1,
                 audio.ground_speed_208,
                 audio.wheel_count_200,
                 audio.in_known_air_332,
