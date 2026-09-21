@@ -140,6 +140,11 @@ pub(crate) struct Runtime {
     pub flip_direction: i32,
     /// 82DA8EB8's +2396 latch, which is also scoring output byte 14651: a body flip
     /// happened during this air, whatever the carrier was.
+    ///
+    /// This is *not* what names a flip -- that is [`Self::flip_direction`], by way of the
+    /// output block's +12316. Byte 14651 only fires one HUD event: `82775328` reads it at
+    /// 0x82775560 and calls the backend's vtable+24 with `r4 = 17`. Nothing consumes it
+    /// here yet, because that event is not ported.
     pub flip_seen: bool,
     landing_countdown: u32,
     idle_ticks: u32,
