@@ -32,6 +32,26 @@ mod trick_tokens {
     pub const BACKFLIP: &str = "ID_TRICK_AIR_METRICS_BACKFLIP";
 }
 
+/// Whether a scorable's name may carry a spin, `r23` in `825E51A0`.
+///
+/// ```text
+/// bl    0x82da22a8   ; the authored record of the named scorable
+/// lwz   r10,392(r1)  ; desc+120 = its TrickType
+/// lbz   r9,396(r1)   ; desc+124 = valid
+/// r23 = (TrickType == 4 && valid && desc+12 != 60) || TrickType in {1,2,3,7,10,12,13}
+/// ```
+///
+/// The admitted set is Air, Flip, FingerFlip, Grab, NoComply, HippyJump, Boneless and
+/// Footplant. It deliberately excludes Grind(5), **Handplant(6)**, **Manual(8)**, Slide(9)
+/// and Revert(11) -- which is why retail never writes "Manual 180".
+///
+/// Not ported: the `desc+12 != 60` qualifier on grabs, an authored field this port does not
+/// resolve. It can only ever admit a spin that retail would refuse, never refuse one retail
+/// would admit.
+fn decorates_spin(trick_type: u32) -> bool {
+    matches!(trick_type, 1 | 2 | 3 | 4 | 7 | 10 | 12 | 13)
+}
+
 /// Compose the displayed trick name the way `sub_825E51A0` does.
 ///
 /// The result is one `#`, then space-separated localisation ids and a bare degree count,
@@ -50,6 +70,7 @@ fn compose_trick_name(
     flip_direction: i32,
     switch: bool,
     goofy: bool,
+    decorate_spin: bool,
 ) -> String {
     // 0x825E53C4: a spin's side is the parity of switch, the spin's own sign and stance.
     let backside = switch ^ (spin_turns < 0) ^ goofy;
@@ -60,8 +81,9 @@ fn compose_trick_name(
         None if backside => trick_tokens::BS_SPIN,
         None => trick_tokens::FS_SPIN,
     });
-    // 82DA8BE0 keeps the rotation as signed half-turns; the display prints degrees.
-    if spin_turns != 0 {
+    // 82DA8BE0 keeps the rotation as signed half-turns; the display prints degrees --
+    // but only for a trick class that is allowed to carry one (0x825E5700).
+    if spin_turns != 0 && decorate_spin {
         name.push(' ');
         name.push_str(&(spin_turns.abs() * 180).to_string());
     }
@@ -325,14 +347,25 @@ pub(crate) struct Runtime {
     trick_name: String,
     /// The announced record's own localisation id, before spin and flip are added.
     base_trick_label: Option<String>,
+    /// The named scorable's authored TrickType, which decides whether the name may carry a
+    /// spin at all. See [`decorates_spin`].
+    base_trick_type: u32,
     stance: [bool; 4],
     clean: bool,
     sketchy: bool,
     pub new_trick: bool,
     pub modified_trick: bool,
     pub close_tricks: bool,
-    /// The spin and flip the display last had, `M+12` and `M+16` in 825E4F40. Those two
-    /// fields, and only those two, are what mark the trick name dirty.
+    /// The spin and flip the *display* holds, `B+52`/`B+56` by way of `M+12`/`M+16`.
+    ///
+    /// These are not the collector's live values. The scoring output block is blanked at
+    /// the top of every frame by 82DE53F0 and only the **active** collector's vtable slot 9
+    /// republishes its own fields; 82DA9A18, the Air collector's, is the only one that ever
+    /// writes the spin and flip. So while a handplant, a manual or a grind is the active
+    /// collector these simply are not refreshed -- which is why a handplant cannot inherit
+    /// the previous air's flip and a manual cannot inherit its spin.
+    ///
+    /// 827743A0 clears them at the end of a trick, via `[B]+92` = 825019B8.
     published_spin_turns: i32,
     published_flip_direction: i32,
     /// The multiplier this runtime last reported, `52(r31)` in 82666BC0.
@@ -378,6 +411,7 @@ impl Runtime {
             sequence_score: 0.,
             trick_name: String::new(),
             base_trick_label: None,
+            base_trick_type: 0,
             stance: [false; 4],
             clean: false,
             sketchy: false,
@@ -565,6 +599,8 @@ impl Runtime {
                 }
                 if conversion.is_some() {
                     self.base_trick_label = Some(d.label.clone());
+                self.base_trick_type = d.trick_type;
+                    self.base_trick_type = d.trick_type;
                 }
                 self.carriers[slot] = Some(carrier);
                 self.sequence_active = true;
@@ -1090,6 +1126,14 @@ impl Runtime {
             self.sequence_score =
                 self.session
                     .publish_sequence(&self.data.session_rules(), 1., bailout, true);
+            // 827743A0 runs every frame and, on the frame a trick finishes without a bail
+            // (O[14626] set, O[14640]/O[14630] clear), calls [B]+92 = 825019B8, which zeroes
+            // M+12 and M+16 and drops the module back to state 0. That is what stops the
+            // next trick inheriting this one's spin and flip.
+            if !bailout {
+                self.published_spin_turns = 0;
+                self.published_flip_direction = 0;
+            }
             if trace_enabled() {
                 let s = &self.session.holder.snapshot;
                 eprintln!(
@@ -1150,33 +1194,35 @@ impl Runtime {
         if self.close_tricks {
             self.base_trick_label = None;
         }
-        let composed = compose_trick_name(
+        // Only the Air collector's slot 9 (82DA9A18) ever publishes the spin and the flip,
+        // and only while it is the active collector. Every other collector leaves them
+        // untouched, so they must not be refreshed from the air's live values here.
+        let (previous_spin, previous_flip) =
+            (self.published_spin_turns, self.published_flip_direction);
+        if self.collector == Collector::Air {
+            self.published_spin_turns = self.spin_turns;
+            self.published_flip_direction = self.flip_direction;
+        }
+        self.trick_name = compose_trick_name(
             self.base_trick_label.as_deref(),
-            self.spin_turns,
-            self.flip_direction,
+            self.published_spin_turns,
+            self.published_flip_direction,
             f.switch,
             // M+187 is the negation of PlayerStance_IsRegular. This engine publishes no
             // stance, so the parity is that of a regular skater; a goofy skater's spins
             // will read FS for BS until one is published.
             false,
+            decorates_spin(self.base_trick_type),
         );
-        // 825E4F40 marks the name dirty whenever the spin (M+12) or the flip (M+16) it
-        // embeds changes, and 825E51A0 then recomposes and re-fires the display event.
-        // Without that the HUD keeps whatever was composed at announcement, so a 540 that
-        // finished turning after the trick was named still read as its bare label -- which
-        // is exactly what a playtest showed: 1 of 118 published names carried a spin.
-        self.trick_name = composed;
         // 825E4F40 compares M+12 and M+16 against the module's cached copies and sets the
         // dirty byte 159 only when one of those two differs; 825E51A0 then recomposes and
         // re-fires the display event. Firing on any change to the whole composed string
         // also caught switch-parity flips, which re-triggered the display for no reason.
-        if self.spin_turns != self.published_spin_turns
-            || self.flip_direction != self.published_flip_direction
+        if self.published_spin_turns != previous_spin
+            || self.published_flip_direction != previous_flip
         {
             self.modified_trick = true;
         }
-        self.published_spin_turns = self.spin_turns;
-        self.published_flip_direction = self.flip_direction;
         Ok(())
     }
 }
@@ -1190,17 +1236,17 @@ mod trick_name_tests {
     #[test]
     fn a_body_flip_is_named_and_takes_its_side_from_the_flip_direction() {
         assert_eq!(
-            compose_trick_name(None, 0, 1, false, false),
+            compose_trick_name(None, 0, 1, false, false, true),
             format!("#{} {}", trick_tokens::AIR, trick_tokens::FRONTFLIP)
         );
         assert_eq!(
-            compose_trick_name(None, 0, -1, false, false),
+            compose_trick_name(None, 0, -1, false, false, true),
             format!("#{} {}", trick_tokens::AIR, trick_tokens::BACKFLIP)
         );
         // A flip with no grab to record its side leaves +2348 at zero, and retail appends
         // nothing at all rather than guessing a side.
         assert_eq!(
-            compose_trick_name(None, 0, 0, false, false),
+            compose_trick_name(None, 0, 0, false, false, true),
             format!("#{}", trick_tokens::AIR)
         );
     }
@@ -1209,11 +1255,11 @@ mod trick_name_tests {
     #[test]
     fn a_spin_prints_degrees_and_picks_its_side_by_parity() {
         assert_eq!(
-            compose_trick_name(Some("ID_TRICK_FLIP_KICKFLIP"), 2, 0, false, false),
+            compose_trick_name(Some("ID_TRICK_FLIP_KICKFLIP"), 2, 0, false, false, true),
             "#ID_TRICK_FLIP_KICKFLIP 360"
         );
         assert_eq!(
-            compose_trick_name(Some("ID_TRICK_FLIP_KICKFLIP"), -3, 0, false, false),
+            compose_trick_name(Some("ID_TRICK_FLIP_KICKFLIP"), -3, 0, false, false, true),
             "#ID_TRICK_FLIP_KICKFLIP 540"
         );
         // Unnamed spins fall back to the FS/BS tokens, chosen by switch ^ sign ^ goofy.
@@ -1225,18 +1271,40 @@ mod trick_name_tests {
             (-1, true, true, trick_tokens::BS_SPIN),
         ] {
             assert_eq!(
-                compose_trick_name(None, turns, 0, switch, goofy),
+                compose_trick_name(None, turns, 0, switch, goofy, true),
                 format!("#{expected} 180"),
                 "turns {turns} switch {switch} goofy {goofy}"
             );
         }
     }
 
+    /// 825E51A0 refuses the spin decoration for a trick class that may not carry one, so
+    /// a manual (TrickType 8) never reads "Manual 180" and a handplant (6) never gains a
+    /// spin from the air before it.
+    #[test]
+    fn only_the_admitted_trick_classes_carry_a_spin() {
+        for admitted in [1, 2, 3, 4, 7, 10, 12, 13] {
+            assert!(super::decorates_spin(admitted), "TrickType {admitted}");
+        }
+        for refused in [0, 5, 6, 8, 9, 11, 14] {
+            assert!(!super::decorates_spin(refused), "TrickType {refused}");
+        }
+        assert_eq!(
+            compose_trick_name(Some("ID_TRICK_GROUND_TRICK_MANUAL"), 1, 0, false, false, false),
+            "#ID_TRICK_GROUND_TRICK_MANUAL"
+        );
+        // The flip suffix is *not* behind this gate -- 0x825E57A8 tests only the sign.
+        assert_eq!(
+            compose_trick_name(Some("ID_TRICK_BS_HANDPLANT"), 2, 0, false, false, false),
+            "#ID_TRICK_BS_HANDPLANT"
+        );
+    }
+
     /// Everything after the single leading `#` has to be tokens the text layer can look
     /// up, so the name must never carry a second `#` or a double space.
     #[test]
     fn the_composed_name_is_one_hash_and_resolvable_tokens() {
-        let name = compose_trick_name(Some("ID_TRICK_FLIP_KICKFLIP"), 2, 1, true, false);
+        let name = compose_trick_name(Some("ID_TRICK_FLIP_KICKFLIP"), 2, 1, true, false, true);
         assert_eq!(name.matches('#').count(), 1);
         assert!(name.starts_with('#'));
         assert!(!name.contains("  "));
