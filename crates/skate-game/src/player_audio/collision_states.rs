@@ -108,6 +108,18 @@ pub(crate) fn controller_key(slot: usize) -> u32 {
     0x4003_0000 | ((slot as u32) << 11)
 }
 
+/// `sub_824D20E8`: which Collision controller **output** scales a voice, chosen by the material's
+/// category (`sub_82496FD0`). The jump table at `0x824D212C`, category 0..=9 in order.
+///
+/// `sub_824D2318` multiplies the voice's gain by this output — `fmuls f3,f5,f4` with `f4` from
+/// vtable +60 — so a contact voice is *not* played at its material level alone. Leaving it out
+/// made both landing collision voices play at full material level, which is loud enough to swamp
+/// the class voice the landing is supposed to vary with.
+pub(crate) fn category_output_id(category: u8) -> u32 {
+    const IDS: [u32; 10] = [13, 14, 15, 16, 17, 18, 12, 19, 21, 20];
+    IDS.get(usize::from(category)).copied().unwrap_or(13)
+}
+
 /// `sub_82486EF0`'s 48-byte message, field for field.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ContactMessage {

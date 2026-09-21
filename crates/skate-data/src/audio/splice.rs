@@ -96,6 +96,15 @@ impl SpliceBanks {
         Ok(Self { banks })
     }
 
+    /// The bank's raw member bytes, which a [`ResolvedMember`]'s `stream_offset` indexes into.
+    /// Callers that want to decode a sample rather than play it need these.
+    pub fn bank_bytes(&self, name: &str) -> Option<&[u8]> {
+        self.banks
+            .iter()
+            .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, bytes, _)| bytes.as_slice())
+    }
+
     pub fn bank(&self, name: &str) -> Option<&Splc> {
         self.banks
             .iter()

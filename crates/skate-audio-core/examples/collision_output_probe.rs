@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 const COLLISION_KEY: u32 = 0x4003_0000;
 const DEFAULT_ASSETS: &str = r"C:\s3\installations\70eda9dc4644496d81ae73af95ff4285\assets";
 /// `SFXObj_Contacts #0`, the local player's.
-const CONTACTS_KEY: u32 = 0x4001_0010;
+const CONTACTS_KEY: u32 = 0x4003_0000; // SFXObj_Collision slot 0
 const OUTPUT_IDS: u32 = 24;
 
 fn image(dir: &Path) -> Vec<Segment> {
@@ -102,30 +102,21 @@ fn main() {
     preroll(&mut g, mm.manager, &ctrls, &bytes, 3600);
     println!("pre-rolled 3600 retail evaluations\n");
 
-    // Input 1 is the landing pulse; retail raises it on the same frame as 2.
-    for probe_input in [2u32, 1, 6] {
-        let mut seen: Vec<(u32, Vec<(u32, u32, u32, u32)>)> = Vec::new();
-        for value in [0u32, 16_000, 32_767] {
-            controller::set(&mut g, ctrl, 1, if probe_input == 1 { value } else { 32_767 })
-                .expect("set 1");
-            controller::set(&mut g, ctrl, probe_input, value).expect("set probe");
-            seen.push((value, sample(&mut g, mm.host, ctrl)));
-        }
-        let (lo, hi) = (&seen[0].1, &seen[2].1);
-        let moved: Vec<_> = lo
-            .iter()
-            .zip(hi)
-            .filter(|(a, b)| a != b)
-            .map(|(a, b)| (a.0, a.1, b.1, a.2, b.2))
-            .collect();
-        if moved.is_empty() {
-            println!("input {probe_input}: no output changed between 0 and 32767");
-        } else {
-            println!("input {probe_input}: outputs that moved (id: u16 lo->hi, gain lo->hi)");
-            for (id, u_lo, u_hi, g_lo, g_hi) in moved {
-                let mid = seen[1].1[id as usize].1;
-                println!("   id {id:2}: u16 {u_lo} -> {mid} -> {u_hi}   gain {g_lo} -> {g_hi}");
-            }
+    // `sub_824D1E00` writes input 0 (the gate, 32767 while the slot is active) and input 1 (the
+    // weight, 10000/20000/32767 by tier). `sub_824D20E8` then reads one *output* per material
+    // category -- 13,14,15,16,17,18,12,19,21,20 for categories 0..=9 -- and `sub_824D2318`
+    // multiplies the voice's gain by it. Those settled outputs are what this prints.
+    const CATEGORY_IDS: [u32; 10] = [13, 14, 15, 16, 17, 18, 12, 19, 21, 20];
+    for weight in [10_000u32, 20_000, 32_767] {
+        controller::set(&mut g, ctrl, 0, 32_767).expect("gate");
+        controller::set(&mut g, ctrl, 1, weight).expect("weight");
+        let out = sample(&mut g, mm.host, ctrl);
+        println!("weight {weight} (tier {}):", match weight { 10_000 => 0, 20_000 => 1, _ => 2 });
+        for (category, id) in CATEGORY_IDS.iter().enumerate() {
+            let level = out[*id as usize].1;
+            let scale = level as f32 / 32_767.0;
+            let db = if scale > 0.0 { 20.0 * scale.log10() } else { -99.0 };
+            println!("   category {category} -> output {id:2}: {level:6}  (x{scale:.4}, {db:+6.1} dB)");
         }
         println!();
     }

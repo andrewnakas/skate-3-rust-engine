@@ -34,6 +34,43 @@ use super::components::contacts::{ContactSound, ContactVoices, SurfaceMap, Voice
 /// level `player-audio-retail-drivers.md` §8 measured against the recomp.
 const LANDING_SEND_MAXIMUM: f32 = 3650.0;
 
+/// Headroom for the landing stack, over and above `CONTACT_TRIM`.
+///
+/// `CONTACT_TRIM` was calibrated when a landing was **two** voices (the fixed impact and the class
+/// voice) and was set to put that pair at full scale. A landing is now **five** — the `+496` ladder
+/// voice and the two contact-sound-manager collision voices joined it — and the stack clips:
+/// measured over a playtest, every landing peaked at exactly 1.0, 271 output blocks at full scale.
+/// Clipping is a hard limiter, so it flattened class 0, 1 and 2 to the same loudness however well
+/// the classes were resolved. That is what "every landing sounds equally loud" was.
+///
+/// Retail's own class-0 landings sit at **−4.4 dBFS** and do not clip (its class 2 reaches +2.0 and
+/// just touches the ceiling), measured from `.local/captures/retail-levels-*.log` binned by
+/// retail's class thresholds. This trim exists to put class 0 back below the ceiling so the
+/// authored class step — +4.7 dB at class 1 and +5.8 dB at class 2, which is in the samples' own
+/// layer counts and gains — survives to the output.
+///
+/// It is applied to the landing voices only. The pops and the grind onset keep `CONTACT_TRIM`
+/// alone, because their voice count did not change.
+///
+/// **Calibrated, in two measured passes.** A clipped peak reads as exactly 1.0 whatever is under
+/// it, so the value could not be computed in one step:
+///
+/// | pass | trim | class 0 peak | class 1 | class 2 |
+/// |---|---|---|---|---|
+/// | before | 0.625 | 0.0 (clipped) | 0.0 | 0.0 |
+/// | headroom probe | 0.4 | −1.1 | −0.5 | −0.6 |
+/// | this | **0.274** | −4.4 (target) | — | — |
+///
+/// The probe's −8 dB moved the peak only 1.1 dB, which says the stack had been roughly 7 dB *into*
+/// the ceiling — not, as it first looked, that some other voice was responsible. `0.4 × 10^(−3.3
+/// / 20) = 0.274` puts class 0 on retail's measured −4.4 dBFS. Class 2 then lands near +1.4 and
+/// still touches the ceiling, which is retail's behaviour too (its class 2 measures +2.0).
+///
+/// This is a calibration against a measured retail target, not a trim by ear, and like
+/// `CONTACT_TRIM` it is a deviation that should disappear once the Splice graph's own levels are
+/// recovered.
+const LANDING_TRIM: f32 = 0.274;
+
 /// Contacts output 15 — the landing voice's owner send — at each landing class, measured off the
 /// real MixMap under the retail pre-roll with controller input 2 held at retail's own words
 /// (0 / 16000 / 32767). A 3.0 dB spread, class 0 to class 2.
@@ -157,6 +194,16 @@ pub(crate) struct ContactVoicePlayer {
     /// component now writes Contacts inputs 0, 1, 2 and 6, but the pops' own send is driven by
     /// inputs 3, 10, 17, 18 and 21, and those are still unwritten.
     pops_enabled: bool,
+    /// Whether a landing also posts to the contact-sound manager (its two collision voices).
+    ///
+    /// `sub_824BA630` does post, so this defaults on. But those voices' gain includes a Collision
+    /// controller output (`sub_824D20E8`, read by `sub_824D2318`) that this engine does not apply
+    /// -- the one-shot path has no per-frame gain update, and the only MixMap fixture available
+    /// reads every one of those outputs as 0. Played at full material level they are loud enough
+    /// to swamp the class voice, which is what makes a landing vary; measured, the class voice is
+    /// only ~5% of the landing peak. `SKATE_AUDIO_LANDING_COLLISION=0` drops them, which is the
+    /// A/B that says whether they are the reason a low ollie is louder here than in retail.
+    landing_collision_enabled: bool,
     /// The pops' owner-local six-channel send bus (`sub_82488DD0`), built on first use.
     pops_send: Option<u32>,
     /// `sub_824BA630`'s landing window, read from the Contacts tuning class: the board material it
@@ -244,6 +291,8 @@ impl ContactVoicePlayer {
             live: Vec::new(),
             reported: std::collections::HashSet::new(),
             pops_enabled: std::env::var("SKATE_AUDIO_CONTACT_POPS").map_or(true, |v| v != "0"),
+            landing_collision_enabled: std::env::var("SKATE_AUDIO_LANDING_COLLISION")
+                .map_or(true, |v| v != "0"),
             pops_send: None,
         })
     }
@@ -282,7 +331,7 @@ impl ContactVoicePlayer {
             // `sub_824BA630` starts its two bank voices *and* posts to the contact-sound manager.
             // The bank voices are handled below as before; the message is what makes a landing
             // sound like the surface rather than like a generic impact.
-            if matches!(play.sound, ContactSound::LandingClass) {
+            if matches!(play.sound, ContactSound::LandingClass) && self.landing_collision_enabled {
                 self.post_landing(runtime, &play.request, audio)?;
             }
             let Some((bank, sample, mut bus)) = self.selection(&play, audio) else {
@@ -349,7 +398,13 @@ impl ContactVoicePlayer {
             // (`skate-audio-core` example `contacts_input_probe`). **That is the approximation
             // here: retail's send ramps across the sample, ours is flat for its whole length.**
             let send_scale = match play.sound {
-                ContactSound::LandingClass => landing_send_scale(play.request.landing_class),
+                ContactSound::LandingClass => {
+                    landing_send_scale(play.request.landing_class) * LANDING_TRIM
+                }
+                // The other two landing voices take the headroom but not the send: retail's
+                // impact and ladder levels are fixed, it is only the class voice that rides
+                // output 15.
+                ContactSound::Landing | ContactSound::LandingLadder => LANDING_TRIM,
                 _ => 1.0,
             };
             let mut handles = Vec::with_capacity(members.len());
@@ -464,7 +519,7 @@ impl ContactVoicePlayer {
                 continue;
             };
             let level = if record == 0 { message.level_a } else { message.level_b };
-            self.play_collision(runtime, &sample, level);
+            self.play_collision(runtime, &sample, level, 1.0, 1.0);
         }
         Ok(())
     }
@@ -556,7 +611,7 @@ impl ContactVoicePlayer {
             };
             // `material_a` is the board, `material_b` the surface, matching the two levels.
             let level = if record == 0 { message.level_a } else { message.level_b };
-            self.play_collision(runtime, &sample, level);
+            self.play_collision(runtime, &sample, level, 1.0, LANDING_TRIM);
         }
         Ok(())
     }
@@ -569,6 +624,12 @@ impl ContactVoicePlayer {
         runtime: &mut AuthoredRuntime,
         sample: &CollisionSample,
         contact_level: u32,
+        // `sub_824D20E8`'s output for this material's category, as a 0..1 scale. Not yet
+        // recoverable -- see `landing_collision_enabled` -- so callers pass 1.0 today.
+        controller_scale: f32,
+        // `LANDING_TRIM` when these two voices are part of a landing stack, 1.0 for a grind
+        // onset — the grind's voice count did not change, so it keeps `CONTACT_TRIM` alone.
+        trim: f32,
     ) {
         let members = match self.banks.resolve(sample.bank, sample.sample, &mut self.state, &mut self.rand) {
             Ok(members) => members,
@@ -587,7 +648,15 @@ impl ContactVoicePlayer {
         // grind — so it modulates the voice here. Retail carries it through the Collision
         // controller's outputs instead; these voices do not read that controller, so applying it
         // directly is the closest the one-shot path gets.
-        let gain = (sample.level as f32 / 32_767.0) * (contact_level as f32 / 32_767.0);
+        // `sub_824D2318`: the voice's gain is the material's `+52` level **times the Collision
+        // controller output `sub_824D20E8` picks for the material's category** times the
+        // message's contact level. The controller term was missing, so both of a landing's
+        // collision voices played at full material level and drowned the class voice that is
+        // supposed to make one landing differ from another.
+        let gain = (sample.level as f32 / 32_767.0)
+            * (contact_level as f32 / 32_767.0)
+            * controller_scale
+            * trim;
         self.report(&format!(
             "collision voice {} #{:#x} material level {} x contact {} -> {} member(s) at gain x{gain:.3}",
             sample.bank,
