@@ -32,6 +32,8 @@ fn frame(
         position: [0., 0., 0.],
         velocity: [0., 0., 5.],
         forward: [0., 0., 1.],
+        rider_up: [0., 1., 0.],
+        rider_forward: [0., 0., 1.],
         switch: false,
         fakie: false,
         nollie: false,
@@ -163,7 +165,9 @@ fn main() -> Result<(), String> {
         let mut f = frame(tick, FilteredCategory::Air, Some(kickflip));
         // 10 m along Z, a 3 m arc of height, and one full rotation.
         f.position = [0., 3. * (t * std::f32::consts::PI).sin(), 10. * t];
-        f.forward = [turn.sin(), 0., turn.cos()];
+        // The rider turns, not the deck: retail's spin accumulator measures the skeleton
+        // root, so rotating the board alone must not register as a spin.
+        f.rider_forward = [turn.sin(), 0., turn.cos()];
         moving.advance(f)?;
     }
     for tick in airborne + 1..airborne + 10 {

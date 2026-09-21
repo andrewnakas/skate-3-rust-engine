@@ -134,6 +134,75 @@ const CONTEXT_CURVES: [u16; 4] = [0x5a0, 0x500, 0x550, 0x4b0];
 /// `air_metric`, the scorable `82DA8550` banks the gap/context total under.
 const CONTEXT_METRIC: usize = 237;
 
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalize3(v: [f32; 3]) -> Option<[f32; 3]> {
+    let squared = dot3(v, v);
+    // 8296EC98 rejects either input below 1e-4 (0x8209BE90) and returns a zero angle.
+    (squared > 1e-4).then(|| {
+        let inverse = squared.sqrt().recip();
+        v.map(|lane| lane * inverse)
+    })
+}
+
+/// One frame of `82DAC9D0` with axis selector 0, as `82DAC880` consumes it.
+///
+/// This is the yaw of a transform's own **forward** (row 2) about its own **up** (row 1),
+/// measured against the accumulator's stored reference -- *not* a world-Y heading. The
+/// distinction is the whole bug: a heading taken from the deck counts a shove-it's board
+/// rotation as a body spin, which named a tre flip "360 Flip 360".
+///
+/// ```text
+/// v58 = Q_old x P_new ; N = normalize(v58)
+/// v54 = N x Q_old     ; M = normalize(v54)          ; P_new flattened into Q_old's plane
+/// vcmpgtfp 0.0, dot(M, P_old) -> return 0.0         ; more than 90 degrees in one frame
+/// ang = acos(clamp(dot(M, P_old), -1, 1))
+/// if dot(M x P_old, Q_old) < 0 { ang = 2pi - ang }
+/// ```
+///
+/// then `82DAC880` wraps the result into (-pi, pi]. The sign comes out as the negative of
+/// the right-handed yaw, which only decides front side versus back side in the name -- the
+/// reward takes the magnitude.
+fn spin_angle(reference_up: [f32; 3], reference_forward: [f32; 3], forward: [f32; 3]) -> f32 {
+    let Some(normal) = normalize3(cross3(reference_up, forward)) else {
+        return 0.0;
+    };
+    let Some(flattened) = normalize3(cross3(normal, reference_up)) else {
+        return 0.0;
+    };
+    let Some(previous) = normalize3(reference_forward) else {
+        return 0.0;
+    };
+    let cosine = dot3(flattened, previous);
+    // The discontinuity guard: a jump of more than 90 degrees scores nothing rather than a
+    // bogus angle.
+    if cosine < 0.0 {
+        return 0.0;
+    }
+    let angle = cosine.clamp(-1.0, 1.0).acos();
+    let angle = if dot3(cross3(flattened, previous), reference_up) < 0.0 {
+        std::f32::consts::TAU - angle
+    } else {
+        angle
+    };
+    // 82DAC880's wrap into (-pi, pi].
+    if angle > std::f32::consts::PI {
+        angle - std::f32::consts::TAU
+    } else {
+        angle
+    }
+}
+
 /// `Handplant_CLASS`, index 6 of the `*_CLASS` list at 82084A40.
 ///
 /// This is the metadata table's **+16** field, which [`catalog::IDENTIFIERS`] carries as its
@@ -171,6 +240,14 @@ pub(crate) struct Frame {
     pub position: [f32; 3],
     pub velocity: [f32; 3],
     pub forward: [f32; 3],
+    /// PhysOut_Skeleton +368 rows 1 and 2 -- the rider skeleton root's own up and forward.
+    ///
+    /// This, and not the deck, is what retail's spin accumulator measures. 82DA8BE0 feeds
+    /// accumulator A `[[owner+20]+368]` on every one of its four branches, and A's angle is
+    /// the only one that ever reaches the banked total; the board-derived accumulator B is
+    /// held at zero for as long as a named trick is carried.
+    pub rider_up: [f32; 3],
+    pub rider_forward: [f32; 3],
     pub switch: bool,
     pub fakie: bool,
     pub nollie: bool,
@@ -201,7 +278,8 @@ pub(crate) struct Runtime {
     metric_started: [bool; 4],
     start: [f32; 3],
     previous: [f32; 3],
-    previous_heading: f32,
+    /// The accumulator's stored reference rows, `82DAC880`'s `obj[0..48]`.
+    spin_reference: ([f32; 3], [f32; 3]),
     spin: f32,
     peak: f32,
     air_factor: f32,
@@ -277,7 +355,7 @@ impl Runtime {
             metric_started: [false; 4],
             start: [0.; 3],
             previous: [0.; 3],
-            previous_heading: 0.,
+            spin_reference: ([0., 1., 0.], [0., 0., 1.]),
             spin: 0.,
             peak: 0.,
             air_factor: 1.,
@@ -801,7 +879,7 @@ impl Runtime {
                 self.start = f.position;
                 self.peak = f.position[1];
                 self.spin = 0.;
-                self.previous_heading = f.forward[0].atan2(f.forward[2]);
+                self.spin_reference = (f.rider_up, f.rider_forward);
                 self.air_metrics = [0.; 5];
                 self.spin_turns = 0;
                 self.flip_direction = 0;
@@ -896,12 +974,10 @@ impl Runtime {
             if self.collector_ticks > 5 || f.flags & 0x01000000 != 0 {
                 self.sequence_active = true;
             }
-            let heading = f.forward[0].atan2(f.forward[2]);
-            let delta = (heading - self.previous_heading + std::f32::consts::PI)
-                .rem_euclid(std::f32::consts::TAU)
-                - std::f32::consts::PI;
-            self.spin += delta;
-            self.previous_heading = heading;
+            let (reference_up, reference_forward) = self.spin_reference;
+            self.spin += spin_angle(reference_up, reference_forward, f.rider_forward);
+            // 82DAC880 stores the new matrix as the reference on every update.
+            self.spin_reference = (f.rider_up, f.rider_forward);
             self.peak = self.peak.max(f.position[1]);
             let dx = f.position[0] - self.start[0];
             let dz = f.position[2] - self.start[2];
@@ -1168,5 +1244,71 @@ mod trick_name_tests {
             name.trim_start_matches('#').split(' ').collect::<Vec<_>>(),
             ["ID_TRICK_FLIP_KICKFLIP", "360", trick_tokens::FRONTFLIP]
         );
+    }
+}
+
+#[cfg(test)]
+mod spin_tests {
+    use super::spin_angle;
+
+    const UP: [f32; 3] = [0., 1., 0.];
+
+    fn yaw(degrees: f32) -> [f32; 3] {
+        let radians = degrees.to_radians();
+        [radians.sin(), 0., radians.cos()]
+    }
+
+    /// A rotation about the frame's own up axis reads back as that rotation.
+    #[test]
+    fn a_yaw_about_the_frames_own_up_is_measured() {
+        for step in [1.0_f32, 15.0, 45.0, 89.0, -30.0] {
+            let measured = spin_angle(UP, yaw(0.), yaw(step)).to_degrees();
+            assert!(
+                (measured.abs() - step.abs()).abs() < 0.01,
+                "{step} degrees measured as {measured}"
+            );
+        }
+    }
+
+    /// Accumulating a full turn in steps totals one turn, which is what makes a 360 read
+    /// as 360 rather than wrapping away to nothing.
+    #[test]
+    fn stepwise_rotation_accumulates_to_a_whole_turn() {
+        let mut total = 0.0_f32;
+        let mut reference = yaw(0.);
+        for step in 1..=72 {
+            let next = yaw(step as f32 * 5.);
+            total += spin_angle(UP, reference, next);
+            reference = next;
+        }
+        assert!(
+            (total.to_degrees().abs() - 360.).abs() < 0.5,
+            "accumulated {}",
+            total.to_degrees()
+        );
+    }
+
+    /// 82DAC9D0 returns zero rather than a bogus angle when the forward moves more than a
+    /// quarter turn in a single frame, and when either vector is degenerate.
+    #[test]
+    fn a_discontinuity_or_a_degenerate_frame_scores_nothing() {
+        assert_eq!(spin_angle(UP, yaw(0.), yaw(91.)), 0.0);
+        assert_eq!(spin_angle(UP, yaw(0.), yaw(180.)), 0.0);
+        assert_eq!(spin_angle(UP, yaw(0.), [0., 0., 0.]), 0.0);
+        assert_eq!(spin_angle([0., 0., 0.], yaw(0.), yaw(10.)), 0.0);
+        // A forward parallel to up leaves no yaw to measure.
+        assert_eq!(spin_angle(UP, yaw(0.), UP), 0.0);
+    }
+
+    /// The board may rotate all it likes: only the transform handed in is measured. This is
+    /// the tre-flip case -- a 360 shove-it with the rider square on must read zero.
+    #[test]
+    fn a_stationary_rider_registers_no_spin() {
+        let mut total = 0.0_f32;
+        let reference = yaw(0.);
+        for _ in 0..60 {
+            total += spin_angle(UP, reference, reference);
+        }
+        assert_eq!(total, 0.0);
     }
 }

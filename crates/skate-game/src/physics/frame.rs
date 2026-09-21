@@ -366,6 +366,18 @@ pub(super) fn advance(
         position: [position.x, position.y, position.z],
         velocity: [velocity.x, velocity.y, velocity.z],
         forward: deck_frame.basis.columns[2],
+        // PhysOut_Skeleton +368, which 82BE1AE8 fills from Physics::Skeleton +11920 -- the
+        // rider's animation-to-world root. Rows are right / up / forward / translation.
+        // Retail's spin accumulator measures *this*, never the deck: feeding it the board
+        // counted a shove-it's rotation as a body spin.
+        rider_up: {
+            let row = skater.player_input.physical.skeleton.anim_to_world_11920[1];
+            std::array::from_fn(|lane| f32::from_bits(row[lane]))
+        },
+        rider_forward: {
+            let row = skater.player_input.physical.skeleton.anim_to_world_11920[2];
+            std::array::from_fn(|lane| f32::from_bits(row[lane]))
+        },
         switch: skater.animation.packet.riding_switch,
         fakie: skater.animation.packet.riding_fakie,
         nollie: skater.animation.packet.weight_forwards,
