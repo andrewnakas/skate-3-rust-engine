@@ -12,6 +12,8 @@
 //! * `VR <voice>` — that voice released;
 //! * `AS st=<state> cat=<category> <field>=<value> …` — the physical state id and the
 //!   audio-state fields the families' triggers read;
+//! * `BC bail676=<b> … slide528=[…] mat560=[…] impact496=[…]` — the ragdoll contact fields, on
+//!   frames where a bail is contacting, sliding or holding a loose board;
 //! * `OUT <p0..p5> | rms <r> frames <n> ch <c>` — one per rendered block, in the retail capture's
 //!   own format (the six native channels before the host downmix), so the two can be compared
 //!   directly; `DEV <peak> <rms>` follows it with the stereo the host actually receives.
@@ -192,6 +194,38 @@ pub(crate) fn state(a: &AudioState, inputs: &RetailAudioInputs) {
             u8::from(a.foot_down_left_725),
             a.wheel_landing_bucket_448,
             a.wheel_landed_464,
+        ));
+    });
+    body(a);
+}
+
+/// The ragdoll contact fields, on their own line and only while a bail is doing something.
+///
+/// `c_body_slide` and `c_cloth_falls` read nothing else, and none of it appears on the `AS` line,
+/// so a playtest could not tell a silent bail from a bail whose material never resolved. `mat` is
+/// the one to watch: it is `tag & 0x7f` off the contact row, and `body_contact` maps a zero to the
+/// default slide type 2 -- so an all-zero `mat` during a real slide means body-vs-material is not
+/// happening, whatever the family posts.
+fn body(a: &AudioState) {
+    let sliding = a.body_slide_528.iter().any(|v| v.abs() > 0.0);
+    let impacting = a.body_impact_496.iter().any(|v| v.abs() > 0.0);
+    if !(sliding || impacting || a.bail_676 || a.bail_over_677 || a.loose_board_780 != 0) {
+        return;
+    }
+    with(|t| {
+        t.line(format_args!(
+            "BC bail676={} over677={} spin328={:.4} limb672={:.4} com212={:.3} groin592={} face593={} board780={} slide528={:?} mat560={:?} impact496={:?}",
+            u8::from(a.bail_676),
+            u8::from(a.bail_over_677),
+            a.ragdoll_spin_328,
+            a.limb_speed_672,
+            a.com_speed_212,
+            u8::from(a.groin_contact_592),
+            u8::from(a.face_contact_593),
+            a.loose_board_780,
+            a.body_slide_528,
+            a.body_material_560,
+            a.body_impact_496,
         ));
     });
 }
