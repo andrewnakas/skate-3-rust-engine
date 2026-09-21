@@ -66,6 +66,7 @@ fn rolling(tick: u64, speed: f32) -> PlayerAudioObservation {
         nollie: false,
         wheel_surface: 3,
         events: Vec::new(),
+        frontend_sounds: Vec::new(),
         retail,
     }
 }

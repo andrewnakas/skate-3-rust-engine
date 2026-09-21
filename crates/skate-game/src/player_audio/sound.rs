@@ -309,6 +309,15 @@ impl PlayerSound {
         // before the evaluation, as retail's process does.
         if let Some((shared, player)) = &mut self.contact_voices {
             player.drain(runtime, shared, &self.audio, FRAME_SECONDS)?;
+            // Retail's `GlobalFEPlaySound` is not part of the component graph at all -- the UI
+            // calls it directly -- so these ride in on the observation and open here, alongside
+            // the other one-shots, rather than going through a component.
+            for &id in &observation.frontend_sounds {
+                match super::frontend::FrontEndSound::from_id(id) {
+                    Some(sound) => player.play_frontend(runtime, sound),
+                    None => eprintln!("SKATE_PLAYER_AUDIO frontend_sound_unknown id={id:#018x}"),
+                }
+            }
         }
 
         // 3. Evaluate.

@@ -443,6 +443,8 @@ pub(crate) fn publish(
         nollie: skater.animation.packet.weight_forwards,
         wheel_surface,
         events: output.events.clone(),
+        // The forwarder attaches these; physics does not produce front-end sounds.
+        frontend_sounds: Vec::new(),
         retail: retail_inputs(&physics, &skater, &camera),
     };
     let powerslide_changed = cursor.last_powersliding != observation.powersliding;

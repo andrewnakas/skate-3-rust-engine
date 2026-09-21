@@ -270,6 +270,11 @@ pub(crate) struct ContactVoicePlayer {
     /// here and freed when they finish. They must be ticked: `tick_oneshot` is what *opens* a
     /// voice whose Splice member carries a delay, and what releases one that has run out.
     collision_live: Vec<OneshotHandle>,
+    /// The session marker's sounds, and the voices they have in flight. These are held for the
+    /// same reason the collision voices are: a Splice member can carry a delay, and dropping the
+    /// handle before `tick_oneshot` opens it strands the voice.
+    frontend: super::frontend::FrontEndSounds,
+    frontend_live: Vec<OneshotHandle>,
     /// `sub_824BC188`'s per-region re-trigger cooldown, `obj+260+4i`. A region that has just
     /// sounded will not sound again until this runs back down, which is what stops a body held
     /// against a wall from firing an impact every frame.
@@ -355,6 +360,8 @@ impl ContactVoicePlayer {
                     skate_data::audio::splice::DLC_COLLISIONS_BANK,
                     super::collision_states::METAL_BANK,
                     super::collision_states::HOM_BANK,
+                    // The front-end one-shots: the session marker's three cellphone sounds.
+                    skate_data::audio::catalog::MENU_BANK,
                 ],
                 &[skate_data::audio::splice::COLLISIONS_BANK],
             )
@@ -370,6 +377,8 @@ impl ContactVoicePlayer {
             landing_collision_enabled: std::env::var("SKATE_AUDIO_LANDING_COLLISION")
                 .map_or(true, |v| v != "0"),
             pops_send: None,
+            frontend: super::frontend::FrontEndSounds::load(&vault),
+            frontend_live: Vec::new(),
             body_cooldown: [0.0; BODY_REGIONS],
             body_impact_enabled: std::env::var("SKATE_AUDIO_BODY_IMPACT")
                 .map_or(true, |v| v != "0"),
@@ -687,6 +696,17 @@ impl ContactVoicePlayer {
             }
         }
         self.collision_live = still_live;
+        // The front-end one-shots own themselves the same way.
+        let mut still_live = Vec::with_capacity(self.frontend_live.len());
+        for mut handle in std::mem::take(&mut self.frontend_live) {
+            if runtime
+                .tick_oneshot(&mut handle, dt)
+                .map_err(|e| e.to_string())?
+            {
+                still_live.push(handle);
+            }
+        }
+        self.frontend_live = still_live;
         // A play whose voices have all finished keeps no handles; retail's slot still holds its
         // container until the component frees it, so the entry stays until `free`.
         Ok(())
@@ -982,6 +1002,64 @@ impl ContactVoicePlayer {
                         "{} sample {:#x} member: {error}",
                         sample.bank, sample.sample
                     ));
+                }
+            }
+        }
+    }
+
+    /// Play one front-end one-shot: retail's `GlobalFEPlaySound` (`sub_825DFAF0`), as far as this
+    /// engine has a front end.
+    ///
+    /// The session marker's three sounds live in `sk8_menu.bnk` and resolve exactly like a
+    /// collision sample, so they take the same Splice path. They are 2D — centre pan, no
+    /// spatialisation — because a front-end sound has no position; retail's own FE manager mixes
+    /// them the same way.
+    pub(crate) fn play_frontend(
+        &mut self,
+        runtime: &mut AuthoredRuntime,
+        sound: super::frontend::FrontEndSound,
+    ) {
+        let Some(voice) = self.frontend.voice(sound) else {
+            self.report(&format!(
+                "front-end sound {sound:?} has no record in this installation"
+            ));
+            return;
+        };
+        let bank = skate_data::audio::catalog::MENU_BANK;
+        let members = match self
+            .banks
+            .resolve(bank, voice.sample, &mut self.state, &mut self.rand)
+        {
+            Ok(members) => members,
+            Err(error) => {
+                self.report(&format!("{bank} sample {:#x}: {error}", voice.sample));
+                return;
+            }
+        };
+        let Some(base) = runtime.bank_base(bank) else {
+            self.report(&format!("Splice bank {bank} is not installed"));
+            return;
+        };
+        self.report(&format!(
+            "front-end voice {sound:?} {bank} #{:#x} -> {} member(s) at gain x{:.3}",
+            voice.sample,
+            members.len(),
+            voice.gain,
+        ));
+        for member in members {
+            match runtime.play_oneshot(&OneshotVoice {
+                sample: base + member.stream_offset,
+                gain: member.values.gain * voice.gain,
+                pitch: member.values.pitch,
+                delay: member.values.delay,
+                pan: 0.0,
+                bus: OneshotBus::Default,
+            }) {
+                // Held for the same reason the collision voices are: a delayed member that loses
+                // its handle never opens.
+                Ok(handle) => self.frontend_live.push(handle),
+                Err(error) => {
+                    self.report(&format!("{bank} sample {:#x} member: {error}", voice.sample));
                 }
             }
         }

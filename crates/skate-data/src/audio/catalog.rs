@@ -46,8 +46,25 @@ pub const SPLICE_BANKS: &[&str] = &["Skate_Collisions.bnk"];
 /// AttribSys field's type name is its bank (`Skate_Metal` -> `Skate_Metal.bnk`). A metal rail
 /// resolves into `Skate_Metal.bnk`, which is why a rail grind does not sound like concrete. Both
 /// are optional so a trimmed installation still boots.
-pub const OPTIONAL_SPLICE_BANKS: &[&str] =
-    &["DLC_Cartoon_Collisions.bnk", "Skate_Metal.bnk", "HOM_Set_1.bnk"];
+/// `sk8_menu.bnk` holds the front-end one-shots. The session marker's three sounds name it the
+/// same way a collision material does -- the vault's `fe` records carry their sample id in a field
+/// whose *type name* is `sk8_menu`, so the bank falls out of the same convention:
+///
+/// | vault `fe` key | sample | |
+/// |---|---|---|
+/// | `cellphone_place_marker` | 237 | the marker is set |
+/// | `cellphone_goto_marker` | 236 | the session returns to it |
+/// | `cellphone_marker_error` | 209 | the placement was refused |
+///
+/// Optional like the rest, so a trimmed installation still boots -- without it the marker is
+/// simply silent again rather than failing to start.
+pub const MENU_BANK: &str = "sk8_menu.bnk";
+pub const OPTIONAL_SPLICE_BANKS: &[&str] = &[
+    "DLC_Cartoon_Collisions.bnk",
+    "Skate_Metal.bnk",
+    "HOM_Set_1.bnk",
+    MENU_BANK,
+];
 
 /// Where the installer stages the MixMap under `assets`.
 pub const MIXMAP_PATH: &str = "private/stock/data/audio/MixMapSK8.mxb";

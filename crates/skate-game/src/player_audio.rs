@@ -31,6 +31,8 @@ mod collision_states;
 mod components;
 #[path = "player_audio/contact_voices.rs"]
 mod contact_voices;
+#[path = "player_audio/frontend.rs"]
+mod frontend;
 #[cfg(test)]
 #[path = "player_audio/headless.rs"]
 mod headless;
@@ -74,6 +76,8 @@ struct PlayerAudioHost {
     live: LivePcm,
     last_report: Instant,
     dropped_observations: u64,
+    /// Front-end one-shot ids waiting for the next observation to carry them to the worker.
+    pending_frontend: Vec<u64>,
 }
 
 #[derive(Resource)]
@@ -132,18 +136,26 @@ fn start(
         live,
         last_report: Instant::now(),
         dropped_observations: 0,
+        pending_frontend: Vec::new(),
     });
 }
 
 fn forward(
     mut host: Option<ResMut<PlayerAudioHost>>,
     mut observations: MessageReader<PlayerAudioObservation>,
+    mut marker_sounds: MessageReader<crate::skate_audio::FrontEndSoundRequest>,
     virtual_time: Res<Time<bevy::time::Virtual>>,
     real_time: Res<Time<bevy::time::Real>>,
 ) {
     let Some(host) = host.as_deref_mut() else {
         return;
     };
+    // The session marker fires on its own schedule, not with the simulation, so its sounds are
+    // buffered and ride out on the next observation rather than being dropped if this frame
+    // produced none. Retail calls `GlobalFEPlaySound` straight from the UI; this is the closest
+    // equivalent that still reaches the one audio worker.
+    host.pending_frontend
+        .extend(marker_sounds.read().map(|sound| sound.0));
     // Retail keeps publishing an audio state every frame while the game is paused — its physics
     // values simply stay frozen — and silences the player path through SFXObj_Pause's input. The
     // simulation schedule does not run while `Time<Virtual>` is paused, so repeat the last
@@ -163,7 +175,11 @@ fn forward(
     host.paused_carry = 0.0;
     for observation in observations.read() {
         host.last_observation = Some(observation.clone());
-        match host.input.try_send(observation.clone()) {
+        let mut observation = observation.clone();
+        observation
+            .frontend_sounds
+            .append(&mut std::mem::take(&mut host.pending_frontend));
+        match host.input.try_send(observation) {
             Ok(()) => {}
             Err(TrySendError::Full(lost)) => {
                 host.dropped_observations += 1;

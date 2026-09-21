@@ -59,6 +59,14 @@ pub mod player;
 /// This is transport only: it preserves the physics event order and raw surface vote without
 /// claiming that a physics material id is an authored audio-material id. Patch-message creation,
 /// random selection, and archive lookup remain the audio runtime's responsibilities.
+/// A front-end one-shot to play, by the 64-bit AttribSys id retail passes to `GlobalFEPlaySound`
+/// (`sub_825DFAF0`).
+///
+/// This lives here rather than beside its producer because `player_audio` is shared by every
+/// binary in this crate while `session_marker` is declared only by the game binary.
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontEndSoundRequest(pub u64);
+
 #[derive(Message, Clone, Debug, PartialEq)]
 pub struct PlayerAudioObservation {
     pub tick: u64,
@@ -108,6 +116,10 @@ pub struct PlayerAudioObservation {
     /// This is intentionally not the friction/physics surface stored in bits 7..11.
     pub wheel_surface: u32,
     pub events: Vec<PhysicsEvent>,
+    /// Front-end one-shot ids to play this frame, retail's `GlobalFEPlaySound` (`sub_825DFAF0`)
+    /// arguments. `session_marker` emits these and the forwarder attaches them here; they are not
+    /// physics events, so they do not belong in `events`.
+    pub frontend_sounds: Vec<u64>,
     /// The native PhysOut fields the retail audio-state bridge `sub_824B0DA8` reads.
     pub retail: RetailAudioInputs,
 }
