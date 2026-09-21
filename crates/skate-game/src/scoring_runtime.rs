@@ -134,7 +134,16 @@ const CONTEXT_CURVES: [u16; 4] = [0x5a0, 0x500, 0x550, 0x4b0];
 /// `air_metric`, the scorable `82DA8550` banks the gap/context total under.
 const CONTEXT_METRIC: usize = 237;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// `SKATE_SCORING_TRACE=1` prints what every air and every publication actually scored.
+///
+/// A HUD total cannot say *which* contributor is missing, so this exists to make a
+/// playtest answer that instead of a guess doing it.
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SKATE_SCORING_TRACE").is_some())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Collector {
     None,
     Ground,
@@ -368,6 +377,25 @@ impl Runtime {
                         } else {
                             carrier.reward
                         };
+                        if trace_enabled() {
+                            eprintln!(
+                                "SCORE_TRICK slot={slot} id={} class={} type={} points={} \
+                                 factor={:.3} carrier={:.1} metric={:.1} credited={:.1} \
+                                 rep={:?} announced={} held={:.2} dist={:.2}",
+                                carrier.scorable.id,
+                                carrier.scorable.class,
+                                carrier.scorable.score_type,
+                                carrier.points,
+                                carrier.factor,
+                                carrier.reward,
+                                self.metric_rewards[slot],
+                                reward,
+                                self.session.holder.repetition_count(carrier.scorable),
+                                carrier.announced,
+                                self.held[slot],
+                                self.distance[slot],
+                            );
+                        }
                         self.session.holder.credit_trick(carrier.scorable, reward);
                     }
                 }
@@ -672,6 +700,23 @@ impl Runtime {
         if f.teleported {
             next = Collector::None;
         }
+        if trace_enabled() && (next != self.collector || descriptor.is_some()) {
+            eprintln!(
+                "SCORE_STATE tick={} cat={:?} state={} collector={:?}->{:?} descriptor={:?} \
+                 grind={} flags={:08x} switch={} fakie={} flip={}",
+                f.tick,
+                f.category,
+                f.state,
+                self.collector,
+                next,
+                descriptor,
+                f.grind_id,
+                f.flags,
+                f.switch,
+                f.fakie,
+                f.body_flip,
+            );
+        }
         if next != self.collector {
             let complete = next != Collector::None;
             let previous_type = self
@@ -702,30 +747,57 @@ impl Runtime {
                             .holder
                             .end_trick(metric, self.context_reward());
                     }
+                    if trace_enabled() {
+                        let m = self.air_metrics;
+                        eprintln!(
+                            "SCORE_AIR spin_deg={:.0} turns={} flip={} dist={:.0} peak={:.0} \
+                             gain={:.0} spin={:.0} flipmetric={:.0} gaps=[{:.1},{:.1},{:.1},{:.1}] \
+                             gap_reward={:.0} factor={:.3} rep={:.3}",
+                            self.spin.to_degrees(),
+                            self.spin_turns,
+                            self.flip_direction,
+                            m[0],
+                            m[1],
+                            m[2],
+                            m[3],
+                            m[4],
+                            self.context_runs[0].total(),
+                            self.context_runs[1].total(),
+                            self.context_runs[2].total(),
+                            self.context_runs[3].total(),
+                            self.context_reward(),
+                            self.air_factor,
+                            self.air_repetition,
+                        );
+                    }
                 }
                 self.session.holder.finish_collector();
                 self.landing_countdown = 2;
             }
             self.collector = next;
-            self.start = f.position;
-            self.peak = f.position[1];
-            self.spin = 0.;
-            self.previous_heading = f.forward[0].atan2(f.forward[2]);
-            self.air_metrics = [0.; 5];
-            self.spin_turns = 0;
-            self.flip_direction = 0;
-            self.context_runs = [ContextRun::default(); 4];
-            self.takeoff_hips_height = f.hips_position[1];
-            self.flip_bonus_paid = false;
-            self.flip_seen = false;
-            self.air_repetition = 1.;
-            self.air_repetition_set = false;
-            self.air_factor = 1.;
             self.grab_chain = 0;
             self.collector_ticks = 0;
             self.manual_revert_ticks = 0;
             self.revert_id = None;
+            // Everything below belongs to the *air* collector and is cleared by its own
+            // Enter, 82DA8078 -- not by leaving it. Clearing on every transition wiped the
+            // spin and the flip on the landing tick, before the publication that had to
+            // name them, so a 540 published as its bare label.
             if next == Collector::Air {
+                self.start = f.position;
+                self.peak = f.position[1];
+                self.spin = 0.;
+                self.previous_heading = f.forward[0].atan2(f.forward[2]);
+                self.air_metrics = [0.; 5];
+                self.spin_turns = 0;
+                self.flip_direction = 0;
+                self.context_runs = [ContextRun::default(); 4];
+                self.takeoff_hips_height = f.hips_position[1];
+                self.flip_bonus_paid = false;
+                self.flip_seen = false;
+                self.air_repetition = 1.;
+                self.air_repetition_set = false;
+                self.air_factor = 1.;
                 self.session.holder.reward_sequence(1.);
                 self.landing_countdown = 0;
                 if previous_type == Some(8) {
@@ -841,7 +913,11 @@ impl Runtime {
                     .as_ref()
                     .is_some_and(|c| c.announced && c.scorable.class == 2)
                 {
-                    self.flip_direction = if f.body_flip_side { -1 } else { 1 };
+                    // 82DA8EB8: `subfic r9,r11,0` sets CA = (side == 0); `subfe r6,r9,r9`
+                    // makes 0 or -1; `rlwinm r11,r6,0,30,30` makes 0 or 2; `addi r9,r11,-1`
+                    // lands on -1 for side == 0 and +1 for side != 0. Getting this the
+                    // wrong way round named every front flip a back flip.
+                    self.flip_direction = if f.body_flip_side { 1 } else { -1 };
                 }
             }
             // Recomputed from the latched +2348 every frame, flipping or not, so the
@@ -918,6 +994,15 @@ impl Runtime {
             self.sequence_score =
                 self.session
                     .publish_sequence(&self.data.session_rules(), 1., bailout, true);
+            if trace_enabled() {
+                let s = &self.session.holder.snapshot;
+                eprintln!(
+                    "SCORE_PUBLISH reward={:.0} mult={:.2} line={:.0} lifetime={:.0} \
+                     bail={bailout} name={:?}",
+                    self.sequence_score, self.session.combo.multiplier, s.line,
+                    s.completed_lines, self.trick_name,
+                );
+            }
             self.sequence_active = false;
             // 82775328 -> 82774E88 closes only for ScoreModule reset/bail
             // output 14630 (82DA4010/82DA4238), not a banked landing.
@@ -969,7 +1054,7 @@ impl Runtime {
         if self.close_tricks {
             self.base_trick_label = None;
         }
-        self.trick_name = compose_trick_name(
+        let composed = compose_trick_name(
             self.base_trick_label.as_deref(),
             self.spin_turns,
             self.flip_direction,
@@ -979,6 +1064,15 @@ impl Runtime {
             // will read FS for BS until one is published.
             false,
         );
+        // 825E4F40 marks the name dirty whenever the spin (M+12) or the flip (M+16) it
+        // embeds changes, and 825E51A0 then recomposes and re-fires the display event.
+        // Without that the HUD keeps whatever was composed at announcement, so a 540 that
+        // finished turning after the trick was named still read as its bare label -- which
+        // is exactly what a playtest showed: 1 of 118 published names carried a spin.
+        if composed != self.trick_name {
+            self.trick_name = composed;
+            self.modified_trick = true;
+        }
         Ok(())
     }
 }
