@@ -45,6 +45,12 @@ const LANDING_MATERIAL_FIELD: &str = "Hash_85FDC8BF696BCA5C";
 const LANDING_THRESHOLD_FIELD: &str = "Hash_3462CBB16DCA696E";
 const LANDING_CEILING_FIELD: &str = "Hash_590495E420B399E5";
 
+/// The grind tuning class and its own two impact windows (0.25 and 0.5 in the owner's vault).
+/// `sub_824BB0E0` uses these where the landing uses the Contacts pair.
+const GRIND_TUNING_CLASS: &str = "Hash_049861E8F9A8D16B";
+const GRIND_THRESHOLD_FIELD: &str = "Hash_086B66C3D4FFEE8F";
+const GRIND_CEILING_FIELD: &str = "Hash_B2ACAFDBCD963C93";
+
 /// One recorded play, in the order `ContactsOwner` made it.
 struct Queued {
     id: u32,
@@ -117,6 +123,8 @@ pub(crate) struct ContactVoicePlayer {
     landing_material: i32,
     landing_threshold: f32,
     landing_ceiling: f32,
+    grind_threshold: f32,
+    grind_ceiling: f32,
     /// `CSTATEMGR_Collision` and its per-material table: the subsystem the grind onset posts to.
     collision: CollisionStates,
     collision_materials: CollisionMaterials,
@@ -154,6 +162,12 @@ impl ContactVoicePlayer {
             landing_material,
             landing_threshold: tuning_float(LANDING_THRESHOLD_FIELD, 0.1),
             landing_ceiling: tuning_float(LANDING_CEILING_FIELD, 0.3),
+            grind_threshold: vault
+                .float(GRIND_TUNING_CLASS, "default", GRIND_THRESHOLD_FIELD)
+                .unwrap_or(0.25),
+            grind_ceiling: vault
+                .float(GRIND_TUNING_CLASS, "default", GRIND_CEILING_FIELD)
+                .unwrap_or(0.5),
             collision: CollisionStates::new(),
             collision_materials,
             collision_live: Vec::new(),
@@ -340,11 +354,25 @@ impl ContactVoicePlayer {
         request: &VoiceRequest,
     ) -> Result<(), String> {
         let tier = request.tier.unwrap_or(0);
+        let impact = request.impact.unwrap_or(0.0);
+        let (lo, hi) = if tier == 0 {
+            (0.0, self.grind_threshold)
+        } else {
+            (self.grind_threshold, self.grind_ceiling)
+        };
+        let board = request.family_base.unwrap_or(0) as i32;
+        let surface = request.material.unwrap_or(0) as i32;
         let message = ContactMessage {
-            material_a: request.family_base.unwrap_or(0) as i32,
-            material_b: request.material.unwrap_or(0) as i32,
+            material_a: board,
+            material_b: surface,
             tier_a: tier,
             tier_b: tier,
+            level_a: self.collision_materials.contact_level(
+                board, surface, tier, lo, hi, impact, &self.surfaces,
+            ),
+            level_b: self.collision_materials.contact_level(
+                surface, board, tier, lo, hi, impact, &self.surfaces,
+            ),
             ..ContactMessage::default()
         };
         let slot = self.collision.post(message, &self.collision_materials);
@@ -375,7 +403,8 @@ impl ContactVoicePlayer {
                 ));
                 continue;
             };
-            self.play_collision(runtime, &sample);
+            let level = if record == 0 { message.level_a } else { message.level_b };
+            self.play_collision(runtime, &sample, level);
         }
         Ok(())
     }
@@ -443,7 +472,9 @@ impl ContactVoicePlayer {
             else {
                 continue;
             };
-            self.play_collision(runtime, &sample);
+            // `material_a` is the board, `material_b` the surface, matching the two levels.
+            let level = if record == 0 { message.level_a } else { message.level_b };
+            self.play_collision(runtime, &sample, level);
         }
         Ok(())
     }
@@ -451,7 +482,12 @@ impl ContactVoicePlayer {
     /// Start one collision voice. Retail opens these through `sub_82975700` and keeps them live
     /// under `sub_824D2318`; this uses the same Splice one-shot path the pops and the landing
     /// already use, with the material record's level as the voice's gain.
-    fn play_collision(&mut self, runtime: &mut AuthoredRuntime, sample: &CollisionSample) {
+    fn play_collision(
+        &mut self,
+        runtime: &mut AuthoredRuntime,
+        sample: &CollisionSample,
+        contact_level: u32,
+    ) {
         let members = match self.banks.resolve(sample.bank, sample.sample, &mut self.state, &mut self.rand) {
             Ok(members) => members,
             Err(error) => {
@@ -463,15 +499,20 @@ impl ContactVoicePlayer {
             self.report(&format!("Splice bank {} is not installed", sample.bank));
             return;
         };
-        let gain = sample.level as f32 / 32_767.0;
+        // The material's `+52` is a *static* per-material level; on its own it made every landing
+        // arrive at the same near-full gain, which is what "all the landings sound the same" was.
+        // What varies is `sub_82496C58`'s per-contact level — air time for a landing, impact for a
+        // grind — so it modulates the voice here. Retail carries it through the Collision
+        // controller's outputs instead; these voices do not read that controller, so applying it
+        // directly is the closest the one-shot path gets.
+        let gain = (sample.level as f32 / 32_767.0) * (contact_level as f32 / 32_767.0);
         self.report(&format!(
-            "collision voice {} #{:#x} level {} -> {} member(s) at gain x{gain:.3}, first delay {:.3}s gain {:.3}",
+            "collision voice {} #{:#x} material level {} x contact {} -> {} member(s) at gain x{gain:.3}",
             sample.bank,
             sample.sample,
             sample.level,
+            contact_level,
             members.len(),
-            members.first().map_or(0.0, |m| m.values.delay),
-            members.first().map_or(0.0, |m| m.values.gain),
         ));
         for member in members {
             match runtime.play_oneshot(&OneshotVoice {

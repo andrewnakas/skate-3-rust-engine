@@ -389,6 +389,9 @@ pub(crate) struct VoiceRequest {
     /// `sub_824BA630`: the latched air time (`[this+340]`) the contact-sound manager's landing
     /// message interpolates its level over — retail's "how far did you actually fall".
     pub air_time: Option<f32>,
+    /// `sub_824BB0E0`: the grind impact (`+228`) its own contact level interpolates over, the
+    /// grind's counterpart to the landing's air time.
+    pub impact: Option<f32>,
 }
 
 /// The one-shot bank-voice sink. Implemented by the `skate-audio-core` bank-voice port; the
@@ -704,6 +707,7 @@ impl ContactsOwner {
             material: Some(material),
             family_base: Some(family_base),
             tier: Some(tier),
+            impact: Some(inputs.grind_impact_228),
             ..VoiceRequest::default()
         };
         // This routine does not hold its voice in a slot the process reads back.
