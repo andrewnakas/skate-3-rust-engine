@@ -31,6 +31,32 @@
 
 use crate::{Error, Guest, Result};
 
+/// An observer of every voice a device opens: the request, its `{id, s32, value}` records and the
+/// voice. The playtest trace installs one so its opens compare with the retail capture's
+/// `skate3-audio-open` lines.
+pub type OpenObserver = fn(&OpenRequest, &[(u8, i32, i32)], u32);
+
+static OPEN_OBSERVER: std::sync::OnceLock<OpenObserver> = std::sync::OnceLock::new();
+
+/// Install the open observer; only the first call takes effect.
+pub fn observe_opens(observer: OpenObserver) {
+    let _ = OPEN_OBSERVER.set(observer);
+}
+
+/// Report an open to the observer, reading the request's 12-byte records from guest memory.
+pub(crate) fn report_open(g: &Guest, request: &OpenRequest, voice: u32) -> Result<()> {
+    let Some(observer) = OPEN_OBSERVER.get() else {
+        return Ok(());
+    };
+    let mut records = Vec::with_capacity(request.record_count as usize);
+    for i in 0..request.record_count {
+        let at = request.records.wrapping_add(12 * i);
+        records.push((g.u8(at)?, g.u32(at + 4)? as i32, g.u32(at + 8)? as i32));
+    }
+    observer(request, &records, voice);
+    Ok(())
+}
+
 /// `lis -32003` + 13816: the device singleton's cell.
 pub const DEVICE_SLOT: u32 = 0x82FD_35F8;
 

@@ -7,6 +7,8 @@
 //! * `PO <slot> <index> <name> <payload> 0 | 28 words | handle=<handle>` — a post;
 //! * `UP <node> <name> <payload> | 28 words` — a redelivery;
 //! * `RL <node> <name>` — a release;
+//! * `OP <index> byte=<b> desc=[6 words] records=[id:a/value …] -> voice=<voice>` — a voice open,
+//!   the capture's `skate3-audio-open` line; follows the post or update whose patch opened it;
 //! * `AS st=<state> cat=<category> <field>=<value> …` — the physical state id and the
 //!   audio-state fields the families' triggers read;
 //! * `OUT <p0..p5> | rms <r> frames <n> ch <c>` — one per rendered block, in the retail capture's
@@ -41,6 +43,7 @@ fn with<F: FnOnce(&mut Trace)>(f: F) {
                     frame: 0,
                     names: HashMap::new(),
                 });
+                skate_audio_core::voice::observe_opens(open);
             }
         }
     });
@@ -72,6 +75,26 @@ pub(crate) fn frame(frame: u64) {
     });
 }
 
+fn open(request: &skate_audio_core::voice::OpenRequest, records: &[(u8, i32, i32)], voice: u32) {
+    let desc = request
+        .shifted
+        .iter()
+        .map(|w| format!("{w:08X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let records = records
+        .iter()
+        .map(|(id, a, value)| format!("{id}:{a}/{value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    with(|t| {
+        t.line(format_args!(
+            "OP {} byte={} desc=[{desc}] records=[{records}] -> voice={voice:08X}",
+            request.index, request.byte2
+        ))
+    });
+}
+
 pub(crate) fn post(object: &str, handle: u32, payload: &[u32]) {
     with(|t| {
         t.names.insert(handle, object.to_owned());
@@ -84,14 +107,24 @@ pub(crate) fn post(object: &str, handle: u32, payload: &[u32]) {
 
 pub(crate) fn update(handle: u32, payload: &[u32]) {
     with(|t| {
-        let name = t.names.get(&handle).cloned().unwrap_or_else(|| "(unknown)".into());
-        t.line(format_args!("UP {handle:08X} {name} {handle:08X} | {}", words(payload)));
+        let name = t
+            .names
+            .get(&handle)
+            .cloned()
+            .unwrap_or_else(|| "(unknown)".into());
+        t.line(format_args!(
+            "UP {handle:08X} {name} {handle:08X} | {}",
+            words(payload)
+        ));
     });
 }
 
 pub(crate) fn release(handle: u32) {
     with(|t| {
-        let name = t.names.remove(&handle).unwrap_or_else(|| "(unknown)".into());
+        let name = t
+            .names
+            .remove(&handle)
+            .unwrap_or_else(|| "(unknown)".into());
         t.line(format_args!("RL {handle:08X} {name}"));
     });
 }
@@ -118,7 +151,10 @@ pub(crate) fn output(native: &[f32], channels: usize, stereo: &[f32]) {
         line += &format!(" | rms {rms:.6} frames {frames} ch {channels}");
         t.line(format_args!("{line}"));
         let device_peak = stereo.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
-        let device_rms = (stereo.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+        let device_rms = (stereo
+            .iter()
+            .map(|s| f64::from(*s) * f64::from(*s))
+            .sum::<f64>()
             / stereo.len().max(1) as f64)
             .sqrt();
         t.line(format_args!("DEV {device_peak:.6} {device_rms:.6}"));

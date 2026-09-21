@@ -314,7 +314,10 @@ impl AuthoredRuntime {
             return Err(Error::new(0, "audio payload exceeds 128 words"));
         }
         if relocations.iter().any(|(index, _)| *index >= payload.len()) {
-            return Err(Error::new(0, "audio payload relocation is outside the packet"));
+            return Err(Error::new(
+                0,
+                "audio payload relocation is outside the packet",
+            ));
         }
         let slot = *self
             .objects
@@ -362,7 +365,10 @@ impl AuthoredRuntime {
             return Err(Error::new(handle, "audio payload exceeds 128 words"));
         }
         if relocations.iter().any(|(index, _)| *index >= payload.len()) {
-            return Err(Error::new(handle, "audio payload relocation is outside the packet"));
+            return Err(Error::new(
+                handle,
+                "audio payload relocation is outside the packet",
+            ));
         }
         for (i, word) in payload.iter().enumerate() {
             self.guest.set_u32(message + 4 + i as u32 * 4, *word)?;
@@ -571,6 +577,7 @@ impl VoiceDevice for AuthoredDevice {
         );
         self.live.insert(voice, g.u32(voice + 4)?);
         self.opened += 1;
+        crate::voice::report_open(g, request, voice)?;
         if std::env::var_os("SKATE_AUDIO_VOICE_TRACE").is_some() {
             eprintln!(
                 "SKATE_AUDIO_VOICE open voice={voice:08x} sample={sample:08x} live={}",
@@ -733,9 +740,10 @@ impl commands::CommandHost for AuthoredDevice {
         // device, so their SndPlayer1 gets its decoder here, as `open` gives bank voices theirs.
         if let Some(stream) = self.grains.begin_play(g, record)? {
             if !self.players.contains_key(&stream) {
-                let decoder = self.grains.take_decoder().ok_or_else(|| {
-                    Error::new(stream, "no spare decoder for a grain voice")
-                })?;
+                let decoder = self
+                    .grains
+                    .take_decoder()
+                    .ok_or_else(|| Error::new(stream, "no spare decoder for a grain voice"))?;
                 self.players.insert(
                     stream,
                     SourceState {
