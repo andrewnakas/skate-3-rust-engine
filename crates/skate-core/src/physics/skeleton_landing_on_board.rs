@@ -48,10 +48,12 @@ pub fn update_root(
     // `Some(0)` would divide by zero and make every row of the root NaN; see the
     // same guard in `skeleton_air_frames`. A revert with no frames falls back to
     // the ordinary spin rather than poisoning the landing root.
-    let angle = revert_frames.filter(|&frames| frames > 0).map_or(spin, |frames| {
-        let magnitude = std::f32::consts::PI / frames as f32;
-        if reversed { magnitude } else { -magnitude }
-    });
+    let angle = revert_frames
+        .filter(|&frames| frames > 0)
+        .map_or(spin, |frames| {
+            let magnitude = std::f32::consts::PI / frames as f32;
+            if reversed { magnitude } else { -magnitude }
+        });
     let (sin, cos) = crate::trigonometry::sin_cos(angle);
     let yaw = [
         [cos, 0., -sin, 0.],

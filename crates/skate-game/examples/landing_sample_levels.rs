@@ -150,9 +150,68 @@ fn main() {
     println!(
         "\nThe class voice (`sub_824BA3F0`, kind 0) -- this is where retail's step should be:"
     );
+    if let Some(splc) = banks.bank(bank) {
+        println!(
+            "  bank {bank}: {} records, {} containers, {} groups",
+            splc.records.len(),
+            splc.containers.len(),
+            splc.groups.len()
+        );
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (i, r) in splc.records.iter().enumerate() {
+            if r.children == 0 {
+                match runs.last_mut() {
+                    Some(last) if last.1 + 1 == i => last.1 = i,
+                    _ => runs.push((i, i)),
+                }
+            }
+        }
+        println!("  records with zero groups: {} runs", runs.len());
+        for (a, b) in runs.iter().take(12) {
+            println!("    {a:#06x}..={b:#06x} ({} records)", b - a + 1);
+        }
+    }
+    if let Some(splc) = banks.bank(bank) {
+        for id in [
+            0x41bu16, 0x41c, 0x41d, 0x431, 0x432, 0x433, 0x426, 0x428, 0x43e,
+        ] {
+            let n = splc.records.len();
+            let idx = usize::from(id);
+            if idx < n {
+                println!(
+                    "  id {id:#06x} -> record {idx} children {}",
+                    splc.records[idx].children
+                );
+            } else if idx - n < splc.containers.len() {
+                let c = &splc.containers[idx - n];
+                let kids: Vec<String> = c
+                    .ids
+                    .iter()
+                    .map(|&k| {
+                        let ki = usize::from(k);
+                        if ki < n {
+                            format!("{k:#06x}(rec,ch={})", splc.records[ki].children)
+                        } else {
+                            format!("{k:#06x}(CONTAINER {})", ki - n)
+                        }
+                    })
+                    .collect();
+                println!(
+                    "  id {id:#06x} -> container {} mode {} kids [{}]",
+                    idx - n,
+                    c.mode,
+                    kids.join(", ")
+                );
+            }
+        }
+    }
+    // DIAGNOSTIC: every mode row, not just the one `class_sample` would pick, so a row that is
+    // entirely unresolvable is distinguishable from a single bad id.
+    for (mode, row) in landing.class_modes.iter().enumerate() {
+        println!("  mode {mode} ids {:04x?}", row);
+    }
     for class in 0..3u32 {
-        // Mode is the surface category only for class 2; 0 otherwise.
-        for category in 0..if class >= 2 { 4u8 } else { 1 } {
+        for category in 0..4u8 {
             let Some(sample) = landing.class_sample(0, class, category) else {
                 println!("  class {class} cat {category}: no sample");
                 continue;

@@ -244,7 +244,10 @@ mod degenerate_tests {
             "heading went non-finite: {:?}",
             frames.heading
         );
-        assert_eq!(frames.heading, before, "a degenerate frame should retain the last heading");
+        assert_eq!(
+            frames.heading, before,
+            "a degenerate frame should retain the last heading"
+        );
         assert!(
             frames.system.iter().flatten().all(|v| v.is_finite())
                 && frames.ground.iter().flatten().all(|v| v.is_finite()),

@@ -71,8 +71,57 @@ pub(crate) fn inverse_length_squared(squared: f32, refinements: usize) -> f32 {
     }
     inverse
 }
+/// Normalise one Gram-Schmidt row, keeping `fallback` when it is degenerate.
+///
+/// [`inverse_length_squared`] refines an `frsqrte` estimate, and that estimate is infinite for a
+/// zero-length row: the first Newton step is `fma(-0, inf, 1)` = NaN, so the row -- and then the
+/// whole affine, because `compose_affine`'s translation mixes every rotation row -- becomes NaN.
+/// Retail never reaches exactly zero here; this port does, because the board offset's rows lerp
+/// *linearly* toward identity, so a ~180-degree offset crosses an exactly-zero row mid-decay. That
+/// is the landing crash: `animation_to_world` went NaN, `lifted_com_frame[3]` with it, and the
+/// skeleton's lifted-COM target body took a NaN velocity into the solver.
+///
+/// Only an exactly-degenerate or non-finite row is touched, so a row retail could produce keeps
+/// the original arithmetic bit for bit.
+pub(crate) fn normalize_row_or(vector: [f32; 4], fallback: [f32; 4]) -> [f32; 4] {
+    let squared = crate::physics::native_arithmetic::dot3(vector, vector);
+    if squared <= 0.0 || !squared.is_finite() {
+        return fallback;
+    }
+    let reciprocal = inverse_length_squared(squared, 2);
+    if !reciprocal.is_finite() {
+        return fallback;
+    }
+    vector.map(|v| v * reciprocal)
+}
+
 pub fn length(v: Vector3) -> f32 {
     let squared = dot(v, v);
     let value = squared * inverse_length_squared(squared, 2);
     if squared == 0.0 { 0.0 } else { value }
+}
+
+#[cfg(test)]
+mod normalize_row_tests {
+    use super::*;
+
+    /// The guard's contract: a row retail could produce normalises exactly as before, and a
+    /// degenerate or non-finite one keeps the fallback instead of becoming NaN.
+    #[test]
+    fn a_degenerate_or_non_finite_row_keeps_the_fallback() {
+        let fallback = [1.0, 0.0, 0.0, 0.0];
+        assert_eq!(normalize_row_or([0.0; 4], fallback), fallback);
+        assert_eq!(
+            normalize_row_or([f32::NAN, 0.0, 0.0, 0.0], fallback),
+            fallback
+        );
+        assert_eq!(
+            normalize_row_or([f32::INFINITY, 0.0, 0.0, 0.0], fallback),
+            fallback
+        );
+        // An ordinary row is untouched: same arithmetic as before the guard.
+        let row = [0.0, 3.0, 4.0, 0.0];
+        let reciprocal = inverse_length_squared(native_arithmetic::dot3(row, row), 2);
+        assert_eq!(normalize_row_or(row, fallback), row.map(|v| v * reciprocal));
+    }
 }
