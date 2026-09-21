@@ -877,8 +877,13 @@ mod tests {
         let surfaces = SurfaceMap::load(&vault).expect("surface map");
         let board = 95;
         let (threshold, ceiling) = (0.1f32, 0.3f32);
+        // `sub_824BA630` normalizes first — the windows are in `clamp(air / 0.4, 0, 1)` units,
+        // not seconds, so the curve is spent by 0.12 s of air. An earlier version of this test
+        // fed raw seconds and so measured a curve 2.5× wider than retail's.
+        let divisor = 0.4f32;
 
         let level = |surface: i32, air: f32| {
+            let air = (air / divisor).clamp(0.0, 1.0);
             let tier = i32::from(air >= threshold);
             let (lo, hi) = if tier == 0 { (0.0, threshold) } else { (threshold, ceiling) };
             (
@@ -889,7 +894,9 @@ mod tests {
 
         let mut varied = 0;
         for surface in [0, 2, 8, 10, 15, 16, 40] {
-            let steps: Vec<_> = [0.02f32, 0.08, 0.15, 0.3, 1.0]
+            // Seconds of air, chosen to straddle retail's real boundaries once normalized:
+            // 0.04 s is the tier split and 0.12 s the ceiling, so 0.5 s is already saturated.
+            let steps: Vec<_> = [0.0f32, 0.02, 0.04, 0.08, 0.12, 0.5]
                 .iter()
                 .map(|air| (*air, level(surface, *air)))
                 .collect();

@@ -573,3 +573,72 @@ into meshes; only the misfiling is gone.
 
 Worth a playtest look: anything offboard (walking, bailing, ragdoll) that seemed to pass through
 static world geometry may simply have been unable to see it.
+
+## 11. Landing dynamics — **three port bugs fixed; the premise behind the old plan was wrong**
+
+Filed 2026-09-20 after "landings all sound the same and loud". Everything below was re-measured,
+because the recorded plan rested on two claims that did not survive the evidence.
+
+### The two dead premises
+
+**"Our air time is several times retail's, which is why the level saturates."** False. Retail's own
+`+236` is recoverable from the recomp traces: `Class_Treatment` update word 7 is
+`fctiwz(air × 1000)` clamped to 10000, i.e. milliseconds. Over `probe/traces/sessions/*`:
+
+| trace | airs | p25 | p50 | p75 | max |
+|---|---|---|---|---|---|
+| `play4` | 48 | 383 | 583 | 700 | 1583 |
+| `play1` | 23 | 516 | 633 | 716 | 1049 |
+| `play2` | 5 | 616 | 816 | 1083 | 1366 |
+
+The owner's own landings sit in the same band (0.08–3.5 s, median ≈ 0.5 s). Our air time is
+retail's. **Defect #2 is not the cause of anything here.**
+
+**"Retail's continuous landing weight comes from `sub_82496C58` / `sub_824D1E00`."** Also false.
+`sub_824D1E00`'s weight input is derived purely from the message's *tier* words — 10000 / 20000 /
+32767 — so it is a three-step quantizer, not a continuous weight. And the level curve saturates
+sooner than this port's did (see below), so it cannot be the source of loud-vs-quiet either.
+
+### What retail actually varies
+
+**Retail does not make a landing louder for being harder.** Measured from
+`.local/captures/retail-levels-20260920-004114.log` (music off, `OUT` peaks against
+`Class_Treatment` word 7), 15 landings spanning 350–783 ms of air: peaks run −7.8 to +3.7 dBFS with
+**no correlation to air time** — 733 ms produced both −7.8 and +0.8. The MixMap agrees: probing the
+real graph under the retail pre-roll (`contacts_input_probe`), the landing class moves Contacts
+output 15 only from 2584 to 3650 and output 3 from 6590 to 9309 — **3.0 dB each**.
+
+What changes is the *sample*. `sub_824BA630` starts three voices, and two of them pick by air time:
+
+| voice | slot | sample chosen by | level |
+|---|---|---|---|
+| impact | `+56` | fixed (`0x447`) | fixed |
+| **ladder** | `+496` | `sub_82494D78(deck material)` × `air ≥ 0.75 s` → `0x35C`…`0x35F` | fixed |
+| class | `+52` | landing class (0.62 s / 1.02 s) via `sub_824BA3F0` | fixed |
+
+### The three bugs fixed
+
+1. **The ladder voice was never played.** `LandingTuning::ladder` / `ladder_sample` existed in
+   `splice.rs` with no callers anywhere — dead code since it was written. Every landing played one
+   fixed impact sample where retail picks between four. This is the one most likely to be audible.
+2. **The level curve ran on seconds, not retail's ratio.** `sub_824BA630` @ `0x824BA7D0` computes
+   `clamp(air / D, 0, 1)` with `D` = `Hash_6D68BC2D1A23C29A` = 0.4, *before* the tier test and both
+   windows. The port passed raw seconds, stretching the curve 2.5×: retail's tier boundary is
+   **0.04 s** of air and its ceiling **0.12 s**, not 0.1 and 0.3. Note the direction — fixing this
+   makes the contact levels *more* uniform, because retail's really are.
+3. **Two vault post-gains were missing, and the level/material pairing was crossed.** Each level
+   word is scaled before it reaches the message (`fmuls`/`fctiwz` @ `0x824BAAC0`, `0x824BAB20`):
+   `Hash_31DEEF8FA219950F` = 0.65 on the first, `Hash_0EC6EEF5366FEA85` = 1.0 on the second. And
+   `sub_82486EF0(this, r28 = board, r27 = surface, …)` pairs `msg[+0x20]` with the **surface**
+   while `msg[+0x00]` is the board; `sub_824D2318` reads `msg[0x20 + 4 × record]`, so record 0 (the
+   board) is leveled by the surface's table entry. The port had them uncrossed.
+
+### Still open
+
+Whether the owner's "low landings should be low volume" is achievable retail-exactly. The evidence
+above says retail keeps the gain roughly flat and varies sample content, so if the ladder voice
+does not deliver the difference by ear, the next step is a deliberate, labelled deviation rather
+than more hunting — there is no un-ported gain path left in `sub_824BA630`.
+
+**Do not** re-open this by widening the `[0.1, 0.3]` window or removing the `/0.4`: that window is
+retail's, it is in ratio units, and it is meant to be spent by 0.12 s of air.

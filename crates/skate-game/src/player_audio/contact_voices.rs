@@ -33,6 +33,22 @@ use super::components::contacts::{ContactSound, ContactVoices, SurfaceMap, Voice
 /// 2584/3103/3650, a 3.0 dB spread. Class 2 is the reference so the loudest landing keeps the
 /// level `player-audio-retail-drivers.md` §8 measured against the recomp.
 const LANDING_SEND_MAXIMUM: f32 = 3650.0;
+
+/// `fmuls` then `fctiwz`: retail truncates the scaled level back to an integer.
+fn scale_level(level: u32, gain: f32) -> u32 {
+    (level as f32 * gain) as u32
+}
+
+/// `sub_824BA630` @ 0x824BA7D0: `clamp(air / divisor, 0, 1)`.
+///
+/// This is the value the tier test and both level windows run on — **not** seconds. With the
+/// owner's divisor of 0.4 the tier splits at 0.04 s of air and the curve is spent by 0.12 s.
+fn landing_weight(air_time: f32, divisor: f32) -> f32 {
+    if divisor <= 0.0 {
+        return 0.0;
+    }
+    (air_time / divisor).clamp(0.0, 1.0)
+}
 /// The send is an environment level as well as a class level, so it can legitimately sit low.
 /// Retail's own class-0 reading is 0.708 of the maximum; this floor keeps an unusual environment
 /// from muting a landing outright while still letting the class spread through.
@@ -44,6 +60,11 @@ const CONTACTS_TUNING_CLASS: &str = "Hash_C26949FCB638A2CA";
 const LANDING_MATERIAL_FIELD: &str = "Hash_85FDC8BF696BCA5C";
 const LANDING_THRESHOLD_FIELD: &str = "Hash_3462CBB16DCA696E";
 const LANDING_CEILING_FIELD: &str = "Hash_590495E420B399E5";
+/// `sub_824BA630` @ 0x824BA7C0: the air-time divisor, and the two per-level gains at 0x824BAAC0
+/// and 0x824BAB20.
+const LANDING_DIVISOR_FIELD: &str = "Hash_6D68BC2D1A23C29A";
+const LANDING_GAIN_A_FIELD: &str = "Hash_31DEEF8FA219950F";
+const LANDING_GAIN_B_FIELD: &str = "Hash_0EC6EEF5366FEA85";
 
 /// The grind tuning class and its own two impact windows (0.25 and 0.5 in the owner's vault).
 /// `sub_824BB0E0` uses these where the landing uses the Contacts pair.
@@ -123,6 +144,13 @@ pub(crate) struct ContactVoicePlayer {
     landing_material: i32,
     landing_threshold: f32,
     landing_ceiling: f32,
+    /// `Hash_6D68BC2D1A23C29A` (0.4): the divisor that turns the latched air time into the
+    /// `[0, 1]` ratio the tier test and both windows actually run on.
+    landing_divisor: f32,
+    /// `Hash_31DEEF8FA219950F` (0.65) and `Hash_0EC6EEF5366FEA85` (1.0): the per-word gains
+    /// applied to each level after `sub_82496C58` and before the message.
+    landing_gain_a: f32,
+    landing_gain_b: f32,
     grind_threshold: f32,
     grind_ceiling: f32,
     /// `CSTATEMGR_Collision` and its per-material table: the subsystem the grind onset posts to.
@@ -162,6 +190,9 @@ impl ContactVoicePlayer {
             landing_material,
             landing_threshold: tuning_float(LANDING_THRESHOLD_FIELD, 0.1),
             landing_ceiling: tuning_float(LANDING_CEILING_FIELD, 0.3),
+            landing_divisor: tuning_float(LANDING_DIVISOR_FIELD, 0.4),
+            landing_gain_a: tuning_float(LANDING_GAIN_A_FIELD, 0.65),
+            landing_gain_b: tuning_float(LANDING_GAIN_B_FIELD, 1.0),
             grind_threshold: vault
                 .float(GRIND_TUNING_CLASS, "default", GRIND_THRESHOLD_FIELD)
                 .unwrap_or(0.25),
@@ -429,32 +460,54 @@ impl ContactVoicePlayer {
         let air_time = request.air_time.unwrap_or(0.0);
         let surface = audio.wheel_material_620[0] as i32;
         let board = self.landing_material;
-        let tier = i32::from(air_time >= self.landing_threshold);
+        // `sub_824BA630` @ 0x824BA7D0 normalizes before it does anything else:
+        //
+        //     fdivs f13,f29,f0 ; fneg f12,f13 ; fsel f11,f12,f30,f13   (max with 0.0)
+        //     fsubs f10,f31,f11 ; fsel f29,f10,f11,f31                 (min with 1.0)
+        //
+        // i.e. `clamp(air / D, 0, 1)` with `D` = `Hash_6D68BC2D1A23C29A` (0.4 in the owner's
+        // vault). **The tier test and both windows are in these ratio units, not seconds** — so
+        // retail's tier boundary is 0.04 s of air and its curve tops out at 0.12 s, not 0.1 and
+        // 0.3. Passing raw seconds stretched the whole curve by 2.5×.
+        let weight = landing_weight(air_time, self.landing_divisor);
+        let tier = i32::from(weight >= self.landing_threshold);
         let (lo, hi) = if tier == 0 {
             (0.0, self.landing_threshold)
         } else {
             (self.landing_threshold, self.landing_ceiling)
         };
+        // The argument order is retail's: the first call is `sub_82496C58(r4 = surface, r5 =
+        // board)` and the second `(r4 = board, r5 = surface)`.
         let level_surface = self.collision_materials.contact_level(
-            surface, board, tier, lo, hi, air_time, &self.surfaces,
+            surface, board, tier, lo, hi, weight, &self.surfaces,
         );
         let level_board = self.collision_materials.contact_level(
-            board, surface, tier, lo, hi, air_time, &self.surfaces,
+            board, surface, tier, lo, hi, weight, &self.surfaces,
         );
+        // Each level word then gets its own vault multiplier before it reaches the message
+        // (`fmuls f10,f11,f0 ; fctiwz` at 0x824BAAC0 and 0x824BAB20): 0.65 for the first,
+        // 1.0 for the second.
+        let level_a = scale_level(level_surface, self.landing_gain_a);
+        let level_b = scale_level(level_board, self.landing_gain_b);
         self.report(&format!(
-            "Landing surface={surface} board={board} tier={tier} air={air_time:.3}              levels={level_surface}/{level_board}"
+            "Landing surface={surface} board={board} tier={tier} air={air_time:.3} weight={weight:.3} levels={level_a}/{level_b}"
         ));
         // Retail's own guard: either level at 0 and there is no message.
-        if level_surface == 0 || level_board == 0 {
+        if level_a == 0 || level_b == 0 {
             return Ok(());
         }
+        // `sub_82486EF0(this, r28 = board, r27 = surface, …, r9 = level_a, …)` — the message's
+        // materials are (board, surface) but the level words are **crossed**: `+0x20` carries the
+        // level computed for the surface and `+0x24` the one computed for the board. `sub_824D2318`
+        // reads `msg[0x20 + 4 × record]` (`add r6,r28,r11` with `r28 = 32 - (r1+80)`), so record 0
+        // — the board — really is leveled by the surface's table entry.
         let message = ContactMessage {
             material_a: board,
             material_b: surface,
             tier_a: tier,
             tier_b: tier,
-            level_a: level_board,
-            level_b: level_surface,
+            level_a,
+            level_b,
             ..ContactMessage::default()
         };
         let slot = self.collision.post(message, &self.collision_materials);
@@ -562,6 +615,23 @@ impl ContactVoicePlayer {
             ContactSound::Landing => {
                 Some((self.landing.bank(), self.landing.sample, OneshotBus::Default))
             }
+            // `sub_824BA630` @ 0x824BAC50: the ladder voice's column is `sub_82494D78` of the
+            // deck material — which is `AudioSurfaceMap` lane +8, the same lookup the pops use,
+            // with retail's own clamp to element 94 for anything out of range. Retail takes
+            // column 1 when that lane is non-zero, and the row is `air >= 0.75 s`.
+            ContactSound::LandingLadder => {
+                let test = play
+                    .request
+                    .deck_material
+                    .is_some_and(|material| self.surfaces.lookup(material as i32, 8) != 0);
+                let air = play.request.air_time.unwrap_or(0.0);
+                let sample = self.landing.ladder_sample(test, air);
+                // Retail opens this one through its own eEQChain (class `42AFE160E647167C`,
+                // value 1) rather than the default output bus. This engine does not model those
+                // chains for contact one-shots, so it takes the same default bus the impact
+                // voice does — an approximation, and the only one in this path.
+                (sample != 0).then_some((self.landing.bank(), sample, OneshotBus::Default))
+            }
             // `sub_824B8D48` via `sub_824BA3F0`: index `3 × kind + class` with `kind = 0` for a
             // landing, and the mode is the surface category only for a class-2 landing.
             //
@@ -609,5 +679,58 @@ impl ContactVoicePlayer {
             // Pops off (see `pops_enabled`), and the two paths that are a different subsystem.
             ContactSound::Pop | ContactSound::PopRoll | ContactSound::GrindOnset => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{landing_weight, scale_level};
+    use skate_data::audio::splice::LandingTuning;
+
+    /// The port fed `sub_82496C58` raw seconds, which stretched retail's curve by 2.5× and was
+    /// the reason every landing past 0.3 s measured identically. Retail normalizes first.
+    #[test]
+    fn the_landing_weight_is_a_ratio_not_seconds() {
+        let d = 0.4;
+        assert_eq!(landing_weight(0.0, d), 0.0);
+        // The tier split: retail's 0.1 in ratio units is 0.04 s of air.
+        assert!(landing_weight(0.039, d) < 0.1);
+        assert!(landing_weight(0.041, d) >= 0.1);
+        // The ceiling: 0.3 in ratio units is 0.12 s of air.
+        assert!(landing_weight(0.119, d) < 0.3);
+        assert!(landing_weight(0.121, d) > 0.3);
+        // Clamped at 1.0 — an ollie and a rooftop drop arrive at the same weight, which is
+        // retail's own behaviour and not something to "fix" by widening the window.
+        assert_eq!(landing_weight(0.4, d), 1.0);
+        assert_eq!(landing_weight(3.5, d), 1.0);
+        // A missing divisor must not produce inf/NaN and reach the voice gain.
+        assert_eq!(landing_weight(0.5, 0.0), 0.0);
+    }
+
+    /// `fmuls` + `fctiwz` truncates toward zero.
+    #[test]
+    fn the_level_gains_truncate() {
+        assert_eq!(scale_level(26_000, 0.65), 16_900);
+        assert_eq!(scale_level(24_000, 1.0), 24_000);
+        assert_eq!(scale_level(1, 0.65), 0);
+        assert_eq!(scale_level(0, 0.65), 0);
+    }
+
+    /// The 2×2 ladder is the voice this port never played: a landing's sample must change with
+    /// time in air, which is how retail makes a hop sound unlike a drop.
+    #[test]
+    fn the_ladder_picks_a_different_sample_either_side_of_the_split() {
+        let tuning = LandingTuning {
+            sample: 0x447,
+            ladder: [[0x35C, 0x35D], [0x35E, 0x35F]],
+            ladder_seconds: 0.75,
+            class_modes: [vec![], vec![], vec![], vec![]],
+        };
+        assert_eq!(tuning.ladder_sample(false, 0.30), 0x35C);
+        assert_eq!(tuning.ladder_sample(false, 0.80), 0x35D);
+        assert_eq!(tuning.ladder_sample(true, 0.30), 0x35E);
+        assert_eq!(tuning.ladder_sample(true, 0.80), 0x35F);
+        // The split is inclusive on the hard side (`air_seconds >= ladder_seconds`).
+        assert_eq!(tuning.ladder_sample(false, 0.75), 0x35D);
     }
 }

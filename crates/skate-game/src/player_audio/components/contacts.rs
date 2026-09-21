@@ -365,6 +365,12 @@ pub(crate) enum ContactSound {
     /// is chosen by the landing class (`sub_824BA3F0`), which is how retail makes a hard landing
     /// sound unlike a soft one — the levels of both voices are fixed.
     LandingClass,
+    /// `sub_824BA630`'s second landing voice, held at `+496` (`sub_82497F48` @ 0x824BAF18).
+    ///
+    /// Its sample comes from a 2×2 ladder — the deck-material test against time in air, split at
+    /// `0x224B06562D9D5E0E` (0.75 s in the owner's vault) — and, like the other two, its level is
+    /// fixed. See [`skate_data::audio::splice::LandingTuning::ladder_sample`].
+    LandingLadder,
     /// `sub_824BB0E0`.
     GrindOnset,
 }
@@ -392,6 +398,10 @@ pub(crate) struct VoiceRequest {
     /// `sub_824BB0E0`: the grind impact (`+228`) its own contact level interpolates over, the
     /// grind's counterpart to the landing's air time.
     pub impact: Option<f32>,
+    /// `sub_824BA630` @ 0x824BAC50: the deck material (`+660`) the ladder voice's column test
+    /// runs on, or `None` when the deck-contact byte (`+614`) is clear — retail passes 0 to
+    /// `sub_82494D78` in that case, which is the same as taking column 0.
+    pub deck_material: Option<u32>,
 }
 
 /// The one-shot bank-voice sink. Implemented by the `skate-audio-core` bank-voice port; the
@@ -485,6 +495,10 @@ pub(crate) struct ContactsInputs {
     pub jump_velocity_468: f32,
     pub bail_676: bool,
     pub grind_material_692: u32,
+    /// `+614`: the deck-contact byte that gates the ladder voice's material test.
+    pub deck_contact_614: bool,
+    /// `+660`: the deck material that test runs on.
+    pub deck_material_660: u32,
     /// Contacts controller output 15, the owner send the landing voice rides.
     /// Input 2 (the landing class) drives it: probing the real MixMap with the
     /// retail pre-roll gives 2584 / 3103 / 3650 for classes 0 / 1 / 2, a 3.0 dB
@@ -506,6 +520,8 @@ impl ContactsInputs {
             jump_velocity_468: state.jump_velocity_468,
             bail_676: state.bail_676,
             grind_material_692: state.grind_material_692,
+            deck_contact_614: state.deck_contact_614,
+            deck_material_660: state.deck_material_660,
             landing_send_level_15: 0,
         }
     }
@@ -528,6 +544,8 @@ impl ContactsInputs {
             jump_velocity_468: float(468),
             bail_676: byte(676),
             grind_material_692: word(692),
+            deck_contact_614: byte(614),
+            deck_material_660: word(660),
             // The capture carries audio-state words, not controller outputs; the
             // send level is supplied by `Component::process` at runtime.
             landing_send_level_15: 0,
@@ -578,6 +596,8 @@ pub(crate) struct ContactsOwner {
     held_landing_56: Option<u32>,
     /// `sub_824B8D48`'s voice, retail slot `+52`.
     held_landing_class_52: Option<u32>,
+    /// `sub_82497F48`'s ladder voice, retail slot `+496`.
+    held_landing_ladder_496: Option<u32>,
     voices: Box<dyn ContactVoices>,
 }
 
@@ -597,6 +617,7 @@ impl ContactsOwner {
             held_roll_96: None,
             held_landing_56: None,
             held_landing_class_52: None,
+            held_landing_ladder_496: None,
             voices,
         })
     }
@@ -668,6 +689,25 @@ impl ContactsOwner {
             ..VoiceRequest::default()
         };
         self.held_landing_56 = self.voices.play(ContactSound::Landing, &request);
+        // `sub_824BA630` @ 0x824BAC48: the second landing voice, held at `+496`. Retail releases
+        // whatever is in the slot (`[[+496]]` vtable 0 with r4 = 1) before zeroing it, which is
+        // the same free-then-play the other slots do here.
+        //
+        // Its sample is a 2×2 ladder — `sub_82494D78` of the deck material against time in air,
+        // split at 0.75 s — and its level is fixed, so this is the third and last way retail
+        // makes one landing sound unlike another. It was the one this port never played.
+        if let Some(handle) = self.held_landing_ladder_496.take() {
+            self.voices.free(handle);
+        }
+        self.held_landing_ladder_496 = self.voices.play(
+            ContactSound::LandingLadder,
+            &VoiceRequest {
+                air_time: Some(self.latches.air_time_340),
+                // Retail passes 0 to `sub_82494D78` when the deck-contact byte is clear.
+                deck_material: inputs.deck_contact_614.then_some(inputs.deck_material_660),
+                ..VoiceRequest::default()
+            },
+        );
         // `sub_824BA630` @ 0x824BB074 then calls `sub_824B8D48(this, 0, max_class, 0)`. Its sample
         // is picked from the landing class, so it — not the fixed-level impact above — is what
         // makes a heavy landing sound different from a light one. The sink resolves the class and
@@ -1167,6 +1207,7 @@ mod owner_tests {
             held_roll_96: None,
             held_landing_56: None,
             held_landing_class_52: None,
+            held_landing_ladder_496: None,
             voices: Box::new(sink.clone()),
         };
         (owner, sink)
@@ -1272,7 +1313,12 @@ mod owner_tests {
         o.step(&air(5));
         assert_eq!(
             sink.kinds(),
-            vec![ContactSound::Landing, ContactSound::LandingClass, ContactSound::Pop]
+            vec![
+                ContactSound::Landing,
+                ContactSound::LandingLadder,
+                ContactSound::LandingClass,
+                ContactSound::Pop
+            ]
         );
         assert_eq!(sink.freed(), vec![1]);
     }
@@ -1287,7 +1333,14 @@ mod owner_tests {
         sink.take();
         o.step(&ContactsInputs::default());
         o.step(&air(5));
-        assert_eq!(sink.kinds(), vec![ContactSound::Landing, ContactSound::LandingClass]);
+        assert_eq!(
+            sink.kinds(),
+            vec![
+                ContactSound::Landing,
+                ContactSound::LandingLadder,
+                ContactSound::LandingClass
+            ]
+        );
     }
 
     #[test]
@@ -1298,12 +1351,14 @@ mod owner_tests {
         // Falling edge, not grinding: the landing voice, and the frame counter resets.
         o.step(&ContactsInputs::default());
         let played = sink.take();
-        // The impact and `sub_824B8D48`'s class voice, in retail's order.
-        assert_eq!(played.len(), 2);
+        // The impact, the `+496` ladder voice and `sub_824B8D48`'s class voice, in retail's
+        // order. The ladder one was missing entirely until it was ported.
+        assert_eq!(played.len(), 3);
         assert_eq!(played[0].0, ContactSound::Landing);
         assert_eq!(played[0].1.sample, Some(1095));
         assert_eq!(played[0].1.eq_chain, Some(1));
-        assert_eq!(played[1].0, ContactSound::LandingClass);
+        assert_eq!(played[1].0, ContactSound::LandingLadder);
+        assert_eq!(played[2].0, ContactSound::LandingClass);
         assert_eq!(o.latches().frames_424, 0);
 
         // Landing into a grind plays no landing voice; the grind onset takes over.
@@ -1403,6 +1458,7 @@ mod owner_tests {
             held_roll_96: None,
             held_landing_56: None,
             held_landing_class_52: None,
+            held_landing_ladder_496: None,
             voices: Box::new(sink.clone()),
         };
         let mut frames: Vec<(u32, ContactSound)> = Vec::new();
@@ -1436,7 +1492,9 @@ mod owner_tests {
                 }
                 // `sub_824B8D48`'s voice is played from the same `sub_824BA630` call as the
                 // impact, so it sits on the same landing edge of the captured state.
-                ContactSound::Landing | ContactSound::LandingClass => {
+                ContactSound::Landing
+                | ContactSound::LandingClass
+                | ContactSound::LandingLadder => {
                     assert!(!now.in_known_air_332 && previous.in_known_air_332, "frame {frame}");
                     assert!(!now.grinding_341, "frame {frame}");
                 }
