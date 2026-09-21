@@ -147,8 +147,34 @@ fn main() -> Result<(), String> {
     if suspended.hud_input().sequence_score != held_score {
         return Err("Air452 suspension accrued distance/height reward".into());
     }
+    // 82DA8550 banks the five air metrics by bare id. They have no authored record, so a
+    // lookup that demanded one dropped every one of them and an air scored its base trick and
+    // nothing else. A moving, spinning air must bank far more than its authored 100.
+    let mut moving = scoring_runtime::Runtime::load(&data)?;
+    moving.advance(frame(0, FilteredCategory::Ground, None))?;
+    let airborne = 60;
+    for tick in 1..=airborne {
+        let t = tick as f32 / airborne as f32;
+        let turn = t * std::f32::consts::TAU;
+        let mut f = frame(tick, FilteredCategory::Air, Some(kickflip));
+        // 10 m along Z, a 3 m arc of height, and one full rotation.
+        f.position = [0., 3. * (t * std::f32::consts::PI).sin(), 10. * t];
+        f.forward = [turn.sin(), 0., turn.cos()];
+        moving.advance(f)?;
+    }
+    for tick in airborne + 1..airborne + 10 {
+        moving.advance(frame(tick, FilteredCategory::Ground, None))?;
+    }
+    let banked = moving.session.holder.snapshot.last_reward;
+    if banked <= 100. {
+        return Err(format!(
+            "A 10 m, 3 m-high, 360-degree air banked {banked}, which is no more than the \
+             authored kickflip alone: the air metric rewards are being discarded again"
+        ));
+    }
+    println!("Moving 360 air over 10 m and 3 m of height banked {banked:.0} (authored base 100)");
     println!(
-        "Scoring data audit: authored kickflip credited once; landing display persists; timer uses seconds; line expiry clears score; teleport cancels pending rewards and multiplier; Air452 freezes continuous metrics"
+        "Scoring data audit: authored kickflip credited once; landing display persists; timer uses seconds; line expiry clears score; teleport cancels pending rewards and multiplier; Air452 freezes continuous metrics; air metrics reach the bank"
     );
     Ok(())
 }

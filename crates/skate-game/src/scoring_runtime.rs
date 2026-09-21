@@ -6,10 +6,14 @@ use skate_core::{
     physics::filtered_state::FilteredCategory,
     scoring::{
         carrier::{Carrier, delay_ticks},
+        catalog,
         conversions::LINKS,
         session::Session,
     },
 };
+
+/// `air_horizontal_distance`. The five air metrics are consecutive from here.
+const AIR_METRIC_BASE: usize = 129;
 use skate_data::{collections::Collections, scoring::ScoringData};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +78,12 @@ pub(crate) struct Runtime {
     pub new_trick: bool,
     pub modified_trick: bool,
     pub close_tricks: bool,
+    /// The multiplier this runtime last reported, `52(r31)` in 82666BC0.
+    published_multiplier: f32,
+    /// Set for the one tick on which the published sequence multiplier changed, to the value
+    /// it changed to. 82666BC0 polls `140(r30)` against its own cached copy and reacts to any
+    /// change in either direction; the ScoreModule itself plays nothing.
+    pub multiplier_changed: Option<f32>,
 }
 impl Runtime {
     pub fn load(data: &Collections) -> Result<Self, String> {
@@ -110,6 +120,8 @@ impl Runtime {
             new_trick: false,
             modified_trick: false,
             close_tricks: false,
+            published_multiplier: 1.,
+            multiplier_changed: None,
         })
     }
     pub fn hud_input(&self) -> hud_runtime::Input {
@@ -392,9 +404,14 @@ impl Runtime {
             }
             if self.collector == Collector::Air {
                 if complete {
+                    // 82DA8550 banks these by bare id (`li r4,129` / `bl 0x82da6260`).
+                    // They have no authored record, so resolving them through the
+                    // authored table returned nothing and every air metric reward --
+                    // distance, peak height, height gain, spin and flip -- was
+                    // discarded at the landing that was supposed to bank it.
                     for (i, reward) in self.air_metrics.into_iter().enumerate() {
-                        if let Some(d) = self.data.by_id(129 + i) {
-                            self.session.holder.end_trick(d.metadata, reward);
+                        if let Some(metric) = catalog::metadata(AIR_METRIC_BASE + i) {
+                            self.session.holder.end_trick(metric, reward);
                         }
                     }
                 }
@@ -627,6 +644,12 @@ impl Runtime {
         }
         self.session.settle_line(f.teleported || bailout, active);
         self.previous = f.position;
+        // The multiplier poll, after settlement so a line that drops it back to x1 is seen as
+        // the change it is. The cached copy is updated whether or not anything reacted, which
+        // is 82666BC0's unconditional `stfs f31,52(r31)`.
+        let multiplier = self.session.combo.multiplier;
+        self.multiplier_changed = (multiplier != self.published_multiplier).then_some(multiplier);
+        self.published_multiplier = multiplier;
         Ok(())
     }
 }

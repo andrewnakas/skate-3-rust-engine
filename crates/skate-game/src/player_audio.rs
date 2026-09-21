@@ -89,8 +89,34 @@ enum WorkerStatus {
 }
 
 pub(super) fn install(app: &mut App) {
-    app.add_systems(Startup, start)
-        .add_systems(Update, (forward, report));
+    // The session marker registers this too, but its plugin returns early when its validation
+    // data will not load, and the multiplier sounds must not depend on that.
+    app.add_message::<crate::skate_audio::FrontEndSoundRequest>()
+        .add_systems(Startup, start)
+        .add_systems(Update, (forward, report))
+        .add_systems(
+            FixedUpdate,
+            multiplier_sounds.after(crate::app::SimulationSet::Physics),
+        );
+}
+
+/// Retail plays the score multiplier's sounds from the TrickDisplay HUD module's per-frame
+/// update (`sub_82666BC0`), which polls the published sequence multiplier -- the ScoreModule
+/// plays nothing itself. The scoring runtime reports the change edge; the selection is
+/// 82666BC0's own, and is deliberately silent for every multiplier but exactly x2 and x3.
+///
+/// This runs with the simulation rather than with the frame so a change cannot be missed when
+/// several fixed ticks fall inside one rendered frame.
+fn multiplier_sounds(
+    skater: Option<Res<crate::physics::SkaterRuntime>>,
+    mut sounds: MessageWriter<crate::skate_audio::FrontEndSoundRequest>,
+) {
+    let Some(multiplier) = skater.and_then(|skater| skater.scoring.multiplier_changed) else {
+        return;
+    };
+    if let Some(sound) = frontend::FrontEndSound::for_multiplier(multiplier) {
+        sounds.write(crate::skate_audio::FrontEndSoundRequest(sound.id()));
+    }
 }
 
 fn start(
