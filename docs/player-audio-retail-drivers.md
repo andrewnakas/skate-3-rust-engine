@@ -677,3 +677,92 @@ Until those inputs are fed from the audio state, contact one-shots cannot have r
 mask `+464`, wheel count `+200`, and the air fields `+236`/`+240`/`+260`), then take the one-shot
 gain from the controller instead of `CONTACT_TRIM`. Verify by re-measuring: a small hop and a big
 drop must produce different `OUT` peaks, not just different word 9.
+
+## 10. The on-board body impact: `sub_824BC188` (decoded 2026-09-21)
+
+**Symptom this explains.** Riding along, your body clips a wall or a pole: retail thuds, this
+engine is silent. The cause is not missing data — `body_impact_496` is computed and speed-scaled
+every frame — it is that **nothing reads it**. `sub_824BC188` is the retail routine that does.
+
+### Why it was hard to find
+
+The read is a scaled indexed load, so a grep for `,496(` finds nothing:
+
+```
+addi   r11,r17,124      ; r17 = region index
+lwz    r10,32(r31)      ; r31 = component object, obj+32 = audio state
+rlwinm r9,r11,2,0,29    ; (124 + i) * 4  =  496 + i*4
+lfsx   f31,r9,r10       ; f31 = state->body_impact[i]
+```
+
+The material read is the same shape with `addi r11,r17,140` (`560 + i*4`, `lwzx`).
+
+### Gating — it runs while riding
+
+`lbz r22,676(r10)`: when `+676` is clear (riding) the loop runs and `obj+422` is set. When `+676`
+is set it runs only while `+677` is clear, and `+676` is then carried as a *modifier* (it gates the
+`+592` groin latch and the `+596`/`+600` force latches), not as a gate. So this is the on-board
+path; `sub_824E3BE0` is its ragdoll counterpart, fed straight from the `sub_82BD60C8` Collision
+block (`+128` token, `+144` magnitude, `+148` material, `+48` position).
+
+The loop covers **6 of the 8 region slots** (`cmpwi cr6,r17,6`), and each region has its own
+re-trigger cooldown at `obj+260+i*4`, refilled from a vault count and decremented by `state+220`.
+
+### `sub_824BCBA0` — region to body-part material
+
+| region | primary | second | third |
+|---|---|---|---|
+| 0 | **97** head | (none, 143) | **110**, or **112** when `state+593` (face) |
+| 1 | **98** torso | **109** cotton | **110** |
+| 2, 3 | **100** arm | **107** skin | **111** |
+| 4, 5 | **99** leg | **108** denim | **111** |
+
+Those ids are confirmed twice over: from this switch, and independently by hashing
+`tools/asset_pipeline/names.txt` against `MATERIAL_VAULT_KEY` — 95 `Board`, 96 `Truck`, 97 `head`,
+98 `torso`, 99 `leg`, 100 `arm`, 101 `foot`, 107 `skin`, 108 `denim`, 109 `cotton`.
+
+### `sub_82497088` — the impact band and its window
+
+The missing helper. It resolves the material's `Hash_F64F891C312EFD5E` RefSpec to a record of class
+`7DAFF70B3A91CD5D` holding four floats, and returns the band the impact falls in plus that band's
+interpolation window — which is exactly the `tier` and the `lo`/`hi` that the already-ported
+`sub_82496C58` (`CollisionMaterials::contact_level`) takes.
+
+| record offset | vault field | default | role |
+|---|---|---|---|
+| +12 | `D660AC459139BDF4` | 0.005 | floor; below it the function returns **3** = silent |
+| +8 | `7D8DEDD338D45482` | 0.5 | band 0/1 split |
+| +0 | `C8DED1BC20B9D6A5` | 1.0 | band 1/2 split |
+| +4 | `B8870D2001033E0F` | 2.0 | ceiling |
+
+```
+if impact <  [+12]            -> 3          (silent)
+if impact >  [+0]             -> 2, window ([+0],  [+4])
+else if impact > [+8]         -> 1, window ([+8],  [+0])
+else                          -> 0, window ([+12], [+8])
+```
+
+The offset-to-field mapping is *derived*, not assumed: the four values must form three contiguous
+ascending bands, and that holds for **all 45 records of the class with zero violations**. 85
+materials inherit the set through `parent`, 18 point at `default` explicitly, and 6 materials
+(including 97 head and 98 torso) have no material record at all and so take the default.
+
+The `.rdata` key table `sub_82497088` indexes (`0x8302D6F0`, 16-byte stride, material → vault key)
+was read from a decrypted image dump and **matches `MATERIAL_VAULT_KEY` for all 143 materials with
+zero mismatches** — which validates both that table and the dump. See the image-dump recipe in the
+session notes; the collection is the same `D40CB4C0FFE45676` this port already loads.
+
+### What each region plays
+
+Five `sub_82486EF0` calls per contacting region — main body-vs-surface, a detail layer, then three
+body-only layers using the second/third ids above with material 143. `sub_824BCEB0` adds a single
+one-shot accent (`matA` 98, `matB` 143, both categories 1) when the `obj+420` first-contact latch
+is set. All of them land in `sub_824D2318` / `sub_824D20E8`, the manager this port already has.
+
+### Not this routine
+
+- `sub_824BBB28` — a looping Splice voice keyed off `+333`/`+334`/`+620`. Unrelated.
+- `sub_824BD000` — a single non-regional channel, position `+144`, magnitude `+668`, material
+  `+660`, ids 95/113. The deck/board impact, not the body.
+- `sub_824DC2B0` — reads `+528..+556` and `+560..+580`; the body *scrape/slide* loop, already
+  ported as `c_body_slide`.
