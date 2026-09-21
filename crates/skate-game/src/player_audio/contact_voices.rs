@@ -398,6 +398,13 @@ impl ContactVoicePlayer {
         if !self.body_impact_enabled {
             return Ok(());
         }
+        // `lbz r22,676` / `bne` → `lbz r11,677` / `cmplwi cr6,r11,0` / `bne`: riding runs the
+        // loop, a bail in progress still runs it, and a bail that is **over** skips it entirely.
+        // `cr6` really is recomputed before that second branch, so the skip is a genuine gate and
+        // not a fall-through — without it a finished bail keeps thudding as the body settles.
+        if audio.bail_676 && audio.bail_over_677 {
+            return Ok(());
+        }
         for region in 0..BODY_REGIONS {
             // `lfsx f31,r9,r10` then `fcmpu`/`ble`: a region with no impact this frame is skipped,
             // and so is one whose cooldown has not run down (`lfsx f0,r30,r31`, `bgt`).
