@@ -37,6 +37,8 @@ fn frame(
         nollie: false,
         body_flip: false,
         body_flip_side: false,
+        hips_position: [0., 1., 0.],
+        hips_ground: None,
         suspend_air: false,
         landing: Default::default(),
         teleported: false,
@@ -174,6 +176,41 @@ fn main() -> Result<(), String> {
         ));
     }
     println!("Moving 360 air over 10 m and 3 m of height banked {banked:.0} (authored base 100)");
+
+    // 82DA93D8's one-shot class-3 bonus, worth 0x600 = 4.0 times the trick's own points.
+    // 82DAC780 admits it only while the hips' ground contact lies between the deck and the
+    // hips, with neither vector degenerate.
+    let flipped = |contact: Option<[f32; 3]>| -> Result<f32, String> {
+        let mut run = scoring_runtime::Runtime::load(&data)?;
+        run.advance(frame(0, FilteredCategory::Ground, None))?;
+        for tick in 1..61 {
+            let mut f = frame(tick, FilteredCategory::Air, Some(kickflip));
+            f.position = [0., 1., 0.];
+            f.hips_position = [0., 2., 0.];
+            f.hips_ground = contact;
+            run.advance(f)?;
+        }
+        for tick in 61..70 {
+            run.advance(frame(tick, FilteredCategory::Ground, None))?;
+        }
+        Ok(run.session.holder.snapshot.last_reward)
+    };
+    // Contact between deck (y=1) and hips (y=2): the two vectors oppose, so it pays.
+    let with_bonus = flipped(Some([0., 1.5, 0.]))?;
+    // Contact below both: the vectors agree, so it must not pay.
+    let without = flipped(Some([0., 0.5, 0.]))?;
+    let no_contact = flipped(None)?;
+    if without != 100. || no_contact != 100. {
+        return Err(format!(
+            "The class-3 bonus paid without its geometric gate: {without} / {no_contact}"
+        ));
+    }
+    if with_bonus != 500. {
+        return Err(format!(
+            "Expected the authored 100 plus four times it, got {with_bonus}"
+        ));
+    }
+    println!("Class-3 one-shot bonus: kickflip banks {with_bonus:.0} through the gate, {without:.0} outside it");
     println!(
         "Scoring data audit: authored kickflip credited once; landing display persists; timer uses seconds; line expiry clears score; teleport cancels pending rewards and multiplier; Air452 freezes continuous metrics; air metrics reach the bank"
     );

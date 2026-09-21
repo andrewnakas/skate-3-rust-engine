@@ -107,6 +107,12 @@ pub(crate) struct Frame {
     pub body_flip: bool,
     /// Air 445. Selects the flip's direction; see [`Runtime::flip_direction`].
     pub body_flip_side: bool,
+    /// PhysOut.Ground +192: the hips line test's ray origin, the hips part's world
+    /// position. `82DB6EC0` publishes it unconditionally.
+    pub hips_position: [f32; 3],
+    /// PhysOut.Ground +208, and `None` when Ground +320 says the test missed. The hips
+    /// test's hit position, republished only while `player+1524` is set.
+    pub hips_ground: Option<[f32; 3]>,
     pub suspend_air: bool,
     pub landing: skate_core::animation::landing_quality::Output,
     pub teleported: bool,
@@ -138,6 +144,9 @@ pub(crate) struct Runtime {
     /// side. Retail writes it only while an announced grab carrier is current, so an
     /// ungrabbed flip earns no flip reward -- but it is still *named* as a flip.
     pub flip_direction: i32,
+    /// 82DA93D8's one-shot latch at +777: the class-3 bonus has already been paid for
+    /// this air, and cannot be paid again however many flip tricks follow.
+    flip_bonus_paid: bool,
     /// 82DA8EB8's +2396 latch, which is also scoring output byte 14651: a body flip
     /// happened during this air, whatever the carrier was.
     ///
@@ -193,6 +202,7 @@ impl Runtime {
             air_metrics: [0.; 5],
             spin_turns: 0,
             flip_direction: 0,
+            flip_bonus_paid: false,
             flip_seen: false,
             landing_countdown: 0,
             idle_ticks: 0,
@@ -449,6 +459,68 @@ impl Runtime {
         }
         Ok(())
     }
+    /// 82DA93D8's one-shot class-3 bonus: `reward += 0x600 * points * factor`.
+    ///
+    /// ```text
+    /// cmpwi cr6,r6,3          ; the current carrier is a flip trick
+    /// lbz   r11,777(r30)      ; and the bonus has not been paid this air
+    /// bl    0x82dac780        ; run the geometric test, which sets output byte 14648
+    /// lbz   r9,14648(r10)
+    /// lwz   r11,588(r30)      ; = carrier+4, the authored points
+    /// lfs   f9,1536(r10)      ; tuning 0x600 = 4.0
+    /// fmuls f8,f9,f10 / fmadds f7,f8,f13,f0 / stfs f7,176(r31)
+    /// ```
+    ///
+    /// The authored scalar is 4.0, so this is worth four times the trick's own points --
+    /// +400 on a kickflip, +1000 on a laserflip -- and it was missing entirely.
+    ///
+    /// `82DAC780`'s test asks whether the hips' ground contact lies *between* the deck and
+    /// the hips: the vectors from the contact to each must point opposite ways, and
+    /// neither may be degenerate.
+    ///
+    /// ```text
+    /// lbz   r11,320(r10) ; beqlr        ; the hips test must have hit something
+    /// v63 = block[144] - block[208]     ; contact -> deck
+    /// v62 = block[192] - block[208]     ; contact -> hips
+    /// vcmpgtfp dot3(v63,v63), 0.01      ; both non-degenerate
+    /// vcmpgtfp dot3(v62,v62), 0.01
+    /// vcmpgtfp 0.0, dot3(v63,v62)       ; and opposed
+    /// stb   r10,14648(r11)
+    /// ```
+    fn pay_flip_bonus(&mut self, f: &Frame) {
+        if self.flip_bonus_paid {
+            return;
+        }
+        let Some(carrier) = self.carriers[0].as_ref() else {
+            return;
+        };
+        // 82DA93D8 reads the carrier's presence byte +124, not its announcement: an
+        // unannounced carrier has not credited its points yet, and the bonus goes onto the
+        // same reward those points will land in.
+        if carrier.scorable.class != 3 {
+            return;
+        }
+        let Some(contact) = f.hips_ground else {
+            return;
+        };
+        let to_deck: [f32; 3] = std::array::from_fn(|i| f.position[i] - contact[i]);
+        let to_hips: [f32; 3] = std::array::from_fn(|i| f.hips_position[i] - contact[i]);
+        let dot = |a: &[f32; 3], b: &[f32; 3]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        // 820D71E8 = 0.01, compared against the squared lengths rather than the lengths.
+        let epsilon = f32::from_bits(0x3C23_D70A);
+        if !(dot(&to_deck, &to_deck) > epsilon && dot(&to_hips, &to_hips) > epsilon) {
+            return;
+        }
+        if !(dot(&to_deck, &to_hips) < 0.0) {
+            return;
+        }
+        let bonus = (self.data.collector.scalar(0x600) * carrier.points as f32) * carrier.factor;
+        if let Some(carrier) = self.carriers[0].as_mut() {
+            carrier.reward += bonus;
+        }
+        self.flip_bonus_paid = true;
+    }
+
     pub fn advance(&mut self, f: Frame) -> Result<(), String> {
         self.new_trick = false;
         self.modified_trick = false;
@@ -518,6 +590,7 @@ impl Runtime {
             self.air_metrics = [0.; 5];
             self.spin_turns = 0;
             self.flip_direction = 0;
+            self.flip_bonus_paid = false;
             self.flip_seen = false;
             self.air_repetition = 1.;
             self.air_repetition_set = false;
@@ -649,6 +722,7 @@ impl Runtime {
             // reward survives the end of the grab that authorised it.
             self.air_metrics[4] =
                 self.flip_direction.abs() as f32 * self.data.collector.scalar(0x640) * scale;
+            self.pay_flip_bonus(&f);
         }
         let active = self.carriers.iter().any(Option::is_some) || self.collector == Collector::Air;
         self.idle_ticks = if active {

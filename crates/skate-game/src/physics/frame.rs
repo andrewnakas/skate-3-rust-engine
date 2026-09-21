@@ -363,6 +363,18 @@ pub(super) fn advance(
         nollie: skater.animation.packet.weight_forwards,
         body_flip: skater.player_input.physical.air.flag_441 != 0,
         body_flip_side: skater.player_input.physical.air.flag_445 != 0,
+        // PhysOut.Ground +192 and +208. 82DB6EC0 publishes the origin unconditionally and
+        // the hit only while the test is valid, so a miss leaves the previous hit standing
+        // rather than clearing it; the scorer's own guard is Ground +320.
+        hips_position: {
+            let origin = skater.player_input.player.hips_line_origin_1632;
+            std::array::from_fn(|lane| f32::from_bits(origin[lane]))
+        },
+        hips_ground: {
+            let hips = skater.player_input.player.hips_line_test_1488;
+            (hips.valid != 0)
+                .then(|| std::array::from_fn(|lane| f32::from_bits(hips.position[lane])))
+        },
         suspend_air: skater.player_input.physical.air.use_air_reckoning_452 != 0,
         landing: skater.landing_quality,
         teleported,
