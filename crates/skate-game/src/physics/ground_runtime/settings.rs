@@ -28,15 +28,24 @@ use std::sync::Arc;
 pub(crate) struct GroundProfiles(Vec<Vec<Arc<GroundSettings>>>);
 impl GroundProfiles {
     pub fn load(data: &Collections) -> Result<Self, String> {
-        crate::difficulty::NATIVE_MODES.into_iter().map(|mode| {
-            (1..=5).map(|surface| {
-                GroundSettings::load(data, mode, super::surface_key(surface)?).map(Arc::new)
-            }).collect::<Result<Vec<_>, String>>()
-        }).collect::<Result<Vec<_>, String>>().map(Self)
+        crate::difficulty::NATIVE_MODES
+            .into_iter()
+            .map(|mode| {
+                (1..=5)
+                    .map(|surface| {
+                        GroundSettings::load(data, mode, super::surface_key(surface)?).map(Arc::new)
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(Self)
     }
     pub fn select(&self, mode: u32, surface: u32) -> Result<Arc<GroundSettings>, String> {
-        surface.checked_sub(1).and_then(|s| self.0.get(mode as usize)?.get(s as usize))
-            .cloned().ok_or_else(|| format!("Invalid processed physics mode/surface {mode}/{surface}"))
+        surface
+            .checked_sub(1)
+            .and_then(|s| self.0.get(mode as usize)?.get(s as usize))
+            .cloned()
+            .ok_or_else(|| format!("Invalid processed physics mode/surface {mode}/{surface}"))
     }
 }
 
@@ -208,10 +217,12 @@ impl GroundSettings {
         })
     }
     pub fn tuned(&self, tuning: skate_mods::TrainerTuning) -> Self {
-        let mut result=self.clone();
+        let mut result = self.clone();
         result.push_target_multiplier = tuning.push_speed;
         result.propulsion.maximum_pushable_speed *= tuning.push_speed;
-        for dv in &mut result.propulsion.mode_speed_changes { *dv *= tuning.push_power; }
+        for dv in &mut result.propulsion.mode_speed_changes {
+            *dv *= tuning.push_power;
+        }
         result.propulsion.braking.input_force *= tuning.braking;
         result.propulsion.braking.override_force *= tuning.braking;
         result.steering.general_scalar *= tuning.steering;
@@ -322,12 +333,27 @@ fn customiser_truck_tightness_changes_authored_steering() {
     let root = std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").unwrap());
     let data = Collections::load(&root).unwrap();
     let settings = GroundSettings::load(&data, "default", "default").unwrap();
-    let samples: Vec<_> = [0.0, 0.7, 1.0].into_iter().map(|tightness| calculate_tilt(
-        &settings.steering,
-        SteeringInput { turn: 0.6, absolute_body_speed: 5.0, flipped_controls_scalar: 1.0,
-            truck_tightness: tightness, ..Default::default() }, None, None,
-    )).collect();
+    let samples: Vec<_> = [0.0, 0.7, 1.0]
+        .into_iter()
+        .map(|tightness| {
+            calculate_tilt(
+                &settings.steering,
+                SteeringInput {
+                    turn: 0.6,
+                    absolute_body_speed: 5.0,
+                    flipped_controls_scalar: 1.0,
+                    truck_tightness: tightness,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+        })
+        .collect();
     assert!(samples[0].abs() > samples[2].abs());
     assert!((samples[2] / samples[0] - settings.steering.tight_trucks_scalar).abs() < 0.00001);
-    eprintln!("Authored truck tightness tilt samples: {samples:?}; tight scalar {}", settings.steering.tight_trucks_scalar);
+    eprintln!(
+        "Authored truck tightness tilt samples: {samples:?}; tight scalar {}",
+        settings.steering.tight_trucks_scalar
+    );
 }

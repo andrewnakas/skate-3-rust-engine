@@ -134,6 +134,22 @@ impl Runtime {
             context_tricks: Vec::new(),
         }
     }
+
+    /// Uses the same landing-quality thresholds as the retail scoring/HUD path without requiring
+    /// audio to infer clean or sketchy from animation names.
+    pub(crate) fn classify_landing_audio(
+        &self,
+        landing: skate_core::animation::landing_quality::Output,
+    ) -> (bool, bool) {
+        if !landing.landing_data_167 {
+            return (false, false);
+        }
+        let clean = landing.landing_type_96 == 0;
+        let sketchy = landing.landing_type_96 == 1
+            && landing.sideways_speed_84 > self.data.sketchy_side_speed
+            && landing.spin_92.abs() > 0.5;
+        (clean, sketchy)
+    }
     fn penalty(&self, id: usize) -> f32 {
         let Some(d) = self.data.by_id(id) else {
             return 1.;

@@ -20,8 +20,14 @@ use skate_data::audio::{self, ffmpeg::FfmpegDecoder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let archive = PathBuf::from(args.next().ok_or("usage: decode_audio ARCHIVE OUTDIR ...")?);
-    let outdir = PathBuf::from(args.next().ok_or("usage: decode_audio ARCHIVE OUTDIR ...")?);
+    let archive = PathBuf::from(
+        args.next()
+            .ok_or("usage: decode_audio ARCHIVE OUTDIR ...")?,
+    );
+    let outdir = PathBuf::from(
+        args.next()
+            .ok_or("usage: decode_audio ARCHIVE OUTDIR ...")?,
+    );
     let (mut at, mut blocks_limit, mut channels, mut rate) = (usize::MAX, 0usize, 0u8, 0u32);
     let mut entry: Option<String> = None;
     let mut end = usize::MAX;
@@ -50,7 +56,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let wanted = entry.as_deref().unwrap_or("0");
         let member = match wanted.parse::<usize>() {
             Ok(index) => parsed.entries.get(index).ok_or_else(|| {
-                format!("entry {index} of {}: the archive has {}", archive.display(), parsed.entries.len())
+                format!(
+                    "entry {index} of {}: the archive has {}",
+                    archive.display(),
+                    parsed.entries.len()
+                )
             })?,
             Err(_) => parsed
                 .find(wanted)
@@ -61,7 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         at = member.range().start;
         end = member.range().end.min(data.len());
-        println!("entry {wanted}: {} bytes at {at:#x}", member.uncompressed_size);
+        println!(
+            "entry {wanted}: {} bytes at {at:#x}",
+            member.uncompressed_size
+        );
     }
 
     // Some members carry an EA Audio Core header; the ambience and grain archives are bare
@@ -81,7 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 header_bytes: 0,
             }
         }
-        Err(e) => return Err(format!("{e} -- pass --channels to read it as a bare block chain").into()),
+        Err(e) => {
+            return Err(format!("{e} -- pass --channels to read it as a bare block chain").into());
+        }
     };
     if channels != 0 {
         info.channels = channels;
@@ -94,8 +109,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{} at {at:#x}: {:?} {} Hz, {} channels in {} contexts {:?}, {} samples ({:.2} s)",
         archive.file_name().unwrap_or_default().to_string_lossy(),
-        info.codec, info.sample_rate, info.channels, info.contexts, widths,
-        info.num_samples, info.duration_secs()
+        info.codec,
+        info.sample_rate,
+        info.channels,
+        info.contexts,
+        widths,
+        info.num_samples,
+        info.duration_secs()
     );
 
     // Gather each context's chain in block order. This is what the decoder needs whole: a chunk
@@ -117,7 +137,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let range = block.data_range();
         let payload = &data[chain + range.start..chain + range.end];
-        for (context, chunk) in eaac::split_block(payload, info.contexts)?.into_iter().enumerate() {
+        for (context, chunk) in eaac::split_block(payload, info.contexts)?
+            .into_iter()
+            .enumerate()
+        {
             chains[context].push(chunk.data.to_vec());
         }
         declared += u64::from(block.num_samples);
@@ -132,8 +155,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let deficit = declared as i64 - frames as i64;
         println!(
             "  context {context}: {} chunks, {}ch, {frames} frames, deficit {deficit}{}",
-            chain.len(), widths[context],
-            if deficit == 0 { " (exact)" } else { "  <-- NOT EXACT" }
+            chain.len(),
+            widths[context],
+            if deficit == 0 {
+                " (exact)"
+            } else {
+                "  <-- NOT EXACT"
+            }
         );
         let raw: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
         fs::write(outdir.join(format!("context{context}.pcm")), &raw)?;
@@ -143,10 +171,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let interleaved = audio::interleave_contexts(&per_context, &widths);
     let frames = interleaved.len() / usize::from(info.channels);
     let wav = outdir.join("stream.wav");
-    fs::write(&wav, wav_pcm16(&interleaved, info.channels, info.sample_rate))?;
+    fs::write(
+        &wav,
+        wav_pcm16(&interleaved, info.channels, info.sample_rate),
+    )?;
     println!(
         "wrote {} ({frames} frames, {:.2} s) and {} per-context PCM files",
-        wav.display(), frames as f64 / f64::from(info.sample_rate), per_context.len()
+        wav.display(),
+        frames as f64 / f64::from(info.sample_rate),
+        per_context.len()
     );
     Ok(())
 }

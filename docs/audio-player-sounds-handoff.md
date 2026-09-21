@@ -333,3 +333,50 @@ Other examples: `voice_classes <image dir>` (cooked class defaults); in `skate-a
 > list from item 1: drain, play command, stream pump replacement, per-block driver. The first
 > milestone is one footstep audible in `skate3rust.exe`; after that, every object in the target table,
 > checked against the traces. Scope is the player's own skating sounds, board and body.
+
+## Windows audio checkpoint — 2026-09-15
+
+The Windows output path is now proved with the user's own Skate 3 ISO; this is a diagnostic and
+archive-decoding milestone, **not** automatic gameplay-sound integration.
+
+- Rust stable MSVC is installed. Build products must use
+  `%LOCALAPPDATA%\\Skate3RustEngine\\target`: linking in this OneDrive checkout repeatedly failed
+  with `LNK1104` while the local target succeeds. `scripts/Build.ps1` now selects that location by
+  default.
+- The project-local ignored `.local/ffmpeg/*/bin/ffmpeg.exe` is discovered before PATH, with
+  `SKATE_FFMPEG` remaining the explicit override. FFmpeg 9.0.1 essentials was used to verify the
+  real decoder path.
+- `skate3-audio-check --tone [seconds]` exercises the same Bevy/CPAL `AudioSink` without game
+  archives. `SKATE_AUDIO_TONE` is implemented in `crates/skate-game/src/skate_audio.rs` and has a
+  bounded-one-second test.
+- `SKATE_AMBIENCE=<resident.big>:<payload.big>:<place>` now supports two absolute Windows paths
+  (including both drive letters); `|` is also accepted as an unambiguous separator. The original
+  colon syntax is preserved.
+- The owned ISO remains `D:\\skate3.iso`. The partial, private extraction containing the audio
+  archives is `C:\\Users\\andre\\AppData\\Local\\Skate3RustEngine\\owned-disc\\partial-skate3\\data\\audio`.
+  It includes `ambienceresident.big` (1,568 bytes), `ambience.big` (143,708,256 bytes), and
+  `audiofiles.big` (104,748,800 bytes). Never add these to Git.
+
+Evidence from the final real-archive check:
+
+```text
+ambience for "univ_mt_low": 07_univ_mt_high.sns ... (looping=true)
+skate-audio: ... 07_univ_mt_high.sns decoded, 204416 frames of 5 channels (4.26 s)
+skate-audio-check: the stream finished after 7.9s
+```
+
+Run it again with:
+
+```powershell
+$env:CARGO_TARGET_DIR = Join-Path $env:LOCALAPPDATA 'Skate3RustEngine\target'
+$env:RUST_LOG = 'info'
+$audio = 'C:\Users\andre\AppData\Local\Skate3RustEngine\owned-disc\partial-skate3\data\audio'
+$env:SKATE_AMBIENCE = "$audio\ambienceresident.big:$audio\ambience.big:univ_mt_low"
+cargo run -p skate-game --bin skate3-audio-check -- 15
+```
+
+Current tests: `cargo test -p skate-game --bin skate3-audio-check --locked` passes 6/6. The
+modified files are `crates/skate-game/src/skate_audio.rs`,
+`crates/skate-game/src/audio_check_main.rs`, `crates/skate-data/src/audio/ffmpeg.rs`, and
+`scripts/Build.ps1`. No commit has been made. The attempted `skate3rust` development build was
+intentionally stopped before launch when the planning handoff was requested.

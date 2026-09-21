@@ -107,7 +107,10 @@ fn update(
     replay: Res<crate::replay::Replay>,
     mut audio: MessageWriter<SessionMarkerAudio>,
 ) {
-    if vehicles.occupied() {session.blocked_until_release = true;return;}
+    if vehicles.occupied() {
+        session.blocked_until_release = true;
+        return;
+    }
     if replay.active {
         return;
     }

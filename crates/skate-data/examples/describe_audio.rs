@@ -30,7 +30,10 @@ fn main() {
                 for (name, info) in &streams {
                     println!(
                         "  {name:<40} {:?} {} Hz {}ch {} contexts {:.2}s",
-                        info.codec, info.sample_rate, info.channels, info.contexts,
+                        info.codec,
+                        info.sample_rate,
+                        info.channels,
+                        info.contexts,
                         info.duration_secs()
                     );
                     total += 1;
@@ -39,7 +42,10 @@ fn main() {
             }
             Ok(Container::SubSounds(members)) => {
                 let subs: usize = members.iter().map(|(_, v)| v.len()).sum();
-                println!("{path}: {} .sth member(s), {subs} sub-sound(s)", members.len());
+                println!(
+                    "{path}: {} .sth member(s), {subs} sub-sound(s)",
+                    members.len()
+                );
                 for (name, infos) in members.iter().take(3) {
                     let first = infos.first();
                     println!(
@@ -48,7 +54,10 @@ fn main() {
                         match first {
                             Some(i) => format!(
                                 " e.g. {:?} {} Hz {}ch {:.2}s",
-                                i.codec, i.sample_rate, i.channels, i.duration_secs()
+                                i.codec,
+                                i.sample_rate,
+                                i.channels,
+                                i.duration_secs()
                             ),
                             None => String::new(),
                         }
@@ -64,9 +73,17 @@ fn main() {
                     .map(|i| i.duration_secs())
                     .sum::<f64>();
             }
-            Ok(Container::Music { segments, num_samples, streams }) => {
+            Ok(Container::Music {
+                segments,
+                num_samples,
+                streams,
+            }) => {
                 let rate = streams.first().map_or(0, |s| s.sample_rate);
-                let secs = if rate == 0 { 0.0 } else { num_samples as f64 / f64::from(rate) };
+                let secs = if rate == 0 {
+                    0.0
+                } else {
+                    num_samples as f64 / f64::from(rate)
+                };
                 println!("{path}: music, {segments} segment(s), {num_samples} samples, {secs:.1}s");
                 for info in streams.iter().take(2) {
                     println!(
@@ -84,8 +101,7 @@ fn main() {
                 );
             }
             Ok(Container::Banks { kinds }) => {
-                let listed: Vec<String> =
-                    kinds.iter().map(|(k, n)| format!("{n} .{k}")).collect();
+                let listed: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} .{k}")).collect();
                 println!("{path}: banks, not decoded ({})", listed.join(", "));
             }
             Err(e) => println!("{path}: no audio ({e})"),
