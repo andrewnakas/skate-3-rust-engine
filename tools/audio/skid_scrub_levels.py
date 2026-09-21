@@ -82,7 +82,11 @@ def main() -> int:
         "\nretail reference (probe sessions play1/play2/play4):\n"
         "  over 0.25 m/s: 16.4% / ~10% / ~6%\n"
         "  over 0.75 m/s:  8.7% /   4% /   2%\n"
-        "This engine measured 1.40% and 0.37% on 2026-09-21 -- the board does not scrub sideways."
+        "\nCOMPARE LIKE WITH LIKE. Those retail traces are busy play sessions. Two runs of this\n"
+        "engine on 2026-09-21 gave 1.5%/0.4% (casual rolling) and 25.1%/12.0% (deliberate\n"
+        "scrubbing) -- a 30x spread from playstyle alone, wider than any plausible physics\n"
+        "deviation. One session proves nothing: match what the rider was doing, or condition the\n"
+        "distribution on speed and turn input."
     )
     return 0
 
