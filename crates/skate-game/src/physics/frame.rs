@@ -352,7 +352,15 @@ pub(super) fn advance(
         dt: simulation.time_step,
         category: filtered.map_or(Default::default(), |f| f.category),
         state: skater.player_state.current() as u32,
-        descriptor: score.trick_names.first.or_else(|| score.grab.map(|g| g.0)),
+        // `ScoringHandPlants` (82BBF758) selects a handplant's name the same way
+        // `ScoringGrabs` (82BBEF60) selects a grab's, directional variants and all, and
+        // publishes it to `score_packet.handplant` -- where nothing read it, so a handplant
+        // reached the scorer with no descriptor at all and could never be named or credited.
+        descriptor: score
+            .trick_names
+            .first
+            .or_else(|| score.grab.map(|g| g.0))
+            .or_else(|| score.handplant.map(|h| h.0)),
         grind_id: filtered.map_or(-1, |f| f.grind.scorable_id),
         flags: score.flags,
         position: [position.x, position.y, position.z],

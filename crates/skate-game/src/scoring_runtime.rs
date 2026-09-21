@@ -245,6 +245,10 @@ pub(crate) struct Runtime {
     pub new_trick: bool,
     pub modified_trick: bool,
     pub close_tricks: bool,
+    /// The spin and flip the display last had, `M+12` and `M+16` in 825E4F40. Those two
+    /// fields, and only those two, are what mark the trick name dirty.
+    published_spin_turns: i32,
+    published_flip_direction: i32,
     /// The multiplier this runtime last reported, `52(r31)` in 82666BC0.
     published_multiplier: f32,
     /// Set for the one tick on which the published sequence multiplier changed, to the value
@@ -294,6 +298,8 @@ impl Runtime {
             new_trick: false,
             modified_trick: false,
             close_tricks: false,
+            published_spin_turns: 0,
+            published_flip_direction: 0,
             published_multiplier: 1.,
             multiplier_changed: None,
         })
@@ -1069,10 +1075,18 @@ impl Runtime {
         // Without that the HUD keeps whatever was composed at announcement, so a 540 that
         // finished turning after the trick was named still read as its bare label -- which
         // is exactly what a playtest showed: 1 of 118 published names carried a spin.
-        if composed != self.trick_name {
-            self.trick_name = composed;
+        self.trick_name = composed;
+        // 825E4F40 compares M+12 and M+16 against the module's cached copies and sets the
+        // dirty byte 159 only when one of those two differs; 825E51A0 then recomposes and
+        // re-fires the display event. Firing on any change to the whole composed string
+        // also caught switch-parity flips, which re-triggered the display for no reason.
+        if self.spin_turns != self.published_spin_turns
+            || self.flip_direction != self.published_flip_direction
+        {
             self.modified_trick = true;
         }
+        self.published_spin_turns = self.spin_turns;
+        self.published_flip_direction = self.flip_direction;
         Ok(())
     }
 }
