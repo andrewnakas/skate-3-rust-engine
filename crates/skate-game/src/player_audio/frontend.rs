@@ -208,4 +208,56 @@ mod tests {
             );
         }
     }
+
+    /// Dump every member of the three containers, to see what actually plays.
+    ///
+    ///     cargo test -p skate-game --bin skate3rust -- --ignored dump_session_marker_members --nocapture
+    #[test]
+    #[ignore = "needs the owner's assets"]
+    fn dump_session_marker_members() {
+        use skate_audio_core::authored::oneshot::Rand;
+        use skate_data::audio::splice::{SpliceBanks, SpliceState};
+        let assets =
+            std::path::Path::new("C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets");
+        let vault = Collections::load(assets).expect("vault");
+        let sounds = FrontEndSounds::load(&vault);
+        let bank = skate_data::audio::catalog::MENU_BANK;
+        let banks = SpliceBanks::load(
+            &assets.join("private/stock/data/audio/audiofiles.big"),
+            &[bank],
+            &[bank],
+        )
+        .expect("bank");
+        for sound in [FrontEndSound::PlaceMarker, FrontEndSound::GotoMarker] {
+            let voice = sounds.voice(sound).expect("resolved");
+            // Resolve several times: a Splice container can be a random one-of, in which case the
+            // membership changes between passes and playing "all members" would be wrong.
+            for pass in 0..4 {
+                let mut state = SpliceState::default();
+                let mut rand = Rand::new(pass + 1);
+                let members = banks
+                    .resolve(bank, voice.sample, &mut state, &mut rand)
+                    .expect("resolve");
+                let summary: Vec<String> = members
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "rec{} s{:#x} off{:#x} gain{:.2} pitch{:.2} delay{:.3} pan{:.0}",
+                            m.record,
+                            m.sample,
+                            m.stream_offset,
+                            m.values.gain,
+                            m.values.pitch,
+                            m.values.delay,
+                            m.pan
+                        )
+                    })
+                    .collect();
+                println!("{sound:?} pass{pass}: {} member(s)", members.len());
+                for line in summary {
+                    println!("    {line}");
+                }
+            }
+        }
+    }
 }

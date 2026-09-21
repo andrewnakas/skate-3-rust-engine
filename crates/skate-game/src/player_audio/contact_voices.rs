@@ -1011,9 +1011,11 @@ impl ContactVoicePlayer {
     /// engine has a front end.
     ///
     /// The session marker's three sounds live in `sk8_menu.bnk` and resolve exactly like a
-    /// collision sample, so they take the same Splice path. They are 2D — centre pan, no
-    /// spatialisation — because a front-end sound has no position; retail's own FE manager mixes
-    /// them the same way.
+    /// collision sample, so they take the same Splice path, including each member's **authored
+    /// pan**. These containers are panned deliberately — the "go" layers sit at −15, −15, −15 and
+    /// −5 degrees — and centring them collapsed that spread, which is what "the go-to marker
+    /// didn't have the static" was. A front-end sound having no world position does not make it
+    /// mono: the pan is part of the authored mix here exactly as it is for a collision voice.
     pub(crate) fn play_frontend(
         &mut self,
         runtime: &mut AuthoredRuntime,
@@ -1041,10 +1043,18 @@ impl ContactVoicePlayer {
             return;
         };
         self.report(&format!(
-            "front-end voice {sound:?} {bank} #{:#x} -> {} member(s) at gain x{:.3}",
+            "front-end voice {sound:?} {bank} #{:#x} -> {} member(s) at gain x{:.3} [{}]",
             voice.sample,
             members.len(),
             voice.gain,
+            members
+                .iter()
+                .map(|m| format!(
+                    "s{:#x}@{:.3}s pan{:.0} g{:.2}",
+                    m.sample, m.values.delay, m.pan, m.values.gain
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
         ));
         for member in members {
             match runtime.play_oneshot(&OneshotVoice {
@@ -1052,7 +1062,7 @@ impl ContactVoicePlayer {
                 gain: member.values.gain * voice.gain,
                 pitch: member.values.pitch,
                 delay: member.values.delay,
-                pan: 0.0,
+                pan: member.pan,
                 bus: OneshotBus::Default,
             }) {
                 // Held for the same reason the collision voices are: a delayed member that loses
