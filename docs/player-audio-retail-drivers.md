@@ -743,9 +743,14 @@ else                          -> 0, window ([+12], [+8])
 ```
 
 The offset-to-field mapping is *derived*, not assumed: the four values must form three contiguous
-ascending bands, and that holds for **all 45 records of the class with zero violations**. 85
-materials inherit the set through `parent`, 18 point at `default` explicitly, and 6 materials
-(including 97 head and 98 torso) have no material record at all and so take the default.
+ascending bands, and that holds for **all 45 records of the class with zero violations**. Asserted
+against the owner's real vault for all 143 materials by
+`the_vault_impact_bands_tile_for_every_material`, which also shows five distinct floors across the
+table — the thresholds really are per-material.
+
+Note the JSON export under `assets/private/stock/skater-collections.json` is missing records 77,
+87, 92, 97 and 98 that the vault itself has, so read the vault (`Collections::load`), not the
+export, when checking this.
 
 The `.rdata` key table `sub_82497088` indexes (`0x8302D6F0`, 16-byte stride, material → vault key)
 was read from a decrypted image dump and **matches `MATERIAL_VAULT_KEY` for all 143 materials with

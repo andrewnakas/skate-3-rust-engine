@@ -28,7 +28,7 @@ use skate_data::collections::Collections;
 
 use super::audio_state::AudioState;
 use super::collision_states::{
-    CollisionMaterials, CollisionSample, CollisionStates, ContactMessage,
+    CollisionMaterials, CollisionSample, CollisionStates, ContactMessage, NO_MATERIAL, NO_TIER,
 };
 use super::components::contacts::{ContactSound, ContactVoices, SurfaceMap, VoiceRequest};
 
@@ -270,7 +270,36 @@ pub(crate) struct ContactVoicePlayer {
     /// here and freed when they finish. They must be ticked: `tick_oneshot` is what *opens* a
     /// voice whose Splice member carries a delay, and what releases one that has run out.
     collision_live: Vec<OneshotHandle>,
+    /// `sub_824BC188`'s per-region re-trigger cooldown, `obj+260+4i`. A region that has just
+    /// sounded will not sound again until this runs back down, which is what stops a body held
+    /// against a wall from firing an impact every frame.
+    body_cooldown: [f32; BODY_REGIONS],
+    /// `SKATE_AUDIO_BODY_IMPACT=0` silences the body impacts again.
+    body_impact_enabled: bool,
 }
+
+/// `sub_824BC188` walks six of the eight contact regions (`cmpwi cr6,r17,6`).
+const BODY_REGIONS: usize = 6;
+
+/// `sub_824BCBA0`: the three body-part materials a contact region carries.
+///
+/// The ids are confirmed twice: from this switch in the lifted code, and independently by hashing
+/// `tools/asset_pipeline/names.txt` against `MATERIAL_VAULT_KEY`, which names 97 `head`,
+/// 98 `torso`, 99 `leg`, 100 `arm`, 107 `skin`, 108 `denim`, 109 `cotton`. Region 0 is the head,
+/// and `+593` is its face sub-flag; its second material is left at retail's "none".
+fn body_region_materials(region: usize, face: bool) -> (i32, i32, i32) {
+    match region {
+        0 => (97, NO_MATERIAL, if face { 112 } else { 110 }),
+        1 => (98, 109, 110),
+        2 | 3 => (100, 107, 111),
+        _ => (99, 108, 111),
+    }
+}
+
+/// The cooldown a region takes after it sounds, in frames: Int32 `0x0F` from the Contacts tuning
+/// class `6EBA5BCD3E38A98A`, field `6DD85F43C1B6E6AA`. Retail counts it down by the audio state's
+/// time scale (`+220`), which is 1.0 whenever the game is not in slow motion.
+const BODY_IMPACT_RETRIGGER: f32 = 15.0;
 
 impl ContactVoicePlayer {
     pub(crate) fn new(
@@ -341,7 +370,151 @@ impl ContactVoicePlayer {
             landing_collision_enabled: std::env::var("SKATE_AUDIO_LANDING_COLLISION")
                 .map_or(true, |v| v != "0"),
             pops_send: None,
+            body_cooldown: [0.0; BODY_REGIONS],
+            body_impact_enabled: std::env::var("SKATE_AUDIO_BODY_IMPACT")
+                .map_or(true, |v| v != "0"),
         })
+    }
+
+    /// `sub_824BC188`: the body-contact region loop, the sound a body makes hitting something.
+    ///
+    /// This is the on-board path — it runs while riding, and `+676` (bailing) only *modifies* it.
+    /// `sub_824E3BE0` is the ragdoll counterpart and is a separate, still unported routine, so a
+    /// bail's own body impacts do not come through here.
+    ///
+    /// Ported: the six-region walk, the impact and cooldown gates, `sub_824BCBA0`'s region to
+    /// body-part material map, the world material from `+560`, `sub_82497088`'s band and window,
+    /// and the first of retail's five contact-sound calls.
+    ///
+    /// **Not ported**, and labelled as missing rather than approximated: retail's four further
+    /// layers per region (a detail layer, then three body-only layers using the second and third
+    /// materials against 143), `sub_824BCEB0`'s one-shot accent, and the `+592`/`+596`/`+600`
+    /// latches, which only feed the bail path.
+    fn body_impacts(
+        &mut self,
+        runtime: &mut AuthoredRuntime,
+        audio: &AudioState,
+    ) -> Result<(), String> {
+        if !self.body_impact_enabled {
+            return Ok(());
+        }
+        for region in 0..BODY_REGIONS {
+            // `lfsx f31,r9,r10` then `fcmpu`/`ble`: a region with no impact this frame is skipped,
+            // and so is one whose cooldown has not run down (`lfsx f0,r30,r31`, `bgt`).
+            let impact = audio.body_impact_496[region];
+            if !(impact > 0.0) || self.body_cooldown[region] > 0.0 {
+                continue;
+            }
+            // `lwzx` at `+560`, then `addi r11,r11,-1` and the 0..=143 clamp; retail's "none".
+            let raw = audio.body_material_560[region] as i32;
+            let world = match raw {
+                0 => NO_MATERIAL,
+                raw => {
+                    let value = raw - 1;
+                    if (0..=143).contains(&value) {
+                        value
+                    } else {
+                        NO_MATERIAL
+                    }
+                }
+            };
+            let (body, _second, _third) = body_region_materials(region, audio.face_contact_593);
+            if self.post_body_impact(runtime, body, world, impact)? {
+                self.body_cooldown[region] = BODY_IMPACT_RETRIGGER;
+            }
+        }
+        // `lfs f0,220(r10)`: the countdown runs on the audio state's time scale.
+        for cooldown in &mut self.body_cooldown {
+            *cooldown = (*cooldown - audio.time_scale_220).max(0.0);
+        }
+        Ok(())
+    }
+
+    /// The first of `sub_824BC188`'s five `sub_82486EF0` calls: the body part against the surface
+    /// it hit. Returns whether anything was posted, which is what arms the region's cooldown.
+    fn post_body_impact(
+        &mut self,
+        runtime: &mut AuthoredRuntime,
+        body: i32,
+        world: i32,
+        impact: f32,
+    ) -> Result<bool, String> {
+        // `sub_82497088` twice, once per side. Retail drops the contact only when *both* sides
+        // come back category 3 (`cmpwi cr6,r20,3` / `cmpwi cr6,r26,3`).
+        let band_a = self.collision_materials.impact_band(body, impact);
+        let band_b = self.collision_materials.impact_band(world, impact);
+        if band_a.is_none() && band_b.is_none() {
+            return Ok(false);
+        }
+        let level = |materials: &CollisionMaterials,
+                     surfaces: &SurfaceMap,
+                     material: i32,
+                     other: i32,
+                     band: Option<(i32, f32, f32)>| {
+            let Some((tier, lo, hi)) = band else {
+                return (NO_TIER, 0);
+            };
+            (
+                tier,
+                materials.contact_level(material, other, tier, lo, hi, impact, surfaces),
+            )
+        };
+        let (tier_a, level_a) = level(
+            &self.collision_materials,
+            &self.surfaces,
+            body,
+            world,
+            band_a,
+        );
+        let (tier_b, level_b) = level(
+            &self.collision_materials,
+            &self.surfaces,
+            world,
+            body,
+            band_b,
+        );
+        let message = ContactMessage {
+            material_a: body,
+            material_b: world,
+            tier_a,
+            tier_b,
+            level_a,
+            level_b,
+            ..ContactMessage::default()
+        };
+        let slot = self.collision.post(message, &self.collision_materials);
+        let started = self.collision.slots()[slot].started;
+        self.report(&format!(
+            "BodyImpact posted a={body} b={world} tier={tier_a}/{tier_b} \
+             level={level_a}/{level_b} -> slot {slot} started={started:?}"
+        ));
+        let mut played = false;
+        for record in 0..2 {
+            if !started[record] {
+                continue;
+            }
+            let other = self
+                .collision_materials
+                .other_class(message.material(1 - record), &self.surfaces);
+            let Some(sample) = self.collision_materials.sample(
+                message.material(record),
+                other,
+                message.tier(record),
+            ) else {
+                continue;
+            };
+            let record_level = if record == 0 { level_a } else { level_b };
+            let category = self.collision_materials.category(message.material(record));
+            self.play_collision(
+                runtime,
+                &sample,
+                record_level,
+                collision_controller_scale(category),
+                1.0,
+            );
+            played = true;
+        }
+        Ok(played)
     }
 
     /// Open everything the component recorded this frame, free what it released, and advance the
@@ -353,6 +526,9 @@ impl ContactVoicePlayer {
         audio: &AudioState,
         dt: f32,
     ) -> Result<(), String> {
+        // `sub_824B8218` runs the body-contact loop in its own chain, not off a queued request:
+        // the regions are read straight from the audio state every frame.
+        self.body_impacts(runtime, audio)?;
         let (queued, freed) = {
             let mut voices = shared.0.borrow_mut();
             (

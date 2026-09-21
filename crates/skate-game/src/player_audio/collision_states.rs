@@ -99,6 +99,47 @@ const FULL_SCALE: u32 = 32_767;
 const MATERIAL_CLASS: &str = "Hash_D40CB4C0FFE45676";
 const MATERIAL_CATEGORY_FIELD: &str = "Hash_D5EF686287A57AFE";
 
+/// `sub_82497088`'s own RefSpec on the material record, and the class it points at.
+const MATERIAL_IMPACT_REFSPEC: &str = "Hash_F64F891C312EFD5E";
+const IMPACT_CLASS: &str = "Hash_7DAFF70B3A91CD5D";
+
+/// The four floats of an impact record, **in native offset order** `+0`, `+4`, `+8`, `+12`.
+///
+/// `sub_82497088` reads them by offset, not by name, so the mapping had to be recovered. It is
+/// derived rather than assumed: the three bands below are contiguous and ascending, which forces
+/// the order, and that holds for all 45 records of the class with no violations. The defaults are
+/// `+12` 0.005, `+8` 0.5, `+0` 1.0, `+4` 2.0.
+const IMPACT_FIELDS: [&str; 4] = [
+    "Hash_C8DED1BC20B9D6A5", // +0  band 1/2 split
+    "Hash_B8870D2001033E0F", // +4  ceiling
+    "Hash_7D8DEDD338D45482", // +8  band 0/1 split
+    "Hash_D660AC459139BDF4", // +12 floor; below it the contact is silent
+];
+
+/// One material's impact bands, `sub_82497088`'s record.
+#[derive(Clone, Copy, Debug)]
+struct ImpactBands {
+    /// `[+12]`, `[+8]`, `[+0]`, `[+4]` in ascending order.
+    floor: f32,
+    mid: f32,
+    high: f32,
+    ceiling: f32,
+}
+
+impl Default for ImpactBands {
+    /// Class `7DAFF70B3A91CD5D`'s own `default` record, used only when a material's RefSpec does
+    /// not resolve. Against the owner's real vault every one of the 143 materials resolves, with
+    /// five distinct floors across the table — see `the_vault_impact_bands_tile_for_every_material`.
+    fn default() -> Self {
+        Self {
+            floor: 0.005,
+            mid: 0.5,
+            high: 1.0,
+            ceiling: 2.0,
+        }
+    }
+}
+
 /// The controller key of one collision slot. `sub_828DEA00` packs a component's key as
 /// `0x40000000 | category << 16 | index << 11 | kind << 4`; collision is category 3, kind 0, so
 /// the ten slots are `40030000`, `40030800`, … `40034800` — which is exactly what the retail
@@ -202,6 +243,8 @@ struct MaterialEntry {
     /// Whether the RefSpec resolved at all; when it did not, retail reads its zeroed default
     /// record and every window is `(0, 0)`, which makes the level 0 and suppresses the contact.
     pairs_resolved: bool,
+    /// `sub_82497088`'s four impact thresholds.
+    bands: ImpactBands,
     /// `tier == 2`.
     tier_two: u16,
     /// `tier == 0`, by the paired material's class.
@@ -253,7 +296,9 @@ impl CollisionMaterials {
         let level = word(MATERIAL_LEVEL_FIELD).min(FULL_SCALE);
         let sample = |name: &str| u16::try_from(word(name)).unwrap_or(0);
         let (pairs, pairs_resolved) = Self::level_pairs(vault, &key);
+        let bands = Self::impact_bands(vault, &key);
         MaterialEntry {
+            bands,
             level,
             pairs,
             pairs_resolved,
@@ -292,6 +337,59 @@ impl CollisionMaterials {
             }
         }
         (pairs, resolved)
+    }
+
+    /// Follow the material's second RefSpec to its `7DAFF70B3A91CD5D` record, `sub_82497088`'s
+    /// thresholds. A material with no record of its own keeps the class default, which is what
+    /// retail's own lookup returns for it.
+    fn impact_bands(vault: &Collections, material_key: &str) -> ImpactBands {
+        let Ok(spec) = vault.field(MATERIAL_CLASS, material_key, MATERIAL_IMPACT_REFSPEC) else {
+            return ImpactBands::default();
+        };
+        let data = spec.data.trim();
+        if data.len() < 32 {
+            return ImpactBands::default();
+        }
+        // The payload is `class (8 bytes) | key (8 bytes) | padding`, as `level_pairs` reads it.
+        let key = format!("Hash_{}", &data[16..32]);
+        let read = |name: &str| -> Option<f32> {
+            let field = vault.field(IMPACT_CLASS, &key, name).ok()?;
+            u32::from_str_radix(field.data.trim(), 16)
+                .ok()
+                .map(f32::from_bits)
+        };
+        let [high, ceiling, mid, floor] = IMPACT_FIELDS.map(read);
+        match (floor, mid, high, ceiling) {
+            (Some(floor), Some(mid), Some(high), Some(ceiling)) => ImpactBands {
+                floor,
+                mid,
+                high,
+                ceiling,
+            },
+            _ => ImpactBands::default(),
+        }
+    }
+
+    /// `sub_82497088`: which band an impact falls in, and the window that band interpolates over.
+    ///
+    /// `None` is retail's category 3 — the impact is under the material's floor and makes no
+    /// sound at all. Otherwise the band doubles as `contact_level`'s `tier`, which is why that
+    /// function already takes one.
+    pub(crate) fn impact_band(&self, material: i32, impact: f32) -> Option<(i32, f32, f32)> {
+        let bands = usize::try_from(material)
+            .ok()
+            .and_then(|m| self.entries.get(m))
+            .map_or_else(ImpactBands::default, |entry| entry.bands);
+        if impact < bands.floor {
+            return None;
+        }
+        Some(if impact > bands.high {
+            (2, bands.high, bands.ceiling)
+        } else if impact > bands.mid {
+            (1, bands.mid, bands.high)
+        } else {
+            (0, bands.floor, bands.mid)
+        })
     }
 
     /// `sub_82496C58`: the `0..=32767` level a contact between `material` and `other` carries.
@@ -1025,5 +1123,72 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(mine, vec![(key, GATE_INPUT, 0), (key, WEIGHT_INPUT, 0)]);
+    }
+
+    /// `sub_82497088`'s three bands, against class `7DAFF70B3A91CD5D`'s own `default` record
+    /// (floor 0.005, mid 0.5, high 1.0, ceiling 2.0), the record used when a RefSpec does not
+    /// resolve.
+    ///
+    /// The bands must be contiguous and ascending, because that property is what fixed the
+    /// offset-to-field mapping in the first place.
+    #[test]
+    fn an_impact_chooses_the_band_and_window_sub_82497088_would() {
+        let materials = CollisionMaterials::from_categories([0; MATERIAL_COUNT]);
+        // Under the floor retail returns category 3, and the contact makes no sound at all.
+        assert_eq!(materials.impact_band(0, 0.004), None);
+        // The floor itself is not silent: the test is `impact < floor`, not `<=`.
+        assert_eq!(materials.impact_band(0, 0.005), Some((0, 0.005, 0.5)));
+        assert_eq!(materials.impact_band(0, 0.2), Some((0, 0.005, 0.5)));
+        assert_eq!(materials.impact_band(0, 0.75), Some((1, 0.5, 1.0)));
+        assert_eq!(materials.impact_band(0, 1.5), Some((2, 1.0, 2.0)));
+        // Both splits are strict `>`, so a value sitting exactly on one stays in the lower band.
+        assert_eq!(materials.impact_band(0, 0.5), Some((0, 0.005, 0.5)));
+        assert_eq!(materials.impact_band(0, 1.0), Some((1, 0.5, 1.0)));
+        // A material off the end of the table still answers, from the same default record.
+        assert_eq!(materials.impact_band(NO_MATERIAL, 0.75), Some((1, 0.5, 1.0)));
+        // The windows tile the range with no gap and no overlap.
+        let bands: Vec<_> = [0.1, 0.75, 1.5]
+            .iter()
+            .map(|v| materials.impact_band(0, *v).expect("above the floor"))
+            .collect();
+        assert_eq!(bands[0].2, bands[1].1);
+        assert_eq!(bands[1].2, bands[2].1);
+    }
+
+    /// Pins `sub_82497088`'s four thresholds against the owner's real vault.
+    ///
+    /// The offset-to-field mapping in [`IMPACT_FIELDS`] was recovered from the *structure* of the
+    /// data — the three bands must tile ascending with no gap — so this is the assertion that
+    /// keeps it honest against every material rather than against the one default record.
+    ///
+    ///     cargo test -p skate-game --bin skate3rust -- --ignored the_vault_impact_bands --nocapture
+    #[test]
+    #[ignore = "needs the owner's assets"]
+    fn the_vault_impact_bands_tile_for_every_material() {
+        let assets =
+            std::path::Path::new("C:/s3/installations/70eda9dc4644496d81ae73af95ff4285/assets");
+        let vault = Collections::load(assets).expect("vault");
+        let (materials, _) = CollisionMaterials::load(&vault);
+        let mut distinct = std::collections::BTreeSet::new();
+        for material in 0..MATERIAL_COUNT as i32 {
+            let bands = materials.entries[material as usize].bands;
+            assert!(
+                bands.floor < bands.mid && bands.mid < bands.high && bands.high <= bands.ceiling,
+                "material {material} bands do not tile: {bands:?}"
+            );
+            // Just above the floor is band 0, and the top band must reach the ceiling.
+            assert_eq!(materials.impact_band(material, bands.floor).map(|b| b.0), Some(0));
+            assert_eq!(materials.impact_band(material, bands.ceiling).map(|b| b.0), Some(2));
+            assert_eq!(materials.impact_band(material, bands.floor * 0.5), None);
+            distinct.insert(bands.floor.to_bits());
+        }
+        // The body parts the on-board impact uses must all answer.
+        for body in [97, 98, 99, 100, 107, 108, 109, 110, 111, 112] {
+            assert!(
+                materials.impact_band(body, 1.0).is_some(),
+                "body material {body} has no impact band at all"
+            );
+        }
+        println!("distinct impact floors across 143 materials: {}", distinct.len());
     }
 }
