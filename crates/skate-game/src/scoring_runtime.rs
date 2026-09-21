@@ -40,6 +40,8 @@ pub(crate) struct Frame {
     pub fakie: bool,
     pub nollie: bool,
     pub body_flip: bool,
+    /// Air 445. Selects the flip's direction; see [`Runtime::flip_direction`].
+    pub body_flip_side: bool,
     pub suspend_air: bool,
     pub landing: skate_core::animation::landing_quality::Output,
     pub teleported: bool,
@@ -64,6 +66,16 @@ pub(crate) struct Runtime {
     air_repetition_set: bool,
     grab_chain: u32,
     air_metrics: [f32; 5],
+    /// 82DA8BE0's +2344: the air's rotation quantised to whole half-turns and signed by
+    /// its direction. The reward uses only its magnitude; the sign is for the trick name.
+    pub spin_turns: i32,
+    /// 82DA8EB8's +2348: `0` until a body flip is credited, then `+1` or `-1` for its
+    /// side. Retail writes it only while an announced grab carrier is current, so an
+    /// ungrabbed flip earns no flip reward -- but it is still *named* as a flip.
+    pub flip_direction: i32,
+    /// 82DA8EB8's +2396 latch, which is also scoring output byte 14651: a body flip
+    /// happened during this air, whatever the carrier was.
+    pub flip_seen: bool,
     landing_countdown: u32,
     idle_ticks: u32,
     collector_ticks: u32,
@@ -106,6 +118,9 @@ impl Runtime {
             air_repetition_set: false,
             grab_chain: 0,
             air_metrics: [0.; 5],
+            spin_turns: 0,
+            flip_direction: 0,
+            flip_seen: false,
             landing_countdown: 0,
             idle_ticks: 0,
             collector_ticks: 0,
@@ -424,6 +439,9 @@ impl Runtime {
             self.spin = 0.;
             self.previous_heading = f.forward[0].atan2(f.forward[2]);
             self.air_metrics = [0.; 5];
+            self.spin_turns = 0;
+            self.flip_direction = 0;
+            self.flip_seen = false;
             self.air_repetition = 1.;
             self.air_repetition_set = false;
             self.air_factor = 1.;
@@ -529,16 +547,31 @@ impl Runtime {
                 .collector
                 .curve(0x320, f.position[1] - self.start[1])
                 * scale;
+            // 82DA8BE0 signs the turn count by the rotation's own direction and keeps it
+            // at +2344; the reward takes its magnitude.
+            let degrees = self.spin.to_degrees();
             let turns =
-                ((self.spin.to_degrees().abs() + self.data.collector.scalar(0x63c)) / 180.) as i32;
-            self.air_metrics[3] = self.data.collector.curve(0x370, (turns * 180) as f32) * scale;
-            if f.body_flip
-                && self.carriers[0]
+                ((degrees.abs() + self.data.collector.scalar(0x63c)) / 180.) as i32;
+            self.spin_turns = if degrees < 0. { -turns } else { turns };
+            self.air_metrics[3] =
+                self.data.collector.curve(0x370, (turns * 180) as f32) * scale;
+            // 82DA8EB8. The +2396 latch, and with it scoring output byte 14651, is set on
+            // the first flipping frame whatever the current carrier is -- that is what the
+            // trick display names a flip from. Only +2348, and so the reward, waits for an
+            // announced grab carrier.
+            if f.body_flip {
+                self.flip_seen = true;
+                if self.carriers[0]
                     .as_ref()
                     .is_some_and(|c| c.announced && c.scorable.class == 2)
-            {
-                self.air_metrics[4] = self.data.collector.scalar(0x640) * scale;
+                {
+                    self.flip_direction = if f.body_flip_side { -1 } else { 1 };
+                }
             }
+            // Recomputed from the latched +2348 every frame, flipping or not, so the
+            // reward survives the end of the grab that authorised it.
+            self.air_metrics[4] =
+                self.flip_direction.abs() as f32 * self.data.collector.scalar(0x640) * scale;
         }
         let active = self.carriers.iter().any(Option::is_some) || self.collector == Collector::Air;
         self.idle_ticks = if active {

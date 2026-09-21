@@ -155,7 +155,9 @@ pub(super) fn publish(physics: &mut GamePhysics, skater: &mut SkaterRuntime) -> 
             .selection()
             .is_some_and(|s| s.wall_ride),
     );
+    // 82DB6EC0 publishes 1596 and 1597 together as air 441 and 445.
     physical.air.flag_441 = u8::from(skater.air_reckoning.state.flip_active);
+    physical.air.flag_445 = u8::from(skater.air_reckoning.state.flip_side);
     if state == PhysicalStateId::GroundAnimation {
         skater.ground_animation.fill(p, &mut physical.air);
     }

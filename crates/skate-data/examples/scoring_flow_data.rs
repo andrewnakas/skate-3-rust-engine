@@ -36,6 +36,7 @@ fn frame(
         fakie: false,
         nollie: false,
         body_flip: false,
+        body_flip_side: false,
         suspend_air: false,
         landing: Default::default(),
         teleported: false,
