@@ -134,6 +134,14 @@ const CONTEXT_CURVES: [u16; 4] = [0x5a0, 0x500, 0x550, 0x4b0];
 /// `air_metric`, the scorable `82DA8550` banks the gap/context total under.
 const CONTEXT_METRIC: usize = 237;
 
+/// `Handplant_CLASS`, index 6 of the `*_CLASS` list at 82084A40.
+///
+/// This is the metadata table's **+16** field, which [`catalog::IDENTIFIERS`] carries as its
+/// third tuple element -- the one the port calls `score_type`. The +12 field it calls `class`
+/// is retail's score/display type. The two names are the wrong way round, which is how the
+/// Handplant and Offboard collectors came to be wired to each other's filters.
+const HANDPLANT_CLASS: usize = 6;
+
 /// `SKATE_SCORING_TRACE=1` prints what every air and every publication actually scored.
 ///
 /// A HUD total cannot say *which* contributor is missing, so this exists to make a
@@ -150,7 +158,7 @@ enum Collector {
     Air,
     Grind,
     Offboard,
-    Special,
+    Handplant,
 }
 pub(crate) struct Frame {
     pub tick: u32,
@@ -530,7 +538,7 @@ impl Runtime {
                 }
                 let curve = match self.collector {
                     Collector::Air if c.scorable.class == 2 => Some(0x460),
-                    Collector::Offboard => Some(0x140),
+                    Collector::Handplant => Some(0x140),
                     _ => None,
                 };
                 if let Some(curve) = curve {
@@ -689,7 +697,7 @@ impl Runtime {
             _ => Collector::None,
         };
         if f.state == 600 && matches!(next, Collector::Ground | Collector::Air) {
-            next = Collector::Special;
+            next = Collector::Handplant;
         }
         if next == Collector::Air
             && self.collector == Collector::Ground
@@ -871,8 +879,14 @@ impl Runtime {
             }
             Collector::Air => ids[0] = descriptor.filter(|d| d.2 != 5).map(|d| d.0),
             Collector::Grind => ids[0] = (f.grind_id >= 0).then_some(f.grind_id as usize),
-            Collector::Offboard => ids[0] = descriptor.filter(|d| d.2 == 6).map(|d| d.0),
-            Collector::Special => ids[0] = descriptor.filter(|d| d.0 == 234).map(|d| d.0),
+            // 82DABFB0, the Offboard collector: `lwz r4,52(r3)` / `cmpwi cr6,r4,234`.
+            // Retail also admits it from physical state 503, which is not ported.
+            Collector::Offboard => ids[0] = descriptor.filter(|d| d.0 == 234).map(|d| d.0),
+            // 82DABA10, the Handplant collector: `addi r9,r27,16` / `cmpwi cr6,r6,6`,
+            // i.e. any scorable whose class is Handplant_CLASS.
+            Collector::Handplant => {
+                ids[0] = descriptor.filter(|d| d.2 == HANDPLANT_CLASS).map(|d| d.0)
+            }
             Collector::None => {}
         }
         for (slot, id) in ids.into_iter().enumerate() {
@@ -971,7 +985,7 @@ impl Runtime {
         let scales = match self.collector {
             Collector::Air => (0x668, 0x664),
             Collector::Grind => (0x618, 0x614),
-            Collector::Offboard => (0x608, 0x604),
+            Collector::Handplant => (0x608, 0x604),
             _ => (0x610, 0x60c),
         };
         let line_scale = if active {

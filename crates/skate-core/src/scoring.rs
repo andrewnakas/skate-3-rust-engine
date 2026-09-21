@@ -15,8 +15,19 @@ pub mod timer;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scorable {
     pub id: usize,
-    /// Fixed metadata table +12. Distinct from the display type at +16.
+    /// Fixed metadata table **+12**, which retail treats as the score/display type.
+    ///
+    /// The two names here are the wrong way round against retail's own vocabulary, and
+    /// renaming them now would touch every collector, so the offsets are what to trust:
+    /// this is +12, read by CalcPointPenalty 82DA5D18 (`addi r7,r11,12`), the flip metric
+    /// 82DA8EB8 and the class-3 bonus 82DA93D8.
     pub class: u32,
+    /// Fixed metadata table **+16**, which is retail's *class* -- an index into the
+    /// `*_CLASS` list at 82084A40: `None, Air, Flip, FingerFlip, Grab, Grind, Handplant,
+    /// NoComply, Manual, Slide, HippyJump, Revert, Boneless, Footplant`.
+    ///
+    /// Read by the Grind collector 82DA9D68 (`== 5`) and the Handplant collector 82DABA10
+    /// (`== 6`), both via `addi r9,r27,16`.
     pub score_type: usize,
 }
 
