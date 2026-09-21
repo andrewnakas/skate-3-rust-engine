@@ -130,16 +130,42 @@ frames against the retail capture's `state.tsv`.
 `Brd_Squeaks.abk` on a different gate, but it is dead code — the struct is never constructed. It
 is not a confound.
 
-## 4. Bail / ragdoll native outputs are absent — **known gap**
+## 4. Bail / ragdoll native outputs — **was a gap; the outputs now exist, unverified by ear**
 
-The bail audio families (`c_cloth_falls`, `c_body_slide`, `c_board_slide`) are gated on engine
-outputs that do not exist: ragdoll body-part slide contacts, thrown/loose-board contact, and the
-bail flags and speeds (`+676`/`+677`, `+328`/`+672`). Per the project rule these families stay off
-and are reported rather than approximated, so **a bail is currently silent** beyond what other
-families happen to emit.
+This entry used to say the bail families were silent for want of engine outputs. That is no longer
+true, and the text stood long after the ports landed. What is actually there, re-checked
+2026-09-21:
 
-**Fixed when.** The engine publishes per-body-part ragdoll contacts and loose-board contact, at
-which point the three families can be driven from real inputs.
+- **Ragdoll contacts reach the audio state.** `sub_82BD60C8`'s per-region work is ported at
+  `crates/skate-game/src/physics/audio_observation.rs:135` (`body_contacts`), `sub_82773298` at
+  `player_audio/audio_state.rs:286` (`Conditioner::body_contacts`), and words **496–611** are
+  stored every frame at `audio_state.rs:798-806`.
+- **The speeds and flags exist**: `+328` (`audio_state.rs:822`), `+672` (`:797`), `+676`/`+677`
+  (`:830-831`), `+780` loose board (`:853`).
+- **The consumers are ported and registered.** `c_body_slide` and `c_cloth_falls` are in
+  `player_audio/components/clothing.rs`, wrapped on the `Clothing` component and registered at
+  `player_audio/sound.rs:454`. There is no env gate.
+- **The surface tag reaches them.** A contact's material rides word 23 of the narrow-phase row and
+  word 55 of the compiled one (`solver/contact_build/publication.rs:72-83`), which is what
+  `contact_feedback/spy.rs:43` reads; the 23→55 move is asserted whole-row by
+  `crates/skate-core/tests/physics_rebuild_contact_build.rs:63,83`. Both real map sources supply a
+  non-zero surface (`skate_world.rs:172` for RWCM, `:336` for portable `.skate`).
+
+**What is genuinely unresolved.** Nobody has heard a bail and checked it, and there was no way to:
+none of these fields appeared in any trace. The `BC` line added 2026-09-21 carries them, so the
+next playtest can answer the open questions instead of re-deriving them:
+
+1. Does `mat560` ever resolve? It is zero on the built-in test terrain (`physics/ground.rs:199`
+   authors material 0) and legitimately zero for body-vs-body contacts
+   (`solve/assembly_contacts.rs:108`), so an all-zero reading on a **stock map** would be the real
+   defect, and every body slide would take `body_contact`'s default type 2.
+2. Is `+328` right? The layout table (`player-audio-retail-drivers.md:74`) fixes the source as
+   `|Skeleton+288|` and the port reads it, but whether that offset is the part's *angular* or
+   *linear* velocity is not settled from the lifted C++. It drives `c_body_slide` w10 and
+   `c_cloth_falls` w3 directly, so it is worth settling before tuning either by ear.
+
+**Fixed when.** A playtest `BC` trace on a stock map shows `mat560` resolving, and the owner has
+A/B'd a bail against retail.
 
 ## 5. Surfaces are not implemented — **known, deliberate**
 

@@ -556,7 +556,7 @@ Corrections to §1: 615/616 = **Skeleton 600/601** (feet inside the deck box), n
 | 304 | B40+48 | `82772D30`: Ground+300 (jump strength) vs vault (+136 class, key `0x46875250BEE65CDB`) → 2/1/0 | jump bucket | `jump_strength` (Processed2624) |
 | 448–460 | B40+52..64 | `82772FD8`: per-wheel touchdown after > 5 air frames: clamp(−(prev wheel vel Motion+208+16i · wheel normal Coll+3376+16i)/K, 0, 1) | wheel impact | per-wheel velocity + normal |
 | 464–467 | B40+68..71 | `82772FD8` | per-wheel landed latch (cleared after > 5 air frames) | `collision.wheel_contact_3296_3299` |
-| 496–611 | B40+92..207 | `82773298`: Collision+80..195 (ragdoll contacts, `sub_82BD60C8`) | body contacts (528 slides, 560 materials, 592/593 flags) | missing: port `sub_82BD60C8` |
+| 496–611 | B40+92..207 | `82773298`: Collision+80..195 (ragdoll contacts, `sub_82BD60C8`) | body contacts (528 slides, 560 materials, 592/593 flags) | `audio_observation.rs:135` + `audio_state.rs:286`, stored `:798-806` |
 | 341 | B40 byte208 | State+12 == 400 or (State+16 == 701 && Grinds+323) | grinding | `state.category_12`, `state_16`, `grinds.flag_323` |
 | 740 | B40 211..213 | `827729B8`: 212 ? (211 ? 2 : 4) : 213 ? (211 ? 3 : 5) : 1 | step code | needs Skeleton+144/+160 + port |
 | 343 / 348 / 352 / 344 | B60+152 (EScorableID from `sub_82DA5AC8`; valid only with packet flags bit 24/25) | builder: trick name `*(0x820862A8 + 24·id + 20)`, key hash64(lowercase) (`sub_82B69B68`), collection `sub_82B69B08(0x6918469984A8C596, key)`, layout `sub_82B6CC78` offsets +164 → 348, +172 → 352, byte +176 → 344 | audio trick ids | `score_packet` → `scoring.data.by_name(..).metadata.id` + flags gate |
@@ -568,12 +568,12 @@ Corrections to §1: 615/616 = **Skeleton 600/601** (feet inside the deck box), n
 | 332 | Air byte438 | ProcessOutput: 200 ≤ state < 300 && Collision+0 == 0 | in known air | `state.state_16`, `collision.wheel_count_0` |
 | 768 | Air byte448; foot materials from Air+224 | FootPlant | footplant | `air.flag_448`, `footplant_surface_224` |
 | 760 / 764 | Air 451 / +228 | HandPlantManager +3056 / +3012 | handplant | missing |
-| 328 | \|Skeleton+288\| | ragdoll body velocity | body speed | missing |
-| 292 / 296 | \|Skeleton+324\| / \|Skeleton+308\| | ragdoll foot bodies (+1612 / +1996) | per-foot vertical speed | missing |
+| 328 | \|Skeleton+288\| | ragdoll body velocity | body speed | `audio_state.rs:822` (part 23 *angular* velocity; angular-vs-linear open, see defect #4) |
+| 292 / 296 | \|Skeleton+324\| / \|Skeleton+308\| | ragdoll foot bodies (+1612 / +1996) | per-foot vertical speed | `audio_state.rs:820-821` |
 | 268 / 272 | \|Skeleton+212\| / \|Skeleton+196\| | `82BF22A0` | local toe velocity Y | `foot_physical.output.local_velocity[1][1]` / `[0][1]` |
 | 280 / 276 | max xz | same | local toe velocity XZ | `local_velocity[0]` / `[1]` x, z |
 | 284 / 288 | max(\|224\|,\|232\|) / max(\|240\|,\|248\|) | same | world foot speed XZ | `foot_physical.output.world_velocity[0]` / `[1]` |
-| 672 | 0.25 × Σ limb speeds rel. COM | `82BE1AE8` | limb speed | missing |
+| 672 | 0.25 × Σ limb speeds rel. COM | `82BE1AE8` | limb speed | `audio_state.rs:797` |
 | 677 | Skeleton 599 | `82D3EEE8` | end of bail | `physical.skeleton.over_599` |
 | 615 / 616 | Skeleton 600 / 601 | `82BF22A0` | feet in deck box | `physical.skeleton.flag_600` / `flag_601` |
 | 620–632 | Coll 3440.. = tag & 0x7F | `82C079E0` | per-wheel material | `WheelLineState.audio_surfaces` |
