@@ -49,7 +49,23 @@ pub(super) fn advance(
         actor_query_56: 0,
         actor_query_44: 0,
         input_available,
-        transition_action: actions.value(71),
+        // Gameplay action **65**, left stick Y -- not 71, the right trigger.
+        //
+        // This is the "press up to fly out" input. Retail's store to Processed `+2636`
+        // (`sub_82DB4048`, the clamp at `0x82DB4330`) is fed by `bl 0x825903C8`, and
+        // `82590358`/`825903C8` are the stock cInputMap pair 64 and 65 -- so the transition input
+        // is 65. `GameplayActions::value` indexes `values[action - 64]`, where `values[1]` is
+        // `value(18) - value(19)` = left stick up minus down, and `values[7]` is the right
+        // trigger.
+        //
+        // It reaches `+2636`, then the air trajectory selector as `directional_input`, where it
+        // both tilts the launch (`launch.rs` `lean = clamp(input - 0.25, -1, 1)`) and casts the
+        // fly-out vote (`scoring.rs`, `input >= 0.5` scores surfaces past the lip, below it
+        // scores the transition face you came up). Reading the trigger instead left that vote
+        // permanently at 0, so every quarter pipe launched the skater out over the coping instead
+        // of arcing back into the ramp. Both the clamp to [-1, 1] and the `- 0.25` lean only make
+        // sense for a bipolar stick axis, never for a 0..1 trigger.
+        transition_action: actions.value(65),
         published_board_transform: if skater.player_input.physical.state.flag_61 != 0 {
             skater
                 .player_input
