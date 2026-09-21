@@ -75,6 +75,39 @@ const LANDING_SEND_MAXIMUM: f32 = 3650.0;
 /// recovered.
 const LANDING_TRIM: f32 = 0.274;
 
+/// `sub_824D20E8`'s Collision controller output for a material category, as a 0..1 scale.
+///
+/// Every contact voice is scaled by this (`sub_824D2318`): the category picks a Collision
+/// controller output (13,14,15,16,17,18,12,19,21,20 for categories 0..=9) and the voice's gain is
+/// that output times the message level times the material level. This port applied the two level
+/// terms and **not** this one, so a landing's collision voices played at full material level and
+/// drowned the class voice — which is why they were switched off.
+///
+/// **Measured, not read.** The `SFXObj_Collision` controllers exist in `MixMapSK8.mxb` with
+/// exactly these outputs, but their inputs are fed by the global mix controllers, which this
+/// engine does not drive: every one of these outputs reads 0 both in `collision_output_probe`
+/// and in the live runtime (`headless_collision_controller_outputs`). So these are the medians of
+/// what retail's own controllers read, over every recomp capture in `.local/captures` (about
+/// 19,000 reads at `824D21BC`), and they stand in until those inputs are driven:
+///
+/// | category | output | median | dB |
+/// |---|---|---|---|
+/// | 0 | 13 | 8869 | −11.4 |
+/// | 1 | 14 | 22153 | −3.4 |
+/// | 2 | 15 | 6079 | −14.6 |
+/// | 4 | 17 | 14669 | −7.0 |
+/// | 5 | 18 | 7923 | −12.3 |
+/// | 6 | 12 | 8126 | −12.1 |
+/// | 9 | 20 | 7913 | −12.3 |
+///
+/// Categories 3, 7 and 8 never came up in a capture; they take the median of the measured ones
+/// (7923) rather than full scale, which is the closest defensible value and still far from the
+/// 1.0 that was audibly wrong.
+fn collision_controller_scale(category: u8) -> f32 {
+    const MEASURED: [u32; 10] = [8869, 22153, 6079, 7923, 14669, 7923, 8126, 7923, 7923, 7913];
+    f32::from(MEASURED[usize::from(category).min(9)] as u16) / 32_767.0
+}
+
 /// Contacts output 15 — the landing voice's owner send — at each landing class, measured off the
 /// real MixMap under the retail pre-roll with controller input 2 held at retail's own words
 /// (0 / 16000 / 32767). A 3.0 dB spread, class 0 to class 2.
@@ -204,21 +237,14 @@ pub(crate) struct ContactVoicePlayer {
     pops_enabled: bool,
     /// Whether a landing also posts to the contact-sound manager (its two collision voices).
     ///
-    /// **Off by default, which is a deliberate deviation.** `sub_824BA630` does post, so retail
-    /// plays them — but their gain is `controllerOutput × messageLevel × materialLevel`
-    /// (`sub_824D2318`), the controller output coming from `sub_824D20E8`'s material-category
-    /// jump table, and this engine applies the two level terms and **not** the controller one.
-    /// The one-shot path has no per-frame gain update, and every one of those outputs reads 0 in
-    /// the only MixMap fixture there is, so the right value is not recoverable yet.
+    /// **On**, as `sub_824BA630` does. They were off while their gain was wrong: retail's is
+    /// `controllerOutput × messageLevel × materialLevel` (`sub_824D2318`) and this port applied
+    /// only the two level terms, so both voices played at full material level and drowned the
+    /// class voice — the owner A/B'd that and preferred them off ("low ollies still sound too
+    /// loud and different than retail"). [`collision_controller_scale`] now supplies the missing
+    /// term from retail's own captured controller reads, which is −11 dB on ordinary ground.
     ///
-    /// Played at full material level they swamp the class voice — measured, the class voice is
-    /// only ~5% of the landing peak, and the class step came out at +0.5 dB against retail's
-    /// +4.8. So the choice is between a voice at a knowingly wrong level and no voice, and the
-    /// owner A/B'd the two at the same trim: with them on, "low ollies still sound too loud and
-    /// different than retail"; with them off, "pretty close to correct".
-    ///
-    /// `SKATE_AUDIO_LANDING_COLLISION=1` restores them. **Delete this switch and default it back
-    /// on once the controller term is recovered** — that is the real fix, not this.
+    /// `SKATE_AUDIO_LANDING_COLLISION=0` switches them off again for an A/B.
     landing_collision_enabled: bool,
     /// The pops' owner-local six-channel send bus (`sub_82488DD0`), built on first use.
     pops_send: Option<u32>,
@@ -313,7 +339,7 @@ impl ContactVoicePlayer {
             reported: std::collections::HashSet::new(),
             pops_enabled: std::env::var("SKATE_AUDIO_CONTACT_POPS").map_or(true, |v| v != "0"),
             landing_collision_enabled: std::env::var("SKATE_AUDIO_LANDING_COLLISION")
-                .is_ok_and(|v| v == "1"),
+                .map_or(true, |v| v != "0"),
             pops_send: None,
         })
     }
@@ -572,7 +598,14 @@ impl ContactVoicePlayer {
             } else {
                 message.level_b
             };
-            self.play_collision(runtime, &sample, level, 1.0, 1.0);
+            let category = self.collision_materials.category(message.material(record));
+            self.play_collision(
+                runtime,
+                &sample,
+                level,
+                collision_controller_scale(category),
+                1.0,
+            );
         }
         Ok(())
     }
@@ -681,7 +714,14 @@ impl ContactVoicePlayer {
             } else {
                 message.level_b
             };
-            self.play_collision(runtime, &sample, level, 1.0, LANDING_TRIM);
+            let category = self.collision_materials.category(message.material(record));
+            self.play_collision(
+                runtime,
+                &sample,
+                level,
+                collision_controller_scale(category),
+                LANDING_TRIM,
+            );
         }
         Ok(())
     }
@@ -694,8 +734,8 @@ impl ContactVoicePlayer {
         runtime: &mut AuthoredRuntime,
         sample: &CollisionSample,
         contact_level: u32,
-        // `sub_824D20E8`'s output for this material's category, as a 0..1 scale. Not yet
-        // recoverable -- see `landing_collision_enabled` -- so callers pass 1.0 today.
+        // `sub_824D20E8`'s output for this material's category, as a 0..1 scale; see
+        // [`collision_controller_scale`].
         controller_scale: f32,
         // `LANDING_TRIM` when these two voices are part of a landing stack, 1.0 for a grind
         // onset — the grind's voice count did not change, so it keeps `CONTACT_TRIM` alone.

@@ -516,3 +516,53 @@ fn headless_replay_skid_from_trace() {
     }
     eprintln!("replayed skid posted at {posted_at} through {to}");
 }
+
+/// What do the `SFXObj_Collision` controllers actually output in the live runtime?
+///
+/// `sub_824D20E8` scales every contact voice by the Collision controller output for its material
+/// category (13,14,15,16,17,18,12,19,21,20 for categories 0..=9). A retail capture of a playtest
+/// reads those outputs at 660 / 455 / 14669 / 39 / 38 (outputs 12 / 13 / 17 / 18 / 20), i.e. -34
+/// to -59 dB except 17's -7 dB -- which is why a landing's two collision voices, played here at
+/// full material level, drowned the class voice. `collision_output_probe` reads zero for all of
+/// them, but it drives only the Contacts inputs; these controllers are fed by the global mix
+/// controllers, so this asks the question inside the runtime the game actually builds.
+#[test]
+#[ignore = "needs the owner's assets; run explicitly"]
+fn headless_collision_controller_outputs() {
+    use skate_audio_core::authored::PCM_FRAMES_PER_BLOCK;
+    let assets = std::env::var_os("SKATE_ASSETS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| DEFAULT_ASSETS.into());
+    let super::Prepared {
+        mut runtime,
+        mut sound,
+        ..
+    } = super::prepare(&assets).expect("prepare the retail player-sound worker");
+    let blocks_per_frame = 48_000.0 / f64::from(PCM_FRAMES_PER_BLOCK) / 60.0;
+    let mut owed = 0.0f64;
+    // Roll, hop, land: the landing is when these voices are opened.
+    let script: Vec<PlayerAudioObservation> = (0..60)
+        .map(|i| rolling(i, 5.0))
+        .chain((0..42).map(|i| airborne(60 + i, 5.0, i as f32 / 60.0, 1.2)))
+        .chain((0..60).map(|i| rolling(102 + i, 5.0)))
+        .collect();
+    for observation in &script {
+        sound.frame(&mut runtime, observation).expect("frame");
+        owed += blocks_per_frame;
+        while owed >= 1.0 {
+            owed -= 1.0;
+            runtime.pump_once().expect("render one block");
+        }
+    }
+    for instance in 0..3u32 {
+        let key = 0x4003_0000 + 0x800 * instance;
+        let Some(controller) = runtime.mixmap_controller(key) else {
+            eprintln!("SFXObj_Collision #{instance}: no controller {key:#010x}");
+            continue;
+        };
+        let levels: Vec<u32> = (12..=22)
+            .map(|id| runtime.mixmap_level(controller, id))
+            .collect();
+        eprintln!("SFXObj_Collision #{instance} ({controller:#010x}) outputs 12..=22: {levels:?}");
+    }
+}
