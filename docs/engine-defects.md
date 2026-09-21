@@ -680,3 +680,24 @@ packet. Where retail takes it beyond that is not yet traced.
 
 **Do not** re-open this by widening the `[0.1, 0.3]` window or removing the `/0.4`: that window is
 retail's, it is in ratio units, and it is meant to be spent by 0.12 s of air.
+
+### The landing's two collision voices are off by default — a deliberate deviation
+
+`sub_824BA630` posts to the contact-sound manager, so retail plays them. But `sub_824D2318` gives
+a contact voice `controllerOutput × messageLevel × materialLevel`, the controller output coming
+from `sub_824D20E8`'s jump table (material category → Collision controller output: 13, 14, 15, 16,
+17, 18, 12, 19, 21, 20 for categories 0..=9). **This port applies the two level terms and not the
+controller one.** It is not recoverable yet: the one-shot path has no per-frame gain update, and
+every one of those outputs reads 0 in the only MixMap fixture available
+(`crates/skate-audio-core/examples/collision_output_probe.rs` against `mixmap_replay_4400.bin`).
+
+At full material level they swamp the class voice. Solving the mix from a playtest,
+`(C + 1.95X)/(C + X) = 1.05`, puts the class voice at **~5 % of the landing peak**, and the class
+step measured +0.5 dB against retail's +4.8. A/B'd by the owner at the same trim: with them on,
+"low ollies still sound too loud and different than retail"; with them off, "pretty close to
+correct". So they default **off**, because a voice at a knowingly wrong level is further from
+retail than no voice.
+
+`SKATE_AUDIO_LANDING_COLLISION=1` restores them. **Recovering the controller term is the real fix;
+delete the switch and default it back on when that lands.**
+

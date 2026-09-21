@@ -196,13 +196,21 @@ pub(crate) struct ContactVoicePlayer {
     pops_enabled: bool,
     /// Whether a landing also posts to the contact-sound manager (its two collision voices).
     ///
-    /// `sub_824BA630` does post, so this defaults on. But those voices' gain includes a Collision
-    /// controller output (`sub_824D20E8`, read by `sub_824D2318`) that this engine does not apply
-    /// -- the one-shot path has no per-frame gain update, and the only MixMap fixture available
-    /// reads every one of those outputs as 0. Played at full material level they are loud enough
-    /// to swamp the class voice, which is what makes a landing vary; measured, the class voice is
-    /// only ~5% of the landing peak. `SKATE_AUDIO_LANDING_COLLISION=0` drops them, which is the
-    /// A/B that says whether they are the reason a low ollie is louder here than in retail.
+    /// **Off by default, which is a deliberate deviation.** `sub_824BA630` does post, so retail
+    /// plays them — but their gain is `controllerOutput × messageLevel × materialLevel`
+    /// (`sub_824D2318`), the controller output coming from `sub_824D20E8`'s material-category
+    /// jump table, and this engine applies the two level terms and **not** the controller one.
+    /// The one-shot path has no per-frame gain update, and every one of those outputs reads 0 in
+    /// the only MixMap fixture there is, so the right value is not recoverable yet.
+    ///
+    /// Played at full material level they swamp the class voice — measured, the class voice is
+    /// only ~5% of the landing peak, and the class step came out at +0.5 dB against retail's
+    /// +4.8. So the choice is between a voice at a knowingly wrong level and no voice, and the
+    /// owner A/B'd the two at the same trim: with them on, "low ollies still sound too loud and
+    /// different than retail"; with them off, "pretty close to correct".
+    ///
+    /// `SKATE_AUDIO_LANDING_COLLISION=1` restores them. **Delete this switch and default it back
+    /// on once the controller term is recovered** — that is the real fix, not this.
     landing_collision_enabled: bool,
     /// The pops' owner-local six-channel send bus (`sub_82488DD0`), built on first use.
     pops_send: Option<u32>,
@@ -292,7 +300,7 @@ impl ContactVoicePlayer {
             reported: std::collections::HashSet::new(),
             pops_enabled: std::env::var("SKATE_AUDIO_CONTACT_POPS").map_or(true, |v| v != "0"),
             landing_collision_enabled: std::env::var("SKATE_AUDIO_LANDING_COLLISION")
-                .map_or(true, |v| v != "0"),
+                .is_ok_and(|v| v == "1"),
             pops_send: None,
         })
     }
