@@ -633,12 +633,50 @@ What changes is the *sample*. `sub_824BA630` starts three voices, and two of the
    while `msg[+0x00]` is the board; `sub_824D2318` reads `msg[0x20 + 4 × record]`, so record 0 (the
    board) is leveled by the surface's table entry. The port had them uncrossed.
 
+### The level mechanism — found on a second pass, after a wider playtest
+
+**The "retail keeps the gain flat" reading above was drawn from too narrow a sample** (15 landings,
+all 350–783 ms, i.e. all class 0/1). A 35-landing capture spanning 16 ms to 1.2 s says otherwise:
+
+```
+corr(peak, air time) = +0.64        peak range 15.8 dB
+  air    0-150 ms  n= 4  mean  -4.0 dBFS
+  air  150-400 ms  n=12  mean  -4.4
+  air  400-700 ms  n= 8  mean  -4.6
+  air  700-1050ms  n= 5  mean  +1.0     <- +5.5 dB step
+  air 1050+   ms   n= 6  mean  +2.3     <- +6.8 dB
+```
+
+Flat to ~0.7 s, then a step — landing exactly on the **landing-class** thresholds (0.62 s and
+1.02 s; air factor 0.31 / 0.50 against factor = air × 0.5).
+
+**`sub_824BA630`'s tail writes the class to Contacts controller input 2** — `[this+12]->vtable[8]
+(2, clamp(word, 0, 32767))` with word = 0 / 16000 / 32767 for class 0 / 1 / 2 (@ 0x824BAF08 and
+0x824BAF44). Input 2 drives output 15, the landing voice's owner send. **This port never wrote any
+Contacts controller input**, so output 15 sat at its class-0 value forever: the class picked a
+different sample but had *zero* effect on level. That is the direct cause of "every landing the
+same loudness", and the port said so itself — `sub_824B90D8 without the controller-input resets`,
+and "raises controller input 1 (the MixMap port owns the input)", which it never did.
+
+Also recovered: `sub_824B90D8`'s head zeroes inputs **0, 1 and 6** every frame and pointedly *not*
+2 — the class latches until the next landing, holding the send up for the voice's whole life.
+`sub_824BA630`'s head raises input 1 to 32767 (the landing pulse).
+
+**Known approximation.** Retail routes the class voice through the send bus, so its level follows
+output 15 continuously as the MixMap settles. This engine gives the one-shot a fixed gain at open,
+and reading output 15 back would be both a frame stale and pre-settling, so the class indexes the
+*settled* measured values (2584 / 3103 / 3650) instead. Retail's send ramps across the sample;
+ours is flat for its length.
+
 ### Still open
 
-Whether the owner's "low landings should be low volume" is achievable retail-exactly. The evidence
-above says retail keeps the gain roughly flat and varies sample content, so if the ladder voice
-does not deliver the difference by ear, the next step is a deliberate, labelled deviation rather
-than more hunting — there is no un-ported gain path left in `sub_824BA630`.
+The measured retail step is ~6 dB but the MixMap supplies only 3.0 dB of it, so the remaining ~3 dB
+must come from the class samples themselves being louder. Worth checking the three class samples'
+own levels before adding any gain. Also unexplained: the 4–10 dB spread *within* a single air-time
+band, which the owner hears as slope-vs-flat — a slope landing has lower vertical impact speed, and
+`sub_82772B88`'s `landing_bucket_44` (|min of last four COM vertical velocities| against
+1.5 / 2.6 / 3.45 m/s) is the obvious candidate, but in this port it reaches only the footsteps
+packet. Where retail takes it beyond that is not yet traced.
 
 **Do not** re-open this by widening the `[0.1, 0.3]` window or removing the `/0.4`: that window is
 retail's, it is in ratio units, and it is meant to be spent by 0.12 s of air.

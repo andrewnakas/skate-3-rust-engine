@@ -34,6 +34,25 @@ use super::components::contacts::{ContactSound, ContactVoices, SurfaceMap, Voice
 /// level `player-audio-retail-drivers.md` §8 measured against the recomp.
 const LANDING_SEND_MAXIMUM: f32 = 3650.0;
 
+/// Contacts output 15 — the landing voice's owner send — at each landing class, measured off the
+/// real MixMap under the retail pre-roll with controller input 2 held at retail's own words
+/// (0 / 16000 / 32767). A 3.0 dB spread, class 0 to class 2.
+const LANDING_SEND_BY_CLASS: [f32; 3] = [2584.0, 3103.0, 3650.0];
+
+/// The landing one-shot's gain relative to the loudest class.
+///
+/// Class 2 is the reference so the heaviest landing keeps the absolute level
+/// `player-audio-retail-drivers.md` §8 measured against the recomp — `CONTACT_TRIM` was calibrated
+/// with this send absent, so applying output 15 raw would drop every landing about 19 dB.
+fn landing_send_scale(class: Option<u32>) -> f32 {
+    let Some(class) = class else { return 1.0 };
+    let level = LANDING_SEND_BY_CLASS
+        .get(class as usize)
+        .copied()
+        .unwrap_or(LANDING_SEND_MAXIMUM);
+    (level / LANDING_SEND_MAXIMUM).clamp(LANDING_SEND_FLOOR, 1.0)
+}
+
 /// `fmuls` then `fctiwz`: retail truncates the scaled level back to an integer.
 fn scale_level(level: u32, gain: f32) -> u32 {
     (level as f32 * gain) as u32
@@ -134,8 +153,9 @@ pub(crate) struct ContactVoicePlayer {
     reported: std::collections::HashSet<String>,
     /// The takeoff pops. Retail's metered takeoff is +17 dB over its rolling bed while this
     /// engine's was +5.5 dB without them, so they are on by default; `SKATE_AUDIO_CONTACT_POPS=0`
-    /// turns them off. Their MixMap-driven environment send still uses `RETAIL_POPS_LEVEL`,
-    /// because the Contacts inputs that drive it are not written yet.
+    /// turns them off. Their MixMap-driven environment send still uses `RETAIL_POPS_LEVEL`: the
+    /// component now writes Contacts inputs 0, 1, 2 and 6, but the pops' own send is driven by
+    /// inputs 3, 10, 17, 18 and 21, and those are still unwritten.
     pops_enabled: bool,
     /// The pops' owner-local six-channel send bus (`sub_82488DD0`), built on first use.
     pops_send: Option<u32>,
@@ -314,13 +334,22 @@ impl ContactVoicePlayer {
                 self.report(&format!("Splice bank {bank} is not installed"));
                 continue;
             };
-            // Retail's landing level rides the owner send (Contacts output 15); see
-            // `selection`. Taken relative to the class-2 maximum so the loudest landing keeps
-            // the level §8 measured and the lighter classes drop by retail's own ratios.
-            let send_scale = match play.request.send_level {
-                Some(level) if matches!(play.sound, ContactSound::LandingClass) => {
-                    (level as f32 / LANDING_SEND_MAXIMUM).clamp(LANDING_SEND_FLOOR, 1.0)
-                }
+            // Retail's landing level rides the owner send, whose level is Contacts output 15,
+            // and output 15 is driven by the class this component just wrote to input 2.
+            //
+            // The class is used directly rather than reading output 15 back, because the read
+            // would be a frame stale *and* wrong: the component reads `level(15)` before its own
+            // input-2 write lands, and the MixMap smooths over tens of frames, so a one-shot
+            // opened on the landing frame would still see the previous landing's send.
+            //
+            // Retail does not have this problem — its class voice is routed through the send bus
+            // and follows output 15 continuously as the graph settles. This engine gives the
+            // one-shot a fixed gain at open, so it uses the *settled* output-15 value for the
+            // class, measured off the real MixMap under the retail pre-roll
+            // (`skate-audio-core` example `contacts_input_probe`). **That is the approximation
+            // here: retail's send ramps across the sample, ours is flat for its whole length.**
+            let send_scale = match play.sound {
+                ContactSound::LandingClass => landing_send_scale(play.request.landing_class),
                 _ => 1.0,
             };
             let mut handles = Vec::with_capacity(members.len());
@@ -639,16 +668,10 @@ impl ContactVoicePlayer {
             // (`+464`), exactly as `sub_824BA630`'s tail computes it for MixMap input 2. Retail
             // derives those buckets from time in air, thresholded at 0.62 s and 1.00 s.
             ContactSound::LandingClass => {
-                let (mut class, mut landed) = (0, false);
-                for wheel in 0..4 {
-                    if audio.wheel_landed_464[wheel] {
-                        landed = true;
-                        class = class.max(audio.wheel_landing_bucket_448[wheel]);
-                    }
-                }
-                if !landed {
-                    return None;
-                }
+                // `sub_824BA630` resolves the class once and uses it for the sample *and* the
+                // controller-input 2 write, so the component owns it and passes it here rather
+                // than each side recomputing it from the audio state.
+                let class = play.request.landing_class?;
                 let material = audio.wheel_material_620[0];
                 let lane = if material >= 143 {
                     0
@@ -684,7 +707,7 @@ impl ContactVoicePlayer {
 
 #[cfg(test)]
 mod tests {
-    use super::{landing_weight, scale_level};
+    use super::{landing_send_scale, landing_weight, scale_level};
     use skate_data::audio::splice::LandingTuning;
 
     /// The port fed `sub_82496C58` raw seconds, which stretched retail's curve by 2.5× and was
@@ -714,6 +737,25 @@ mod tests {
         assert_eq!(scale_level(24_000, 1.0), 24_000);
         assert_eq!(scale_level(1, 0.65), 0);
         assert_eq!(scale_level(0, 0.65), 0);
+    }
+
+    /// The class must actually reach the gain. Before the controller-input 2 write was ported
+    /// this was flat at every class, which is what made every landing the same loudness.
+    #[test]
+    fn the_landing_send_follows_the_class() {
+        let db = |x: f32| 20.0 * x.log10();
+        let (c0, c1, c2) = (
+            landing_send_scale(Some(0)),
+            landing_send_scale(Some(1)),
+            landing_send_scale(Some(2)),
+        );
+        assert!(c0 < c1 && c1 < c2, "{c0} {c1} {c2}");
+        assert_eq!(c2, 1.0, "class 2 is the reference and keeps the measured level");
+        // The real MixMap's spread, class 0 to class 2, is 3.0 dB.
+        assert!((db(c2) - db(c0) - 3.0).abs() < 0.1, "spread {} dB", db(c2) - db(c0));
+        // An unknown class must not attenuate, and no class must ever mute the landing.
+        assert_eq!(landing_send_scale(None), 1.0);
+        assert!(landing_send_scale(Some(99)) >= super::LANDING_SEND_FLOOR);
     }
 
     /// The 2×2 ladder is the voice this port never played: a landing's sample must change with

@@ -402,6 +402,9 @@ pub(crate) struct VoiceRequest {
     /// runs on, or `None` when the deck-contact byte (`+614`) is clear — retail passes 0 to
     /// `sub_82494D78` in that case, which is the same as taking column 0.
     pub deck_material: Option<u32>,
+    /// The landing class `sub_824BA630` resolved (largest `+448` bucket over the landed wheels).
+    /// Retail derives the sample and the controller-input word from this one value.
+    pub landing_class: Option<u32>,
 }
 
 /// The one-shot bank-voice sink. Implemented by the `skate-audio-core` bank-voice port; the
@@ -499,6 +502,11 @@ pub(crate) struct ContactsInputs {
     pub deck_contact_614: bool,
     /// `+660`: the deck material that test runs on.
     pub deck_material_660: u32,
+    /// `+464` / `+448`: which wheels are down and each one's landing bucket. `sub_824BA630`
+    /// reduces them to the single class it uses for both `sub_824B8D48`'s sample and the
+    /// controller-input 2 write.
+    pub wheel_landed_464: [bool; 4],
+    pub wheel_landing_bucket_448: [u32; 4],
     /// Contacts controller output 15, the owner send the landing voice rides.
     /// Input 2 (the landing class) drives it: probing the real MixMap with the
     /// retail pre-roll gives 2584 / 3103 / 3650 for classes 0 / 1 / 2, a 3.0 dB
@@ -522,6 +530,8 @@ impl ContactsInputs {
             grind_material_692: state.grind_material_692,
             deck_contact_614: state.deck_contact_614,
             deck_material_660: state.deck_material_660,
+            wheel_landed_464: state.wheel_landed_464,
+            wheel_landing_bucket_448: state.wheel_landing_bucket_448,
             landing_send_level_15: 0,
         }
     }
@@ -546,6 +556,8 @@ impl ContactsInputs {
             grind_material_692: word(692),
             deck_contact_614: byte(614),
             deck_material_660: word(660),
+            wheel_landed_464: std::array::from_fn(|i| byte(464 + i)),
+            wheel_landing_bucket_448: std::array::from_fn(|i| word(448 + 4 * i)),
             // The capture carries audio-state words, not controller outputs; the
             // send level is supplied by `Component::process` at runtime.
             landing_send_level_15: 0,
@@ -598,6 +610,10 @@ pub(crate) struct ContactsOwner {
     held_landing_class_52: Option<u32>,
     /// `sub_82497F48`'s ladder voice, retail slot `+496`.
     held_landing_ladder_496: Option<u32>,
+    /// The Contacts controller inputs (vfunc 8 on `[this+12]`) this process set, in retail call
+    /// order. `sub_824BA630`'s tail writes input 2 from the landing class; the worker applies
+    /// them before the next MixMap evaluation, exactly as it already does for Rail.
+    inputs: Vec<(u32, u32)>,
     voices: Box<dyn ContactVoices>,
 }
 
@@ -618,6 +634,7 @@ impl ContactsOwner {
             held_landing_56: None,
             held_landing_class_52: None,
             held_landing_ladder_496: None,
+            inputs: Vec::new(),
             voices,
         })
     }
@@ -674,9 +691,9 @@ impl ContactsOwner {
 
     /// `sub_824BA630`.
     fn landing(&mut self, inputs: &ContactsInputs) {
-        // Retail resets the frame counter and raises controller input 1 (the MixMap port owns
-        // the input) before its voices.
+        // `sub_824BA630` @ 0x824BA66C, before any voice: the landing pulse on input 1.
         self.latches.frames_424 = 0;
+        self.inputs.push((1, 32_767));
         if !self.local {
             return;
         }
@@ -715,14 +732,45 @@ impl ContactsOwner {
         if let Some(handle) = self.held_landing_class_52.take() {
             self.voices.free(handle);
         }
-        self.held_landing_class_52 = self.voices.play(
-            ContactSound::LandingClass,
-            &VoiceRequest {
-                send_level: Some(inputs.landing_send_level_15),
-                air_time: Some(self.latches.air_time_340),
-                ..VoiceRequest::default()
-            },
-        );
+        // `sub_824BA630` @ 0x824BAF08: the class is the largest `+448` bucket over the wheels
+        // that are actually down (`+464`). Retail computes it **once** and uses it for both the
+        // sample and the controller write, so it is computed here rather than in the sink.
+        let mut class = 0;
+        let mut landed = false;
+        for wheel in 0..4 {
+            if inputs.wheel_landed_464[wheel] {
+                landed = true;
+                class = class.max(inputs.wheel_landing_bucket_448[wheel]);
+            }
+        }
+        if landed {
+            self.held_landing_class_52 = self.voices.play(
+                ContactSound::LandingClass,
+                &VoiceRequest {
+                    send_level: Some(inputs.landing_send_level_15),
+                    air_time: Some(self.latches.air_time_340),
+                    landing_class: Some(class),
+                    ..VoiceRequest::default()
+                },
+            );
+        }
+        // `sub_824BA630`'s tail @ 0x824BAF44: the class as a controller word, written to input 2
+        // of `[this+12]`. **This is the landing's level mechanism.** Input 2 drives Contacts
+        // output 15 (the landing voice's owner send) and output 3; probing the real MixMap under
+        // the retail pre-roll gives output 15 = 2584 / 3103 / 3650 for classes 0 / 1 / 2.
+        //
+        // Unlike inputs 0, 1 and 6 — which `sub_824B90D8` zeroes every frame — input 2 is **not**
+        // reset, so the class latches until the next landing and the send holds for the voice's
+        // whole life. Retail writes it even when no wheel landed, as 0.
+        //
+        // This port never wrote it at all, so output 15 sat at its class-0 value forever and the
+        // landing class changed the sample but never the level.
+        let word = match class {
+            1 => 16_000,
+            2 => 32_767,
+            _ => 0,
+        };
+        self.inputs.push((2, if landed { word } else { 0 }));
     }
 
     /// `sub_824BB0E0`.
@@ -754,8 +802,14 @@ impl ContactsOwner {
         let _ = self.voices.play(ContactSound::GrindOnset, &request);
     }
 
-    /// `sub_824B90D8` without the controller-input resets.
+    /// `sub_824B90D8`.
     pub(crate) fn step(&mut self, inputs: &ContactsInputs) {
+        // The head of `sub_824B90D8` zeroes inputs 0, 1 and 6 on its own controller every frame,
+        // before anything else. Input **2** is pointedly not among them: the landing class stays
+        // latched until the next landing.
+        self.inputs.push((0, 0));
+        self.inputs.push((1, 0));
+        self.inputs.push((6, 0));
         self.latches.frames_424 = self.latches.frames_424.wrapping_add(1);
         let was_airborne = self.latches.airborne_120;
         let airborne = inputs.in_known_air_332;
@@ -785,6 +839,11 @@ impl ContactsOwner {
 }
 
 impl Component for ContactsOwner {
+    /// The worker applies these to the Contacts controller before the next MixMap evaluation.
+    fn take_owner_inputs(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.inputs)
+    }
+
     fn process(&mut self, tick: &mut Tick) -> Result<(), String> {
         let mut inputs = ContactsInputs::from_state(tick.audio);
         inputs.landing_send_level_15 = tick.controls.level(15);
@@ -1208,12 +1267,20 @@ mod owner_tests {
             held_landing_56: None,
             held_landing_class_52: None,
             held_landing_ladder_496: None,
+            inputs: Vec::new(),
             voices: Box::new(sink.clone()),
         };
         (owner, sink)
     }
 
     /// Airborne with a trick active and a pop-permitting trick id.
+    /// A grounded frame with the wheels actually down. `sub_824BA630` resolves its landing
+    /// class from the `+464` wheels, so a landing with no wheel down plays no class voice and
+    /// writes 0 to controller input 2 — which is retail's behaviour, not a fixture accident.
+    fn grounded() -> ContactsInputs {
+        ContactsInputs { wheel_landed_464: [true; 4], ..ContactsInputs::default() }
+    }
+
     fn air(trick: u32) -> ContactsInputs {
         ContactsInputs {
             in_known_air_332: true,
@@ -1308,7 +1375,7 @@ mod owner_tests {
         o.step(&ContactsInputs::default());
         o.step(&air(5));
         sink.take();
-        o.step(&ContactsInputs::default());
+        o.step(&grounded());
         o.step(&ContactsInputs::default());
         o.step(&air(5));
         assert_eq!(
@@ -1323,6 +1390,57 @@ mod owner_tests {
         assert_eq!(sink.freed(), vec![1]);
     }
 
+    /// The landing's *level* mechanism, and the one this port was missing entirely: retail's
+    /// `sub_824BA630` writes the landing class to Contacts controller input 2, which drives
+    /// output 15 — the landing voice's owner send. With it unwritten, output 15 never left its
+    /// class-0 value and every landing came out at the same level.
+    #[test]
+    fn a_landing_writes_its_class_to_controller_input_2_and_latches_it() {
+        for (bucket, expected) in [(0u32, 0u32), (1, 16_000), (2, 32_767)] {
+            let (mut o, _sink) = owner(true);
+            o.step(&air(5));
+            o.take_owner_inputs();
+            o.step(&ContactsInputs {
+                wheel_landing_bucket_448: [bucket; 4],
+                ..grounded()
+            });
+            let inputs = o.take_owner_inputs();
+            // The per-frame resets come first (`sub_824B90D8`'s head), then the landing pulse on
+            // input 1, then the class on input 2.
+            assert_eq!(inputs[0], (0, 0), "bucket {bucket}");
+            assert_eq!(inputs[1], (1, 0), "bucket {bucket}");
+            assert_eq!(inputs[2], (6, 0), "bucket {bucket}");
+            assert!(inputs.contains(&(1, 32_767)), "landing pulse, bucket {bucket}");
+            assert_eq!(
+                inputs.last(),
+                Some(&(2, expected)),
+                "class {bucket} should write {expected} to input 2"
+            );
+
+            // Input 2 is *not* in the per-frame reset list, so the next ordinary frame leaves the
+            // class latched — that is what holds the send up for the voice's whole life.
+            o.step(&ContactsInputs::default());
+            let next = o.take_owner_inputs();
+            assert_eq!(next, vec![(0, 0), (1, 0), (6, 0)], "bucket {bucket}");
+        }
+    }
+
+    /// A landing with no wheel down plays no class voice and writes 0, rather than inventing a
+    /// class from stale buckets.
+    #[test]
+    fn a_landing_with_no_wheel_down_writes_zero_and_plays_no_class_voice() {
+        let (mut o, sink) = owner(true);
+        o.step(&air(5));
+        sink.take();
+        o.take_owner_inputs();
+        o.step(&ContactsInputs {
+            wheel_landing_bucket_448: [2; 4],
+            ..ContactsInputs::default()
+        });
+        assert!(!sink.kinds().contains(&ContactSound::LandingClass));
+        assert_eq!(o.take_owner_inputs().last(), Some(&(2, 0)));
+    }
+
     #[test]
     fn landing_resets_the_frame_counter_so_the_next_pop_is_gated() {
         // A pop on the frame straight after a landing is suppressed, because the landing set
@@ -1331,7 +1449,7 @@ mod owner_tests {
         o.step(&ContactsInputs::default());
         o.step(&air(5));
         sink.take();
-        o.step(&ContactsInputs::default());
+        o.step(&grounded());
         o.step(&air(5));
         assert_eq!(
             sink.kinds(),
@@ -1349,7 +1467,7 @@ mod owner_tests {
         o.step(&air(5));
         sink.take();
         // Falling edge, not grinding: the landing voice, and the frame counter resets.
-        o.step(&ContactsInputs::default());
+        o.step(&grounded());
         let played = sink.take();
         // The impact, the `+496` ladder voice and `sub_824B8D48`'s class voice, in retail's
         // order. The ladder one was missing entirely until it was ported.
@@ -1459,6 +1577,7 @@ mod owner_tests {
             held_landing_56: None,
             held_landing_class_52: None,
             held_landing_ladder_496: None,
+            inputs: Vec::new(),
             voices: Box::new(sink.clone()),
         };
         let mut frames: Vec<(u32, ContactSound)> = Vec::new();
