@@ -39,6 +39,7 @@ fn frame(
         body_flip_side: false,
         hips_position: [0., 1., 0.],
         hips_ground: None,
+        hips_surface: 0,
         suspend_air: false,
         landing: Default::default(),
         teleported: false,
@@ -211,6 +212,45 @@ fn main() -> Result<(), String> {
         ));
     }
     println!("Class-3 one-shot bonus: kickflip banks {with_bonus:.0} through the gate, {without:.0} outside it");
+
+    // The gap/context collector: four runs of horizontal distance, two of them gated on
+    // being more than 3 m and 6 m above the ground under the hips. 20 m spent above 6 m
+    // tops out both of those curves, at 900 and 1800.
+    let gap = |clearance: f32| -> Result<f32, String> {
+        let mut run = scoring_runtime::Runtime::load(&data)?;
+        // The deck is held still and above the contact: that zeroes the air distance and
+        // height metrics and keeps 82DAC780's flip bonus out of the measurement, so what
+        // is left is the gap runs alone.
+        let mut entry = frame(0, FilteredCategory::Ground, None);
+        entry.position = [0., 10., 0.];
+        entry.hips_position = [0., 10., 0.];
+        run.advance(entry)?;
+        for tick in 1..=60 {
+            // The run starts on its first active frame, so travel must begin at zero for
+            // the distance to come out at exactly 20 m.
+            let travelled = 20. * (tick - 1) as f32 / 59.;
+            let mut f = frame(tick, FilteredCategory::Air, Some(kickflip));
+            f.position = [0., 10., 0.];
+            f.hips_position = [0., 10., travelled];
+            f.hips_ground = Some([0., 10. - clearance, travelled]);
+            run.advance(f)?;
+        }
+        for tick in 61..70 {
+            run.advance(frame(tick, FilteredCategory::Ground, None))?;
+        }
+        Ok(run.session.holder.snapshot.last_reward)
+    };
+    let over_a_gap = gap(7.)?;
+    let low = gap(1.)?;
+    if low != 100. {
+        return Err(format!("A 1 m clearance must clear no gap, got {low}"));
+    }
+    if (over_a_gap - 2800.).abs() > 0.5 {
+        return Err(format!(
+            "20 m spent 7 m up should bank 100 + 900 + 1800, got {over_a_gap}"
+        ));
+    }
+    println!("Gap collector: 20 m cleared 7 m up banks {over_a_gap:.0}, the same air 1 m up banks {low:.0}");
     println!(
         "Scoring data audit: authored kickflip credited once; landing display persists; timer uses seconds; line expiry clears score; teleport cancels pending rewards and multiplier; Air452 freezes continuous metrics; air metrics reach the bank"
     );

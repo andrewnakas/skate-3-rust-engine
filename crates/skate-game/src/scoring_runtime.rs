@@ -81,6 +81,59 @@ fn compose_trick_name(
     name
 }
 
+/// One of the four run accumulators the gap/context collector keeps, `82DA7B50`.
+///
+/// Each measures how far the skater travelled horizontally while its own condition held,
+/// across as many separate runs as the air contains. Retail also keeps the longest single
+/// run at +24 and a run count at +28; neither reaches the score.
+#[derive(Clone, Copy, Default)]
+struct ContextRun {
+    /// +0, the position the current run started from.
+    start: [f32; 3],
+    /// +16, the distance covered by the run in progress.
+    current: f32,
+    /// +20, the distance of every run already closed.
+    banked: f32,
+    /// byte +32.
+    running: bool,
+}
+
+impl ContextRun {
+    fn advance(&mut self, position: [f32; 3], active: bool) {
+        if active && !self.running {
+            self.current = 0.0;
+            self.running = true;
+            self.start = position;
+        }
+        if !self.running {
+            return;
+        }
+        // The lane mask before the length drops Y, as the air's own distance metric does.
+        let (dx, dz) = (position[0] - self.start[0], position[2] - self.start[2]);
+        let distance = dx.hypot(dz);
+        if active {
+            self.current = distance;
+            return;
+        }
+        self.banked += distance;
+        self.current = 0.0;
+        self.running = false;
+    }
+
+    /// `82DA88E8` sums the closed runs and the one in progress before the curve.
+    fn total(self) -> f32 {
+        self.banked + self.current
+    }
+}
+
+/// The curves `82DA88E8` evaluates, in the order `82DA89A0` drives the runs.
+///
+/// `addi r10,r11,1440` / `1280` / `1360` / `1200` against the collector tuning block.
+const CONTEXT_CURVES: [u16; 4] = [0x5a0, 0x500, 0x550, 0x4b0];
+
+/// `air_metric`, the scorable `82DA8550` banks the gap/context total under.
+const CONTEXT_METRIC: usize = 237;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Collector {
     None,
@@ -113,6 +166,8 @@ pub(crate) struct Frame {
     /// PhysOut.Ground +208, and `None` when Ground +320 says the test missed. The hips
     /// test's hit position, republished only while `player+1524` is set.
     pub hips_ground: Option<[f32; 3]>,
+    /// PhysOut.Ground +260: the packed surface tag the hips test hit.
+    pub hips_surface: u32,
     pub suspend_air: bool,
     pub landing: skate_core::animation::landing_quality::Output,
     pub teleported: bool,
@@ -144,6 +199,15 @@ pub(crate) struct Runtime {
     /// side. Retail writes it only while an announced grab carrier is current, so an
     /// ungrabbed flip earns no flip reward -- but it is still *named* as a flip.
     pub flip_direction: i32,
+    /// The gap/context collector's four run accumulators, at collector +192/+240/+288/+336.
+    context_runs: [ContextRun; 4],
+    /// The hips ray origin's height at take-off.
+    ///
+    /// `82DA7DA0` is the air collector's Reset (vtable 823281A4 slot 2) and takes a whole
+    /// ground query into collector+160 with no reference, once, at Enter. The per-frame
+    /// query then measures its drop against *the lower of* that snapshot and the present
+    /// hips height, so a rise after take-off cannot inflate the gap.
+    takeoff_hips_height: f32,
     /// 82DA93D8's one-shot latch at +777: the class-3 bonus has already been paid for
     /// this air, and cannot be paid again however many flip tricks follow.
     flip_bonus_paid: bool,
@@ -202,6 +266,8 @@ impl Runtime {
             air_metrics: [0.; 5],
             spin_turns: 0,
             flip_direction: 0,
+            context_runs: [ContextRun::default(); 4],
+            takeoff_hips_height: 0.,
             flip_bonus_paid: false,
             flip_seen: false,
             landing_countdown: 0,
@@ -459,6 +525,57 @@ impl Runtime {
         }
         Ok(())
     }
+    /// The gap/context collector, `82DA89A0` driving four `82DA7B50` run accumulators.
+    ///
+    /// This is retail's "cleared a big gap" score, and it was missing entirely. The ground
+    /// query `82DA7A38` reports, from the hips test alone:
+    ///
+    /// ```text
+    /// out[0..16) = Ground[192]                  ; the hips ray origin, unconditional
+    /// if (byte[Ground+320] == 0) return;        ; a miss leaves every field zero
+    /// out+16 = Ground[192].y - Ground[208].y
+    /// out+20 = min(Ground[192].y, reference.y) - Ground[208].y
+    /// out+25 = (tag & 0x7F) == 10
+    /// out+26 = ((tag >> 7) & 31) == 8
+    /// ```
+    ///
+    /// and `82DA89A0` gates one run on each of `out+25`, `out+26`, `out+20 > 0x680` (3 m)
+    /// and `out+20 > 0x67C` (6 m). Each run measures horizontal distance travelled while
+    /// its gate holds, and `82DA88E8` puts the total through a curve: up to 900 for the
+    /// first three and **1800** for the 6 m one.
+    ///
+    /// Not ported: `82DA89A0` additionally requires `collector+185 == 0` for the first run.
+    /// That byte is unidentified, so the run is gated on the surface test alone.
+    fn advance_context_runs(&mut self, f: &Frame) {
+        let tag = f.hips_surface;
+        let gates = match f.hips_ground {
+            None => [false; 4],
+            Some(contact) => {
+                let reference = self.takeoff_hips_height.min(f.hips_position[1]);
+                let drop = reference - contact[1];
+                [
+                    tag & 0x7f == 10,
+                    (tag >> 7) & 0x1f == 8,
+                    drop > self.data.collector.scalar(0x680),
+                    drop > self.data.collector.scalar(0x67c),
+                ]
+            }
+        };
+        for (run, active) in self.context_runs.iter_mut().zip(gates) {
+            run.advance(f.hips_position, active);
+        }
+    }
+
+    /// `82DA88E8`: the four runs through their curves. Banked as scorable 237 at the
+    /// landing, and shown live in the sequence total meanwhile.
+    fn context_reward(&self) -> f32 {
+        self.context_runs
+            .iter()
+            .zip(CONTEXT_CURVES)
+            .map(|(run, curve)| self.data.collector.curve(curve, run.total()))
+            .sum()
+    }
+
     /// 82DA93D8's one-shot class-3 bonus: `reward += 0x600 * points * factor`.
     ///
     /// ```text
@@ -578,6 +695,13 @@ impl Runtime {
                             self.session.holder.end_trick(metric, reward);
                         }
                     }
+                    // 82DA8550 closes the gap runs and banks their total the same way:
+                    // `bl 0x82da88e8` / `li r4,237` / `bl 0x82da6260`.
+                    if let Some(metric) = catalog::metadata(CONTEXT_METRIC) {
+                        self.session
+                            .holder
+                            .end_trick(metric, self.context_reward());
+                    }
                 }
                 self.session.holder.finish_collector();
                 self.landing_countdown = 2;
@@ -590,6 +714,8 @@ impl Runtime {
             self.air_metrics = [0.; 5];
             self.spin_turns = 0;
             self.flip_direction = 0;
+            self.context_runs = [ContextRun::default(); 4];
+            self.takeoff_hips_height = f.hips_position[1];
             self.flip_bonus_paid = false;
             self.flip_seen = false;
             self.air_repetition = 1.;
@@ -723,6 +849,7 @@ impl Runtime {
             self.air_metrics[4] =
                 self.flip_direction.abs() as f32 * self.data.collector.scalar(0x640) * scale;
             self.pay_flip_bonus(&f);
+            self.advance_context_runs(&f);
         }
         let active = self.carriers.iter().any(Option::is_some) || self.collector == Collector::Air;
         self.idle_ticks = if active {
@@ -820,7 +947,8 @@ impl Runtime {
                         })
                     })
                     .sum::<f32>()
-                + self.air_metrics.iter().sum::<f32>())
+                + self.air_metrics.iter().sum::<f32>()
+                + self.context_reward())
                 * self.session.combo.multiplier;
         }
         if self.session.line.expired || f.teleported || bailout {

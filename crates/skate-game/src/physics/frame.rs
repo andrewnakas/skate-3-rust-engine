@@ -375,6 +375,7 @@ pub(super) fn advance(
             (hips.valid != 0)
                 .then(|| std::array::from_fn(|lane| f32::from_bits(hips.position[lane])))
         },
+        hips_surface: skater.player_input.player.hips_line_test_1488.surface,
         suspend_air: skater.player_input.physical.air.use_air_reckoning_452 != 0,
         landing: skater.landing_quality,
         teleported,
