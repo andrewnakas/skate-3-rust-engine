@@ -9,6 +9,24 @@ pub(crate) struct Handling {
     spin: [f32; 8],
 }
 
+impl Handling {
+    /// Mean angular speed of the driven wheels, rad/s. Signed with the drive
+    /// direction, so a reversing wheel reads negative.
+    pub(crate) fn driven_speed(&self, d: &crate::VehicleDefinition) -> f32 {
+        let driven: Vec<_> = d
+            .wheels
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.driven)
+            .map(|(i, _)| self.omega[i])
+            .collect();
+        if driven.is_empty() {
+            return 0.;
+        }
+        driven.iter().sum::<f32>() / driven.len() as f32
+    }
+}
+
 pub(crate) fn prepare(v: &mut Vehicle, bodies: &mut RigidBodySet, dt: f32) {
     let body = &mut bodies[v.body];
     let speed = body.linvel().dot(body.rotation() * Vector::Z);
@@ -19,7 +37,14 @@ pub(crate) fn prepare(v: &mut Vehicle, bodies: &mut RigidBodySet, dt: f32) {
     }
     // Full low-speed lock, progressively reduced at speed. Rate limiting models
     // steering travel, including keyboard input; it never rotates the chassis.
-    let target = c.steering * d.steering_angle / (1. + speed.abs().powi(2) * 0.008);
+    // A bike wants far more lock parked and far less at speed than a car, so its
+    // profile supplies the falloff; four-wheel definitions keep the 0.008 curve.
+    let falloff = if d.bike.enabled {
+        d.bike.steer_falloff
+    } else {
+        0.008
+    };
+    let target = c.steering * d.steering_angle / (1. + speed.abs().powi(2) * falloff);
     v.handling.steering += (target - v.handling.steering).clamp(-2.5 * dt, 2.5 * dt);
     let front = d
         .wheels
@@ -60,13 +85,17 @@ pub(crate) fn prepare(v: &mut Vehicle, bodies: &mut RigidBodySet, dt: f32) {
 pub(crate) fn tires(v: &mut Vehicle, bodies: &mut RigidBodySet, colliders: &ColliderSet, dt: f32) {
     let d = &v.definition;
     let c = v.controls;
+    let engine_scale = v.engine_scale;
+    let launch = std::mem::take(&mut v.launch);
     let speed = bodies[v.body]
         .linvel()
         .dot(bodies[v.body].rotation() * Vector::Z);
     // Opposing pedal first brakes, then engages reverse close to rest.
     let opposing = c.throttle * speed < -0.5;
     let brake = c.brake.max(if opposing { c.throttle.abs() } else { 0. });
-    let throttle = if opposing || brake > 0.01 {
+    let throttle = if opposing || brake > 0.01 || (d.bike.enabled && c.clutch) {
+        // A bike with the clutch in drives nothing: the engine is revving
+        // against it, which `bike` tracks and turns into a launch on release.
         0.
     } else {
         c.throttle
@@ -91,15 +120,24 @@ pub(crate) fn tires(v: &mut Vehicle, bodies: &mut RigidBodySet, colliders: &Coll
         };
         let taper = (1. - (omega.abs() * r / limit).powi(2)).max(0.);
         let engine = if def.driven {
-            throttle * d.engine_force / driven * taper
+            throttle * d.engine_force * engine_scale / driven * taper
         } else {
             0.
         };
         *omega += engine * r * dt / inertia;
+        if def.driven && launch > omega.abs() {
+            // The clutch let go: engine and wheel speed equalise at once.
+            *omega = launch;
+        }
         // Preserve legacy brake setting scale, but interpret at the reference 120 Hz.
         // Brake torque is time-scaled and can lock a wheel without reversing its spin.
         let braking = if c.handbrake && !def.steering {
             1.
+        } else if d.bike.enabled && !def.steering {
+            // `brake` is the front lever on a bike (LT), which is most of the
+            // stopping power; the rear gets a share, and `handbrake` above is
+            // the rear pedal locked for a slide.
+            brake * 0.3
         } else {
             brake
         };
@@ -145,7 +183,14 @@ pub(crate) fn tires(v: &mut Vehicle, bodies: &mut RigidBodySet, colliders: &Coll
                 (*omega * r - longitudinal) / (inv_long + r * r / inertia)
             };
             let slip_angle = lateral.atan2(longitudinal.abs().max(1.));
-            let cornering = -load * 8. * slip_angle * dt;
+            // The bare 8.0 is tuned for four wheels sharing the load; two wheels
+            // each carry double, so a single-track profile scales it.
+            let stiffness = if d.bike.enabled {
+                8. * d.bike.cornering_scale
+            } else {
+                8.
+            };
+            let cornering = -load * stiffness * slip_angle * dt;
             let stopping = -lateral / inv_side.max(1e-6) / wheel_count;
             let mut jy = cornering.signum() * cornering.abs().min(stopping.abs());
             // Braking, acceleration and turning share one friction circle.
@@ -161,7 +206,22 @@ pub(crate) fn tires(v: &mut Vehicle, bodies: &mut RigidBodySet, colliders: &Coll
             let rolling = 0.015 * load * r * dt / inertia;
             *omega -= omega.clamp(-rolling, rolling);
             let impulse = forward * jx + side * jy;
-            bodies[v.body].apply_impulse_at_point(impulse, p, false);
+            if d.bike.enabled {
+                // Single track. In steady cornering a leaned bike's contact
+                // patch, mass centre and resultant force are collinear, so the
+                // cornering force exerts no net righting moment — gravity's
+                // toppling moment cancels it. This chassis is a box on centreline
+                // raycasts and has no toppling moment to cancel, so applying the
+                // side force at the contact point would invent a righting moment
+                // of several hundred N·m and pin roll to zero for good. Apply it
+                // at the mass centre instead and let lean be a free degree of
+                // freedom that `bike` controls. Drive and braking stay at the
+                // contact point, so wheelies and stoppies still work.
+                bodies[v.body].apply_impulse_at_point(forward * jx, p, false);
+                bodies[v.body].apply_impulse(side * jy, false);
+            } else {
+                bodies[v.body].apply_impulse_at_point(impulse, p, false);
+            }
             if let Some(h) = ground {
                 // Suspension was applied to the chassis by Rapier. Return both the
                 // tire and suspension reactions to movable support bodies.

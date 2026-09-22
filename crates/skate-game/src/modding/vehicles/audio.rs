@@ -1,5 +1,5 @@
 //! Shared synthesized engine voices; remote volume attenuates with distance.
-use super::engine_sound::Engine;
+use super::engine_sound::{Engine, Profile};
 use bevy::{
     audio::{AddAudioSource, Volume},
     prelude::*,
@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 struct EngineVoice(u64);
 #[derive(Resource, Default)]
 struct State {
-    source: Option<Handle<Engine>>,
+    sources: BTreeMap<Profile, Handle<Engine>>,
     mix: BTreeMap<u64, (f32, f32)>,
 }
 pub(super) fn install(app: &mut App) {
@@ -65,7 +65,20 @@ fn update(
         let speed =
             (car.controller.current_vehicle_speed.abs() / car.definition.max_speed).clamp(0., 1.);
         let throttle = car.controls.throttle.abs();
-        let revs = (speed * 0.65 + throttle * 0.35).clamp(0., 1.);
+        // Chassis speed cannot describe a freestyle engine: the whole point of a
+        // clutch and a rev in the air is that the bike is not moving. Take revs
+        // from the driven wheel, which keeps turning off the ground and against
+        // the brake, and let throttle rev it freely on top.
+        let revs = if car.definition.bike.enabled {
+            let wheel = vehicles.simulation.wheel_speed(id).abs()
+                * car.definition.wheels.iter().find(|w| w.driven).map_or(0.3, |w| w.radius);
+            let geared = (wheel / car.definition.max_speed).clamp(0., 1.);
+            // A four-stroke single never sits at idle under load: the pull is
+            // mostly the wheel, with the throttle free-revving over the top.
+            (geared * 0.7 + throttle * 0.45).clamp(0., 1.)
+        } else {
+            (speed * 0.65 + throttle * 0.35).clamp(0., 1.)
+        };
         let pitch = a.idle_pitch + (a.max_pitch - a.idle_pitch) * revs;
         let volume = if active {
             a.volume * (0.22 + 0.65 * throttle + 0.13 * speed) * attenuation
@@ -74,9 +87,11 @@ fn update(
         };
         targets.insert(id, (pitch, volume));
         if !existing.contains(&id) {
+            let profile = Profile::parse(&a.profile).unwrap_or_default();
             let source = state
-                .source
-                .get_or_insert_with(|| sources.add(Engine))
+                .sources
+                .entry(profile)
+                .or_insert_with(|| sources.add(Engine(profile)))
                 .clone();
             commands.spawn((
                 EngineVoice(id),

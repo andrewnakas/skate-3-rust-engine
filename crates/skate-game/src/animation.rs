@@ -343,7 +343,13 @@ pub(crate) fn native_matrix(matrix: NativeMatrix) -> Mat4 {
 }
 
 /// Vehicle clips use the same native model-space skeleton matrices as the SDK.
-pub(crate) fn vehicle_pose(world: &mut World, pose: &[Mat4], steering: Option<(&[Mat4], f32)>) {
+///
+/// `layers` are applied in order, each easing the result towards one target pose
+/// by its own weight. Steering is one layer and an air trick is another, which
+/// is what lets a trick be a single authored frame rather than an animation: the
+/// weight is how far the rider has thrown it, so a half-extended trick reads as
+/// half-extended instead of snapping between two poses.
+pub(crate) fn vehicle_pose(world: &mut World, pose: &[Mat4], layers: &[(&[Mat4], f32)]) {
     let board = world
         .resource::<crate::physics::SkaterRuntime>()
         .animation
@@ -367,20 +373,22 @@ pub(crate) fn vehicle_pose(world: &mut World, pose: &[Mat4], steering: Option<(&
                 global
             };
             let mut target = Transform::from_matrix(local);
-            if let Some((turn, weight)) = steering {
-                if let Some(global) = turn.get(binding.bone).map(|m| *m * basis) {
+            for (layer, weight) in layers {
+                let weight = weight.clamp(0., 1.);
+                if weight <= 0. {
+                    continue;
+                }
+                if let Some(global) = layer.get(binding.bone).map(|m| *m * basis) {
                     let local = if let Some(parent) = binding.parent_bone {
-                        turn.get(parent)
+                        layer
+                            .get(parent)
                             .map(|p| (*p * basis).inverse() * global)
                             .unwrap_or(global)
                     } else {
                         global
                     };
-                    target = crate::presentation::blend(
-                        target,
-                        Transform::from_matrix(local),
-                        weight.clamp(0., 1.),
-                    );
+                    target =
+                        crate::presentation::blend(target, Transform::from_matrix(local), weight);
                 }
             }
             if let Some(mut transform) = world.get_mut::<Transform>(binding.entity) {

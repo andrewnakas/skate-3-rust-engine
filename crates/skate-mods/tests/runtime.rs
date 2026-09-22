@@ -154,7 +154,11 @@ fn examples_load_and_run() {
     let ids: Vec<_> = m.packages.keys().cloned().collect();
     assert_eq!(
         ids,
-        vec!["community.mario-kart", "community.native-trainer"]
+        vec![
+            "community.freestyle-mx",
+            "community.mario-kart",
+            "community.native-trainer"
+        ]
     );
     for id in ids {
         m.enable(&id, true).unwrap();

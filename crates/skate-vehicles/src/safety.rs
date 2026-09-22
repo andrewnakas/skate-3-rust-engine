@@ -8,6 +8,29 @@ pub struct Ejection {
     pub reason: &'static str,
 }
 
+/// Build an ejection from a vehicle's current seat motion. Shared by the crash
+/// detector and by `bike`'s landing judgement, so a bad landing hands the rider
+/// off exactly the way a collision does.
+pub(crate) fn ejection(
+    definition: &VehicleDefinition,
+    body: &RigidBody,
+    angular: Vector,
+    reason: &'static str,
+) -> Ejection {
+    let seat = body
+        .position()
+        .transform_point(Vector::from_array(definition.seat));
+    let velocity =
+        (body.velocity_at_point(seat) + Vector::Y * definition.rider_safety.eject_up_speed)
+            .clamp_length_max(60.);
+    Ejection {
+        position: seat.to_array(),
+        velocity: velocity.to_array(),
+        angular_velocity: angular.clamp_length_max(15.).to_array(),
+        reason,
+    }
+}
+
 impl Simulation {
     pub fn set_occupied(&mut self, id: u64, occupied: bool) {
         if let Some(v) = self.vehicles.get_mut(&id) {
@@ -75,22 +98,16 @@ impl Simulation {
                 None
             };
             if let Some(reason) = reason {
-                let seat = body
-                    .position()
-                    .transform_point(Vector::from_array(v.definition.seat));
-                let after = body.velocity_at_point(seat);
-                let velocity = if after.length_squared() > point_velocity.length_squared() {
-                    after
-                } else {
-                    point_velocity
-                };
-                let velocity = (velocity + Vector::Y * safety.eject_up_speed).clamp_length_max(60.);
-                v.ejection = Some(Ejection {
-                    position: seat.to_array(),
-                    velocity: velocity.to_array(),
-                    angular_velocity: body.angvel().clamp_length_max(15.).to_array(),
-                    reason,
-                });
+                let mut e = ejection(&v.definition, body, body.angvel(), reason);
+                // Carry the faster of the pre-solve seat velocity and the one
+                // the helper measured: a collision that stops the chassis dead
+                // should still throw the rider at the speed they were doing.
+                let carried =
+                    (point_velocity + Vector::Y * safety.eject_up_speed).clamp_length_max(60.);
+                if carried.length_squared() > Vector::from_array(e.velocity).length_squared() {
+                    e.velocity = carried.to_array();
+                }
+                v.ejection = Some(e);
             }
         }
     }
