@@ -485,6 +485,20 @@ impl Runtime {
             if complete {
                 carrier.complete(self.data.unannounced_factor);
                 if self.collector == Collector::Air {
+                    if trace_enabled() {
+                        eprintln!(
+                            "SCORE_TRICK air slot={slot} id={} class={} type={} points={} \
+                             factor={:.3} reward={:.1} announced={} bonus_paid={}",
+                            carrier.scorable.id,
+                            carrier.scorable.class,
+                            carrier.scorable.score_type,
+                            carrier.points,
+                            carrier.factor,
+                            carrier.reward,
+                            carrier.announced,
+                            self.flip_bonus_paid,
+                        );
+                    }
                     self.session
                         .holder
                         .end_trick(carrier.scorable, carrier.reward);
@@ -599,7 +613,6 @@ impl Runtime {
                 }
                 if conversion.is_some() {
                     self.base_trick_label = Some(d.label.clone());
-                self.base_trick_type = d.trick_type;
                     self.base_trick_type = d.trick_type;
                 }
                 self.carriers[slot] = Some(carrier);
@@ -871,9 +884,7 @@ impl Runtime {
                     // 82DA8550 closes the gap runs and banks their total the same way:
                     // `bl 0x82da88e8` / `li r4,237` / `bl 0x82da6260`.
                     if let Some(metric) = catalog::metadata(CONTEXT_METRIC) {
-                        self.session
-                            .holder
-                            .end_trick(metric, self.context_reward());
+                        self.session.holder.end_trick(metric, self.context_reward());
                     }
                     if trace_enabled() {
                         let m = self.air_metrics;
@@ -1030,11 +1041,9 @@ impl Runtime {
             // 82DA8BE0 signs the turn count by the rotation's own direction and keeps it
             // at +2344; the reward takes its magnitude.
             let degrees = self.spin.to_degrees();
-            let turns =
-                ((degrees.abs() + self.data.collector.scalar(0x63c)) / 180.) as i32;
+            let turns = ((degrees.abs() + self.data.collector.scalar(0x63c)) / 180.) as i32;
             self.spin_turns = if degrees < 0. { -turns } else { turns };
-            self.air_metrics[3] =
-                self.data.collector.curve(0x370, (turns * 180) as f32) * scale;
+            self.air_metrics[3] = self.data.collector.curve(0x370, (turns * 180) as f32) * scale;
             // 82DA8EB8. The +2396 latch, and with it scoring output byte 14651, is set on
             // the first flipping frame whatever the current carrier is -- that is what the
             // trick display names a flip from. Only +2348, and so the reward, waits for an
@@ -1139,8 +1148,11 @@ impl Runtime {
                 eprintln!(
                     "SCORE_PUBLISH reward={:.0} mult={:.2} line={:.0} lifetime={:.0} \
                      bail={bailout} name={:?}",
-                    self.sequence_score, self.session.combo.multiplier, s.line,
-                    s.completed_lines, self.trick_name,
+                    self.sequence_score,
+                    self.session.combo.multiplier,
+                    s.line,
+                    s.completed_lines,
+                    self.trick_name,
                 );
             }
             self.sequence_active = false;
@@ -1290,7 +1302,14 @@ mod trick_name_tests {
             assert!(!super::decorates_spin(refused), "TrickType {refused}");
         }
         assert_eq!(
-            compose_trick_name(Some("ID_TRICK_GROUND_TRICK_MANUAL"), 1, 0, false, false, false),
+            compose_trick_name(
+                Some("ID_TRICK_GROUND_TRICK_MANUAL"),
+                1,
+                0,
+                false,
+                false,
+                false
+            ),
             "#ID_TRICK_GROUND_TRICK_MANUAL"
         );
         // The flip suffix is *not* behind this gate -- 0x825E57A8 tests only the sign.
