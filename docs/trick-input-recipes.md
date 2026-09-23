@@ -235,3 +235,26 @@ question is which gesture group `CreateTrickIntentFromGesture` is meant to resol
 foot is planted, and what publishes `NoComply` rather than `Ollie` from it. The same question
 covers the four `no_comply_*180/360` ids, though those have no VLT record at all and so score
 nothing even once reached.
+
+## Dark catches
+
+An ordinary flip scoop with the dark-catch button held. `trick_intentions::produce` reads the
+request from the packed action flags rather than from gesture timing --
+`dark_flags = (1 << 20) | (1 << 28)`, so two bits arm it -- and publishes `DarkCatch` while held
+plus `NewDarkCatch` on the rising edge. `gesture_mapping::select` resolves the flick through the
+dark-catch column of the 270-row table, and `MonitorUnderflip` latches `trick_requests.dark_catch`
+when no `U_*` underflip intent is present instead.
+
+**Use RB, not B.** Only one of the two armed bits reaches the catch from a rolling approach: the
+other is B, and B while riding is `Brake` (`riding_intentions` emits it from the same button), so
+the pop never happens at all.
+
+| Trick | id | Scoop | Button |
+|---|---:|---|---|
+| `kickflip_darkcatch` | 301 | `Kickflip` | RB, armed before the pop |
+| `heelflip_darkcatch` | 297 | `Heelflip` | RB, armed before the pop |
+
+The rest of the darkcatch range (298-300, 302-320, 331) is the same recipe over the other scoops
+and the flip-count ladder, and is not separately covered here.
+
+Proven by `tests/dark_playback.rs`.

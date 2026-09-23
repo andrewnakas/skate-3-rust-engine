@@ -596,6 +596,10 @@ mod revert_tests;
 #[path = "tests/footplant_playback.rs"]
 mod footplant_tests;
 
+#[cfg(test)]
+#[path = "tests/dark_playback.rs"]
+mod dark_tests;
+
 fn present(
     physics: Res<GamePhysics>,
     history: Res<crate::presentation::Presentation>,
