@@ -83,8 +83,17 @@ impl CameraRuntime {
         })
     }
 
+    /// Ignores a ratio that is not a positive, finite number.
+    ///
+    /// The frame check below rejects a non-finite field of view by returning
+    /// an error, which ends the run. A zero-area window -- minimised, or
+    /// mid-resize -- makes `width / height` NaN at the call site, so without
+    /// this the camera state is poisoned and the game exits. Holding the last
+    /// good ratio costs nothing: there is no frame to compose at zero area.
     pub fn set_aspect_ratio(&mut self, value: f32) {
-        self.manager.state.aspect_ratio = value;
+        if value.is_finite() && value > 0. {
+            self.manager.state.aspect_ratio = value;
+        }
     }
     pub fn selected_shot(&self) -> &str {
         &self.manager.shots.current().name

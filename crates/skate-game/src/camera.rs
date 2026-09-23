@@ -84,7 +84,16 @@ pub(crate) fn present(
     mut cameras: Query<(&mut Camera, &mut Transform, &mut Projection), With<GameplayCamera>>,
 ) {
     if let Ok(window) = windows.single() {
-        runtime.set_aspect_ratio(window.width() / window.height());
+        // A minimised window reports zero height, and 0/0 is NaN. That NaN
+        // reaches the field of view, the frame fails the finite check in
+        // `runtime`, and the game exits with "Normal gameplay camera produced
+        // a non-finite frame" -- so minimising the window killed the running
+        // game. Keep the last good ratio instead: there is nothing to draw at
+        // zero area anyway, and it is restored the moment the window is.
+        let (width, height) = (window.width(), window.height());
+        if width > 0. && height > 0. {
+            runtime.set_aspect_ratio(width / height);
+        }
     }
     let Some((previous, current, alpha)) = history.view(&replay, time.overstep_fraction()) else {
         return;
