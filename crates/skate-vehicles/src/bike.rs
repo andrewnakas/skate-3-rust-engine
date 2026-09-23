@@ -30,8 +30,11 @@
 use crate::rapier3d::utils::AngularInertiaOps;
 use crate::{Vehicle, rapier3d::prelude::*};
 
-/// Speed at which the bars fully command lean rather than steering lock.
-const LEAN_SPEED: f32 = 6.;
+/// Speed at which the bars fully command lean rather than steering lock. Low
+/// on purpose: a motocross bike is expected to come round in its own length in
+/// a corner, and gating lean behind road-bike speeds makes it feel like it
+/// refuses to turn.
+const LEAN_SPEED: f32 = 3.5;
 /// Preload must reach this fraction of travel before a release will pop.
 const ARM_FRACTION: f32 = 0.35;
 /// Below this much remaining rider weight, an armed preload fires.
@@ -41,6 +44,13 @@ const MIN_AIR: f32 = 0.25;
 /// Landings slower than this are never judged on heading: you can land a
 /// bike sideways at walking pace.
 const YAW_JUDGEMENT_SPEED: f32 = 4.;
+/// Hard ceiling on how fast the bike will come round, rad/s. Only a slow,
+/// steeply leaned corner ever reaches it; it exists so a walking-pace lean
+/// cannot spin the bike on the spot, which steering lock does instead.
+const CARVE_LIMIT: f32 = 4.5;
+/// Effective lean is clamped here before the tangent that turns it into a turn
+/// rate. 80 degrees, safely short of the singularity at 90.
+const CARVE_MAX_LEAN: f32 = 1.40;
 /// How long a clutch dump boosts the engine, seconds.
 const BOOST_SECONDS: f32 = 0.5;
 /// How long the bike is helped to plant itself after a real air, seconds.
@@ -71,6 +81,10 @@ pub(crate) struct Bike {
     boost: f32,
     /// Seconds of post-touchdown planting assist remaining.
     pub(crate) landing: f32,
+    /// Forward pace carried into this frame, m/s, decaying.
+    carry: f32,
+    /// Seconds before another step hop is allowed.
+    hop: f32,
 }
 
 impl Bike {
@@ -79,23 +93,81 @@ impl Bike {
     }
 }
 
+/// Soften an axis around centre while keeping its full range at the stop.
+/// A linear stick spends most of its travel past the lean anyone wants to
+/// hold, so the usable part of a corner lives in the first few millimetres and
+/// nothing smaller than a whole lane change can be asked for.
+pub(crate) fn expo(x: f32, amount: f32) -> f32 {
+    x * (1. - amount + amount * x * x)
+}
+
 /// Lean the bars and rider ask for, radians, negative left.
-pub(crate) fn lean_target(d: &crate::BikeProfile, c: &crate::Controls, speed: f32) -> f32 {
+pub(crate) fn lean_target(d: &crate::BikeProfile, c: &crate::Controls, speed: f32, yaw: f32) -> f32 {
     let speed_factor = (speed.abs() / LEAN_SPEED).clamp(0., 1.);
     // Bars are the main lean input at speed; rider weight hangs off on top.
     // Positive steering and positive lean both mean left, which is negative Z.
-    -(c.steering * d.counter_steer + c.lean * 0.4).clamp(-1., 1.) * d.lean_max * speed_factor
+    let stick = (c.steering * d.counter_steer + c.lean * 0.4).clamp(-1., 1.);
+    let want = -expo(stick, d.lean_expo) * d.lean_max * speed_factor;
+    // Never lie the bike further over than the turn it is actually doing can
+    // carry. A leaned bike is balancing centripetal acceleration against
+    // gravity, so the honest angle is `atan(v*w/g)` -- and `w` here is the
+    // yaw rate measured last frame, not one derived from the lean, so there
+    // is no circularity.
+    //
+    // This only bites at walking pace. Above about 4 m/s the cap already
+    // exceeds `lean_max` and the term is inert, which is what the
+    // measurements showed: the shown lean tracked the justified angle within
+    // a few degrees from 4 m/s up, but at 2 m/s the bike was drawn lying over
+    // at 35 degrees for a turn that justified 23.
+    let cap = (speed.abs() * yaw.abs() / 9.81).atan().max(0.12);
+    want.clamp(-cap, cap)
 }
 
-/// Yaw rate a bike leaned this far carves at this speed, rad/s, positive left.
+/// Bank of the surface under the bike, radians, in `lean`'s own sign: negative
+/// means the ground is tilted the way a left turn wants it.
+///
+/// `lean` is measured against the *surface*, because the chassis is held
+/// square to the contact normal. That is what makes a berm free: the bank is
+/// simply lean the rider did not have to ask for, and it adds to theirs.
+pub(crate) fn bank_angle(normal: Vector, forward: Vector) -> f32 {
+    let flat = Vector::new(forward.x, 0., forward.z);
+    if flat.length_squared() < 1e-6 {
+        return 0.;
+    }
+    // The bike's left, horizontal. A normal leaning that way is a surface
+    // banked to support a left turn, and a left turn is a negative lean.
+    let left = Vector::Y.cross(flat).normalize_or_zero();
+    -normal.dot(left).clamp(-1., 1.).asin()
+}
+
+/// Yaw rate a bike carves at this speed, rad/s, positive left.
 ///
 /// Steady cornering balances gravity against centripetal acceleration:
 /// `v²/R = g·tan(lean)`, so the turn rate is `v/R = g·tan(lean)/v`. Faster is
-/// wider for the same lean, exactly as on a real bike. Clamped so a walking
-/// pace lean cannot spin the bike on the spot: steering lock does that job.
-pub(crate) fn carve_rate(lean: f32, speed: f32) -> f32 {
-    let speed_factor = (speed / LEAN_SPEED).clamp(0., 1.);
-    (-9.81 * lean.tan() / speed.max(3.)).clamp(-2.5, 2.5) * speed_factor
+/// wider for the same lean, exactly as on a real bike.
+///
+/// On a banked surface the same balance holds about the *bank*, so the two
+/// angles simply add — a berm banked `b` under a bike leaned `l` corners as
+/// though leaned `b + l`. That one term is the whole berm effect, and it also
+/// gives off-camber for nothing: a bank of the wrong sign subtracts, the bike
+/// pushes wide, and riding straight across a camber pulls you downhill the way
+/// a real bike does.
+pub(crate) fn carve_rate(lean: f32, bank: f32, speed: f32) -> f32 {
+    // Clamp the sum *before* the tangent, and not as tidiness: `lean_max` is
+    // 60 degrees and a 35 degree berm is another 35, so a committed rider
+    // reaches 95 — past the singularity, where `tan` returns a large negative
+    // number and the bike would snap into turning the wrong way exactly when
+    // it is being asked for everything. At the 80 degree clamp `tan` is 5.7,
+    // already far more turn than the tyres can hold, so nothing real is lost.
+    let effective = (lean + bank).clamp(-CARVE_MAX_LEAN, CARVE_MAX_LEAN);
+    // A berm is not the case the rate limit exists for — that is a walking
+    // pace lean spinning the bike on the spot — so the bank raises it.
+    let limit = CARVE_LIMIT * (1. + 1.5 * bank.abs());
+    // No speed gate here. `lean_target` already fades the lean out as the bike
+    // slows, and gating the carve as well squared that fade: at 2 m/s the bike
+    // kept eleven percent of its turning authority and felt like it would not
+    // come round at all. A lean that exists should carve what it is worth.
+    (-9.81 * effective.tan() / speed.max(3.)).clamp(-limit, limit)
 }
 
 /// Airborne pitch/yaw/roll acceleration, rad/s², in the chassis frame.
@@ -145,6 +217,189 @@ pub(crate) fn air_acceleration(
         rate(yaw_target, local_omega.y, d.air_yaw),
         rate(roll_target, local_omega.z, d.air_roll),
     )
+}
+
+/// Lift the bike over a step its frame has jammed against.
+///
+/// A raycast wheel samples the ground at a single point, so it cannot roll
+/// over an edge: a riser arrives as an instantaneous jump in ground height.
+/// Climbing a flight is worse than one step, because the chassis pitch lags
+/// the staircase slope and the frame ends up driven into a riser two steps
+/// ahead of the front wheel while that wheel is still on the first tread.
+/// That was measured -- the chassis takes a single large shove along its own
+/// heading and the bike goes from 11 m/s to a standstill in one frame.
+///
+/// Reshaping the collider does not help. Five shapes were measured over a
+/// twelve-step flight, from the shipped box to a compact heavily-rounded one,
+/// and every one of them jammed on anything above a 0.15 m rise. The chassis
+/// has to be lifted instead.
+///
+/// Two conditions gate it, and together they are what stop this becoming a
+/// cheat. The frame must actually be against a near-horizontal face, which a
+/// ramp never does -- the wheels ride a slope and the chassis never touches
+/// it. And a climbable top has to be found by probing ahead, so a wall, which
+/// has no top within reach, is still a wall.
+pub(crate) fn step_up(v: &mut crate::Vehicle, world: &mut PhysicsWorld, dt: f32) {
+    let d = v.definition.bike;
+    if !d.enabled || d.step_assist <= 0. {
+        return;
+    }
+    v.bike.hop = (v.bike.hop - dt).max(0.);
+    let c = v.controls;
+    let body = &world.bodies[v.body];
+    let rotation = *body.rotation();
+    let up = rotation * Vector::Y;
+    let forward = rotation * Vector::Z;
+    let flat = Vector::new(forward.x, 0., forward.z).normalize_or_zero();
+    let velocity = body.linvel();
+    let speed = Vector::new(velocity.x, 0., velocity.z).dot(flat);
+    // Remember the pace from just before a jam. By the time the jam is
+    // visible the solver has already taken the speed away, and the hop has to
+    // give it back or every step costs the bike all of its momentum.
+    v.bike.carry = (v.bike.carry - v.bike.carry * 3. * dt).max(speed);
+    // The rider asking to go is what makes this an assist rather than a
+    // trampoline: nothing happens to a bike being left alone against a wall.
+    let asking = c.throttle.abs() > 0.1;
+    if v.bike.hop > 0. || !asking || speed.abs() > 9. || up.y < 0.5 || flat == Vector::ZERO {
+        return;
+    }
+    // A near-horizontal face against the frame. Deliberately *not* gated on
+    // the impulse: that is large only on the frame of the crash, and a moment
+    // later the bike is simply resting against the riser going nowhere, which
+    // is exactly the state that needs rescuing.
+    let blocked = body.colliders().iter().any(|&col| {
+        world.narrow_phase.contact_pairs_with(col).any(|pair| {
+            pair.manifolds.iter().any(|m| {
+                let n: Vector = m.data.normal.into();
+                n.y.abs() < 0.5
+                    && n.dot(flat).abs() > 0.3
+                    && m.points.iter().any(|p| p.dist < 0.02)
+            })
+        })
+    });
+    // Probe from the *leading* wheel. Taking the lowest contact instead reads
+    // the rear wheel, which on a staircase is still down on the flat several
+    // steps behind, where the ground ahead is flat too -- so nothing is ever
+    // found to climb.
+    let Some(here) = v
+        .controller
+        .wheels()
+        .iter()
+        .map(|w| w.raycast_info())
+        .filter(|r| r.is_in_contact)
+        .map(|r| r.contact_point_ws)
+        .max_by(|a, b| a.dot(flat).total_cmp(&b.dot(flat)))
+    else {
+        return;
+    };
+    let reach = d.step_assist + 0.2;
+    let ground = |ahead: f32| {
+        let nose = here + flat * ahead + Vector::Y * (d.step_assist + 0.15);
+        world
+            .cast_ray(
+                &Ray::new(nose, -Vector::Y),
+                reach,
+                true,
+                QueryFilter::only_fixed(),
+            )
+            // Nothing within reach is an edge to drop off, not to climb.
+            .map(|(_, toi)| (nose.y - toi) - here.y)
+    };
+    // Probe close. What has to be climbed is the *next* riser, and stair
+    // treads are short -- looking 0.35 m or more ahead lands two steps on,
+    // reads their combined height and rejects it as unclimbable.
+    let (near, far) = (ground(0.12), ground(0.3));
+    let Some(rise) = far.filter(|r| *r > 0.03 && *r <= d.step_assist) else {
+        return;
+    };
+    // Step over it *before* being stopped by it. Waiting for the jam means
+    // taking the hit first, and that hit is what threw the rider and made
+    // clearing a flight a coin flip.
+    //
+    // The pair of probes is what tells a step from a ramp, and without it
+    // this would haul the bike up every slope in the park: a ramp rises
+    // steadily, so the near probe is already climbing, while a step leaves it
+    // flat right up to the riser.
+    let ahead = near.is_some_and(|n| n < 0.05) && rise > 0.08;
+    if !blocked && !ahead {
+        return;
+    }
+    // Place the chassis on the step rather than trying to drive or bounce it
+    // there. Impulses do not work here: the frame is already pressed into the
+    // riser, so the solver cancels whatever forward speed is handed to it,
+    // and lifting bodily just raises the jam along with the bike. Moving it
+    // is the same thing a character controller does to walk up a stair, and
+    // it is the only version of this that measured as working.
+    let body = &mut world.bodies[v.body];
+    let lifted = body.translation() + Vector::Y * (rise + 0.04);
+    body.set_translation(lifted, true);
+    // Hand back the pace the jam took, with a floor so a bike that has been
+    // sat against the step long enough for `carry` to decay can still walk
+    // itself up rather than being stranded.
+    let keep = (v.bike.carry * 0.9).max(3.);
+    let mut next = body.linvel();
+    next.y = next.y.max(0.);
+    if Vector::new(next.x, 0., next.z).dot(flat) < keep {
+        next = Vector::new(flat.x * keep, next.y, flat.z * keep);
+    }
+    body.set_linvel(next, true);
+    v.bike.hop = 0.05;
+}
+
+/// Turn rate the bars alone ask for, rad/s, positive left.
+///
+/// Lean physics caps the rate at `g·tan(lean)/v`, which is about half what an
+/// arcade motocross game turns at once you are moving: 1.43 rad/s at 12 m/s
+/// against the ~2.5 it wants. Grip cannot close that gap -- 2.5 rad/s at
+/// 12 m/s needs 3.1 g and the tyres have 1.9 -- so the rate is asked for
+/// directly and `redirect` below is what stops it becoming a slide.
+///
+/// The falloff is deliberately gentle. `g·tan/v` falls as `1/v`; this falls
+/// far slower, which is exactly the part that was missing at speed.
+pub(crate) fn steer_rate(d: &crate::BikeProfile, c: &crate::Controls, speed: f32) -> f32 {
+    let stick = (c.steering + c.lean * 0.25).clamp(-1., 1.);
+    // Comes in from a standstill over the same span lean does, so a parked
+    // bike is not spun on the spot by the bars alone.
+    let moving = (speed.abs() / LEAN_SPEED).clamp(0., 1.);
+    let falloff = 1. / (1. + speed.abs() * 0.025);
+    expo(stick, d.lean_expo) * d.steer_rate * falloff * moving
+}
+
+/// Rotate a horizontal velocity toward `forward` by at most `limit` radians,
+/// keeping its speed. Returns the new velocity.
+///
+/// This is the arcade mechanic the bike was missing. A real bike changes
+/// direction only as fast as the tyres can push it sideways, and asking for
+/// more than that does not turn harder -- it slides, and the slide scrubs the
+/// speed off, which is measurably *less* turn for more command. Rotating the
+/// velocity costs no grip at all, so the turn is real and the speed survives.
+pub(crate) fn redirect(velocity: Vector, forward: Vector, limit: f32) -> Vector {
+    let flat = Vector::new(velocity.x, 0., velocity.z);
+    let aim = Vector::new(forward.x, 0., forward.z);
+    let speed = flat.length();
+    if speed < 0.5 || aim.length_squared() < 1e-6 || limit <= 0. {
+        return velocity;
+    }
+    let aim = aim.normalize();
+    let heading = flat / speed;
+    // Only ever close the gap, never overshoot past the heading.
+    let error = heading.dot(aim).clamp(-1., 1.).acos();
+    if error < 1e-4 {
+        return velocity;
+    }
+    // Never redirect a bike that is travelling backwards into a spin.
+    if heading.dot(aim) < 0. {
+        return velocity;
+    }
+    let turn = limit.min(error);
+    let side = if Vector::Y.cross(heading).dot(aim) > 0. { 1. } else { -1. };
+    let (sin, cos) = (turn * side).sin_cos();
+    let rotated = Vector::new(
+        heading.x * cos + heading.z * sin,
+        0.,
+        -heading.x * sin + heading.z * cos,
+    );
+    rotated * speed + Vector::Y * velocity.y
 }
 
 /// Signed yaw from `forward` to `velocity` in the ground plane, positive when
@@ -298,7 +553,7 @@ pub(crate) fn apply(v: &mut Vehicle, bodies: &mut RigidBodySet, dt: f32) {
     };
     let body = &mut bodies[v.body];
     if grounded {
-        let target = lean_target(&d, &c, speed);
+        let target = lean_target(&d, &c, speed, local_omega.y);
         v.bike.lean += (target - v.bike.lean) * (1. - (-d.lean_rate * dt).exp());
         // Hold the chassis over the contact line. Damping is derived from the
         // gain, so tuning the gain cannot tune the bike into an oscillation.
@@ -336,11 +591,29 @@ pub(crate) fn apply(v: &mut Vehicle, bodies: &mut RigidBodySet, dt: f32) {
         acceleration.z = roll_to_surface * d.upright_gain * planted
             - gravity_roll
             - local_omega.z * 2. * (d.upright_gain * planted).sqrt();
-        // Carve: the lean angle dictates the turn rate, the tyres supply the
-        // force, and the friction circle in `handling` decides whether the
-        // back end holds or steps out.
-        let carve = carve_rate(v.bike.lean, speed);
-        acceleration.y = (carve - local_omega.y) * d.lean_yaw;
+        // Carve: the lean angle and the bank under it dictate the turn rate,
+        // the tyres supply the force, and the friction circle in `handling`
+        // decides whether the back end holds or steps out.
+        let bank = bank_angle(normal, forward) * d.berm_assist;
+        let carve = carve_rate(v.bike.lean, bank, speed);
+        // The bars ask for a rate of their own, which does not fall away with
+        // speed the way the lean's does. Whichever is asking for more wins, so
+        // a slow corner and a berm still ride on their own physics and this
+        // only fills the hole at speed.
+        let bars = steer_rate(&d, &c, speed);
+        // Backing it in: the rear brake trades grip for rotation.
+        let pivot = if c.handbrake { d.pivot_boost } else { 1. };
+        let want = if bars.abs() > carve.abs() { bars } else { carve } * pivot;
+        acceleration.y = (want - local_omega.y) * d.lean_yaw;
+        // Point the bike where it is aimed, rather than waiting for the tyres
+        // to get it there. Held back while the rear brake is down, which is
+        // what makes the pivot slide instead of rail.
+        let assist = if c.handbrake { d.grip_assist * 0.15 } else { d.grip_assist };
+        if assist > 0. && speed > 1. {
+            let rate = want.abs().max(local_omega.y.abs()) * assist;
+            let redirected = redirect(body.linvel(), forward, rate * dt);
+            body.set_linvel(redirected, true);
+        }
         // Just landed: square the bike up under the rider rather than letting
         // a few degrees of yaw become a slide, and let the roll controller
         // above pull harder for the same window.
@@ -493,6 +766,7 @@ mod tests {
                 ..Default::default()
             },
             LEAN_SPEED,
+            4.,
         );
         assert!(left < -0.5, "left steer should lean left (negative), got {left}");
         let right = lean_target(
@@ -502,19 +776,25 @@ mod tests {
                 ..Default::default()
             },
             LEAN_SPEED,
+            4.,
         );
         assert!((left + right).abs() < 1e-5, "lean must be symmetric");
         // A left lean carves left, which is positive yaw.
-        assert!(carve_rate(left, 10.) > 0.3);
-        assert!(carve_rate(right, 10.) < -0.3);
+        assert!(carve_rate(left, 0., 10.) > 0.3);
+        assert!(carve_rate(right, 0., 10.) < -0.3);
     }
 
     #[test]
     fn the_same_lean_carves_wider_at_speed_and_not_at_all_at_rest() {
-        let slow = carve_rate(-0.6, 8.);
-        let fast = carve_rate(-0.6, 24.);
+        let slow = carve_rate(-0.6, 0., 8.);
+        let fast = carve_rate(-0.6, 0., 24.);
         assert!(slow > fast && fast > 0., "{slow} vs {fast}");
-        assert_eq!(carve_rate(-0.6, 0.), 0.);
+        // A stopped bike does not carve, but that is `lean_target`'s job: it
+        // fades the lean out below `LEAN_SPEED`, so there is no lean left to
+        // carve with. `carve_rate` used to gate on speed as well, which
+        // squared the fade and left the bike with a ninth of its authority at
+        // walking pace -- the reason it felt like it would not come round.
+        assert_eq!(lean_target(&profile(), &Controls { steering: 1., ..Default::default() }, 0., 0.), 0.);
     }
 
     #[test]
@@ -527,6 +807,7 @@ mod tests {
                 ..Default::default()
             },
             LEAN_SPEED,
+            4.,
         );
         assert!(lean_only < -0.1);
         let both = lean_target(
@@ -537,8 +818,53 @@ mod tests {
                 ..Default::default()
             },
             LEAN_SPEED,
+            4.,
         );
         assert!(both <= lean_only, "steer and lean should agree in sign");
+    }
+
+    /// A bike lies over to balance a turn, so the angle has to be one the
+    /// turn earns. Held at walking pace the bike used to be drawn at 35
+    /// degrees for a turn that justified 23, which reads as falling over.
+    #[test]
+    fn the_lean_never_exceeds_the_angle_the_turn_actually_justifies() {
+        let d = profile();
+        let full = Controls {
+            steering: 1.,
+            ..Default::default()
+        };
+        for (speed, yaw) in [(2., 1.6), (4., 2.8), (6., 2.7)] {
+            let lean = lean_target(&d, &full, speed, yaw).abs();
+            let justified = (speed * yaw / 9.81).atan();
+            assert!(
+                lean <= justified + 1e-3,
+                "at {speed} m/s turning {yaw}/s the bike leans {lean:.2} for a justified {justified:.2}"
+            );
+        }
+        // And it is inert where it should be: at riding speed the cap is past
+        // `lean_max`, so full lean is still available and nothing changed.
+        assert!(
+            (lean_target(&d, &full, 12., 2.4).abs() - d.lean_max).abs() < 1e-5,
+            "the cap must not bite at riding speed"
+        );
+    }
+
+    /// Turning has to be able to start. The cap is built from the yaw rate
+    /// measured last frame, which is zero the instant the bars are turned, so
+    /// without a floor the bike could never lean and so could never carve.
+    #[test]
+    fn a_turn_can_still_be_started_from_no_yaw_at_all() {
+        let d = profile();
+        let lean = lean_target(
+            &d,
+            &Controls {
+                steering: 1.,
+                ..Default::default()
+            },
+            6.,
+            0.,
+        );
+        assert!(lean < -0.1, "no lean available to start a turn: {lean}");
     }
 
     #[test]
@@ -551,6 +877,7 @@ mod tests {
                 steering: 1.,
                 ..Default::default()
             },
+            0.,
             0.,
         );
         assert_eq!(a, 0.);
@@ -618,6 +945,138 @@ mod tests {
             0.,
         );
         assert!(scrub.x > 1.);
+    }
+
+    /// A surface banked to help a left turn has to read with the same sign as
+    /// a left lean, or the two would cancel instead of adding.
+    #[test]
+    fn a_bank_reads_in_the_same_sign_as_the_lean_it_stands_in_for() {
+        let forward = Vector::Z;
+        // Normal tilted toward the bike's left (+X): banked for a left turn.
+        let left_bank = Vector::new(0.5, 0.866, 0.).normalize();
+        assert!(
+            bank_angle(left_bank, forward) < -0.4,
+            "a left-hand berm should read negative like a left lean, got {}",
+            bank_angle(left_bank, forward)
+        );
+        let right_bank = Vector::new(-0.5, 0.866, 0.).normalize();
+        assert!(bank_angle(right_bank, forward) > 0.4);
+        // Flat ground banks nothing, whichever way the bike points.
+        assert!(bank_angle(Vector::Y, forward).abs() < 1e-6);
+        assert!(bank_angle(Vector::Y, Vector::X).abs() < 1e-6);
+    }
+
+    /// A berm turns harder for the same stick; off-camber pushes wide. This is
+    /// the whole feature in one assertion pair.
+    #[test]
+    fn a_berm_turns_harder_and_off_camber_pushes_wide() {
+        let lean = -0.5;
+        let flat = carve_rate(lean, 0., 12.);
+        let berm = carve_rate(lean, -0.5, 12.);
+        let off = carve_rate(lean, 0.5, 12.);
+        assert!(berm > flat * 1.5, "a berm should bite: {berm} vs flat {flat}");
+        assert!(off < flat * 0.5, "off-camber should wash out: {off} vs {flat}");
+        // Even with no lean at all, a berm still turns the bike.
+        assert!(carve_rate(0., -0.5, 12.) > 0.3);
+    }
+
+    /// The guard that makes the feature shippable. `lean_max` is 60 degrees
+    /// and a steep berm is another 40, which lands past the tangent's
+    /// singularity at 90. Unclamped, `tan` goes large and negative there and
+    /// the bike would snap into turning the wrong way under a rider who has
+    /// just committed everything to the corner.
+    #[test]
+    fn a_committed_rider_on_a_steep_berm_never_turns_the_wrong_way() {
+        for speed in [6., 12., 25.] {
+            for bank in [-0.4_f32, -0.6, -0.9, -1.4] {
+                let rate = carve_rate(-1.05, bank, speed);
+                assert!(
+                    rate > 0.,
+                    "lean -1.05 on a {bank} bank at {speed} m/s turned {rate}"
+                );
+                assert!(rate.is_finite(), "non-finite carve at bank {bank}");
+            }
+        }
+    }
+
+    #[test]
+    fn switching_the_assist_off_reproduces_flat_ground_exactly() {
+        // `berm_assist` scales the bank at the call site, so zero means the
+        // bank never reaches the carve and today's numbers are unchanged.
+        let with_none = carve_rate(-0.5, 0., 12.);
+        assert_eq!(carve_rate(-0.5, 0. * -0.6, 12.), with_none);
+    }
+
+    /// The whole point of the arcade term: lean physics caps the turn rate at
+    /// `g*tan(lean)/v`, which halves every time you double your speed. This
+    /// has to still be asking for a real rate where that one has given up.
+    #[test]
+    fn the_bars_keep_asking_for_a_turn_where_lean_physics_has_given_up() {
+        let d = profile();
+        let full = Controls { steering: 1., ..Default::default() };
+        for speed in [12., 18., 24.] {
+            let physics = (9.81 * d.lean_max.tan() / speed).abs();
+            let bars = steer_rate(&d, &full, speed).abs();
+            assert!(
+                bars > physics,
+                "at {speed} m/s the bars ask {bars:.2} and lean physics {physics:.2}"
+            );
+        }
+        // And it still fades in from a standstill, so a parked bike is not
+        // spun on the spot by the handlebars alone.
+        assert_eq!(steer_rate(&d, &full, 0.), 0.);
+    }
+
+    #[test]
+    fn steering_is_symmetric_and_softened_around_centre() {
+        // The profile default is linear; softening is opt-in, and the mod sets
+        // it. Ask for it here rather than assume the default carries it.
+        let d = crate::BikeProfile { lean_expo: 0.3, ..profile() };
+        let at = |x: f32| steer_rate(&d, &Controls { steering: x, ..Default::default() }, 12.);
+        assert!((at(1.) + at(-1.)).abs() < 1e-6, "must be symmetric");
+        // Expo: a quarter of the stick asks for well under a quarter of the turn.
+        assert!(at(0.25).abs() < at(1.).abs() * 0.25);
+        // ...and a linear profile is exactly proportional.
+        let linear = profile();
+        let lin = |x: f32| steer_rate(&linear, &Controls { steering: x, ..Default::default() }, 12.);
+        assert!((lin(0.25).abs() - lin(1.).abs() * 0.25).abs() < 1e-6);
+    }
+
+    /// Redirection is the mechanic that makes a commanded turn real instead of
+    /// a slide. It must never add or remove speed -- only point it somewhere
+    /// else -- or it becomes a hidden accelerator.
+    #[test]
+    fn redirection_turns_the_velocity_without_changing_its_speed() {
+        let velocity = Vector::new(6., -2., 6.);
+        let forward = Vector::Z;
+        let out = redirect(velocity, forward, 0.1);
+        let flat = |v: Vector| Vector::new(v.x, 0., v.z).length();
+        assert!(
+            (flat(out) - flat(velocity)).abs() < 1e-4,
+            "speed changed: {} -> {}",
+            flat(velocity),
+            flat(out)
+        );
+        assert_eq!(out.y, velocity.y, "vertical motion must be left alone");
+        // It moved toward the heading, and not past it.
+        let before = Vector::new(velocity.x, 0., velocity.z).normalize().dot(forward);
+        let after = Vector::new(out.x, 0., out.z).normalize().dot(forward);
+        assert!(after > before, "should have turned toward the heading");
+        assert!(after <= 1.0001);
+    }
+
+    #[test]
+    fn redirection_never_overshoots_or_spins_a_reversing_bike() {
+        // A limit far bigger than the error lands exactly on the heading.
+        let out = redirect(Vector::new(5., 0., 5.), Vector::Z, 10.);
+        assert!(out.x.abs() < 1e-3, "overshot past the heading: {out:?}");
+        // Travelling backwards, it must not haul the bike round.
+        let back = Vector::new(0., 0., -6.);
+        assert_eq!(redirect(back, Vector::Z, 1.), back);
+        // Stationary, and with nothing asked for, it is inert.
+        assert_eq!(redirect(Vector::ZERO, Vector::Z, 1.), Vector::ZERO);
+        let v = Vector::new(3., 0., 3.);
+        assert_eq!(redirect(v, Vector::Z, 0.), v);
     }
 
     #[test]

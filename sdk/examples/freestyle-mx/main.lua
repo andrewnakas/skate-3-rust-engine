@@ -51,8 +51,12 @@ local function tune()
  local s = sdk.settings
  sdk.vehicle.tune('mx', {
   engine_force = s.engine, max_speed = s.speed, tire_grip = s.tire_friction,
-  lean_max = s.lean_max, lean_rate = s.lean_rate, counter_steer = s.counter_steer,
-  lean_yaw = s.lean_yaw, preload_release = s.preload_release,
+  lean_max = s.lean_max, lean_rate = s.lean_rate, lean_expo = s.lean_expo,
+  counter_steer = s.counter_steer,
+  lean_yaw = s.lean_yaw, berm_assist = s.berm_assist,
+  steer_rate = s.steer_rate, grip_assist = s.grip_assist,
+  step_assist = s.step_assist,
+  preload_release = s.preload_release,
   air_yaw = s.air_yaw, whip_rate = s.whip_rate, flip_rate = s.flip_rate,
   engine_volume = s.engine_volume,
  })
@@ -285,9 +289,14 @@ return {
     -- Throwing the rider off the bike means you are not steering it. The stick
     -- does one job at a time.
     local tricking = extend > 0.05
+    -- The left trigger brakes, and once you are stopped it backs you up.
+    -- The host reads reverse as negative throttle, which nothing was ever
+    -- sending, so the bike could brake but never reverse out of anything.
+    local lt = i.trigger_l or 0
+    local reversing = math.abs(bike.speed) < 1.2 and lt > 0.25
     sdk.vehicle.control('mx', {
-     throttle = i.trigger_r or 0,
-     brake = i.trigger_l or 0,
+     throttle = reversing and -lt or (i.trigger_r or 0),
+     brake = reversing and 0 or lt,
      steering = i.steering,
      weight = i.weight,
      whip = i.whip,

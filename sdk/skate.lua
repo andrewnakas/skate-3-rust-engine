@@ -125,7 +125,12 @@ function sdk.trainer.apply(tuning) end
 ---@field clutch? boolean
 ---@class VehicleTuning
 ---@field lean_max? number 0.05..1.4 radians, maximum commanded lean (bike profile)
----@field lean_rate? number 0..60 rad/s^2 roll authority (bike profile)
+---@field lean_rate? number 0..60 1/s how quickly the lean takes up (bike profile)
+---@field lean_expo? number 0..1 softens the bars around centre (bike profile)
+---@field berm_assist? number 0..2 how much a banked surface adds to lean (bike profile)
+---@field steer_rate? number 0..8 rad/s turn rate the bars ask for at speed (bike profile)
+---@field grip_assist? number 0..1 how much the turn points the bike rather than sliding (bike profile)
+---@field step_assist? number 0..0.6 tallest step in metres the bike climbs rather than jamming on (bike profile)
 ---@field counter_steer? number 0..2 steering to lean coupling (bike profile)
 ---@field preload_release? number 0..20000 N.s pop from releasing preload (bike profile)
 ---@field air_yaw? number 0..20 rad/s^2 airborne yaw authority (bike profile)

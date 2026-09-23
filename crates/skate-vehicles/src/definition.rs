@@ -90,8 +90,16 @@ pub struct BikeProfile {
     /// Maximum lean angle, radians. Also the lean the tyres can hold: a bike
     /// leaned to `atan(tire_grip)` is asking for exactly the friction it has.
     pub lean_max: f32,
-    /// How fast the lean follows the bars, 1/s. Higher is twitchier.
+    /// How fast the lean follows the bars, 1/s. Higher is twitchier; lower
+    /// takes the lean up gradually, which is what makes a line adjustable
+    /// mid-corner rather than a thing you commit to once.
     pub lean_rate: f32,
+    /// Softens the bars around centre, 0..1. The lean a stick asks for is
+    /// `x * (1 - e + e * x²)`, so at `e = 0.6` a third of the stick asks for
+    /// about a sixth of the lean and full stick still reaches `lean_max`.
+    /// Without it the first few degrees of stick are the whole corner and
+    /// small corrections are impossible to make.
+    pub lean_expo: f32,
     /// How much bar input becomes lean at speed, 0..2.
     pub counter_steer: f32,
     /// Roll authority holding the chassis over the contact line, rad/s² per
@@ -103,6 +111,43 @@ pub struct BikeProfile {
     pub cornering_scale: f32,
     /// Yaw authority toward the turn rate the lean angle dictates, 1/s.
     pub lean_yaw: f32,
+    /// Turn rate the bars alone will ask for at speed, rad/s.
+    ///
+    /// Lean physics caps the turn rate at `g·tan(lean)/v`, which is 1.43 rad/s
+    /// at 12 m/s and falls off from there -- about half what an arcade
+    /// motocross game turns at. Raising grip to close that gap does not work:
+    /// sustaining 2.5 rad/s at 12 m/s needs 3.1 g and the tyres have 1.9, so
+    /// the bike just slides and scrubs its speed off. This asks for the rate
+    /// directly instead, and `grip_assist` is what makes it real.
+    pub steer_rate: f32,
+    /// How much of the turn is made by pointing the bike rather than by the
+    /// tyres, 0..1. Each grounded tick the velocity is rotated toward the
+    /// heading, at constant speed, so a commanded turn actually changes the
+    /// direction of travel instead of becoming a slide. 0 is pure physics.
+    /// High values feel railed -- the bike stops having weight.
+    pub grip_assist: f32,
+    /// Rear brake pivot: extra yaw authority while the rear brake is held,
+    /// on top of the back end stepping out on its own.
+    ///
+    /// Defaults to 1 — no extra yaw. Measured, any boost at all sends the
+    /// bike past a pivot and into a spin: a 0.8 s tap already swings it 130
+    /// degrees, and the slide costs most of the speed whichever way the
+    /// rear's grip is tuned. Raise it if you want the bike loose, but it
+    /// wants the heading kept on a leash first.
+    pub pivot_boost: f32,
+    /// How much of a banked surface is added to the rider's lean, 0..2.
+    ///
+    /// Not 1, and the reason is worth knowing: most of the berm is already
+    /// there without this. The suspension pushes along the contact normal,
+    /// and on a berm that normal leans toward the turn centre, so the ground
+    /// supplies centripetal force for free. Adding the bank to the carve at
+    /// full strength counts it twice -- measured on a 26 degree bowl, an
+    /// assist of 1 commanded so much yaw that the tyres gave up and the bike
+    /// left the corner at 8 m/s where it entered at 14, while an assist of 0
+    /// left at 20. Past about 0.45 the bike actually sweeps *less* for more
+    /// command, which is the signature of a slide. This trims the turn-in
+    /// rather than providing the effect.
+    pub berm_assist: f32,
     /// Suspension compression from rider weight, newtons.
     pub preload_force: f32,
     /// Launch impulse when preload is released in contact, newton-seconds.
@@ -136,6 +181,19 @@ pub struct BikeProfile {
     /// Angle between the bike and its direction of travel, radians, beyond
     /// which a landing above walking pace is a crash.
     pub landing_yaw: f32,
+    /// Tallest step the bike will hop up when its frame jams against one,
+    /// metres. 0 turns the assist off.
+    ///
+    /// A raycast wheel cannot roll over an edge -- it samples the ground at a
+    /// single point, so a riser arrives as an instantaneous jump in ground
+    /// height rather than something to climb. On a flight of stairs the
+    /// chassis pitch lags the slope and the frame ends up driven into a riser
+    /// two steps ahead of the front wheel, which stops the bike dead. No
+    /// collider shape avoids that: it was measured across five, and every one
+    /// jammed. This lifts the bike over the step instead, and only when a
+    /// climbable top is actually found ahead, so it cannot be used to ride up
+    /// a wall.
+    pub step_assist: f32,
 }
 impl Default for BikeProfile {
     fn default() -> Self {
@@ -143,11 +201,16 @@ impl Default for BikeProfile {
             enabled: false,
             lean_max: 0.9,
             lean_rate: 9.,
+            lean_expo: 0.,
             counter_steer: 1.,
             upright_gain: 60.,
             steer_falloff: 0.03,
             cornering_scale: 2.,
             lean_yaw: 8.,
+            steer_rate: 2.5,
+            grip_assist: 0.5,
+            pivot_boost: 1.,
+            berm_assist: 0.2,
             preload_force: 1100.,
             preload_release: 500.,
             air_yaw: 8.,
@@ -163,6 +226,7 @@ impl Default for BikeProfile {
             landing_roll: 0.75,
             landing_pitch: 0.95,
             landing_yaw: 0.9,
+            step_assist: 0.,
         }
     }
 }
@@ -333,6 +397,7 @@ impl VehicleDefinition {
             || !range(self.air_control, 0., 10.)
             || !range(self.bike.lean_max, 0.05, 1.4)
             || !range(self.bike.lean_rate, 0., 60.)
+            || !range(self.bike.lean_expo, 0., 1.)
             || !range(self.bike.counter_steer, 0., 2.)
             || !range(self.bike.upright_gain, 0., 60.)
             || !range(self.bike.steer_falloff, 0., 1.)
@@ -344,6 +409,10 @@ impl VehicleDefinition {
             || !range(self.bike.air_pitch_up, 0., 20.)
             || !range(self.bike.air_roll, 0., 20.)
             || !range(self.bike.lean_yaw, 0., 40.)
+            || !range(self.bike.steer_rate, 0., 8.)
+            || !range(self.bike.grip_assist, 0., 1.)
+            || !range(self.bike.pivot_boost, 1., 4.)
+            || !range(self.bike.berm_assist, 0., 2.)
             || !range(self.bike.flip_rate, 0., 12.)
             || !range(self.bike.whip_rate, 0., 12.)
             || !range(self.bike.air_level, 0., 20.)
@@ -353,6 +422,7 @@ impl VehicleDefinition {
             || !range(self.bike.landing_roll, 0.1, 3.2)
             || !range(self.bike.landing_pitch, 0.1, 3.2)
             || !range(self.bike.landing_yaw, 0.1, 3.2)
+            || !range(self.bike.step_assist, 0., 0.6)
             || !point(&self.seat, 10.)
             || !point(&self.exit, 10.)
             || !range(self.camera_distance, 2., 30.)
@@ -444,10 +514,16 @@ pub struct VehicleTuning {
     pub tire_grip: Option<f32>,
     pub lean_max: Option<f32>,
     pub lean_rate: Option<f32>,
+    pub lean_expo: Option<f32>,
     pub counter_steer: Option<f32>,
     pub preload_release: Option<f32>,
     pub air_yaw: Option<f32>,
     pub lean_yaw: Option<f32>,
+    pub steer_rate: Option<f32>,
+    pub grip_assist: Option<f32>,
+    pub pivot_boost: Option<f32>,
+    pub berm_assist: Option<f32>,
+    pub step_assist: Option<f32>,
     pub flip_rate: Option<f32>,
     pub whip_rate: Option<f32>,
 }
@@ -478,6 +554,9 @@ impl VehicleTuning {
         if let Some(v) = self.lean_rate {
             d.bike.lean_rate = v;
         }
+        if let Some(v) = self.lean_expo {
+            d.bike.lean_expo = v;
+        }
         if let Some(v) = self.counter_steer {
             d.bike.counter_steer = v;
         }
@@ -489,6 +568,21 @@ impl VehicleTuning {
         }
         if let Some(v) = self.lean_yaw {
             d.bike.lean_yaw = v;
+        }
+        if let Some(v) = self.steer_rate {
+            d.bike.steer_rate = v;
+        }
+        if let Some(v) = self.grip_assist {
+            d.bike.grip_assist = v;
+        }
+        if let Some(v) = self.pivot_boost {
+            d.bike.pivot_boost = v;
+        }
+        if let Some(v) = self.step_assist {
+            d.bike.step_assist = v;
+        }
+        if let Some(v) = self.berm_assist {
+            d.bike.berm_assist = v;
         }
         if let Some(v) = self.flip_rate {
             d.bike.flip_rate = v;
@@ -509,10 +603,16 @@ impl VehicleTuning {
             self.tire_grip.map(|x| (x, 0.1, 20.)),
             self.lean_max.map(|x| (x, 0.05, 1.4)),
             self.lean_rate.map(|x| (x, 0., 60.)),
+            self.lean_expo.map(|x| (x, 0., 1.)),
             self.counter_steer.map(|x| (x, 0., 2.)),
             self.preload_release.map(|x| (x, 0., 20000.)),
             self.air_yaw.map(|x| (x, 0., 20.)),
             self.lean_yaw.map(|x| (x, 0., 40.)),
+            self.steer_rate.map(|x| (x, 0., 8.)),
+            self.grip_assist.map(|x| (x, 0., 1.)),
+            self.pivot_boost.map(|x| (x, 1., 4.)),
+            self.berm_assist.map(|x| (x, 0., 2.)),
+            self.step_assist.map(|x| (x, 0., 0.6)),
             self.flip_rate.map(|x| (x, 0., 12.)),
             self.whip_rate.map(|x| (x, 0., 12.)),
         ]

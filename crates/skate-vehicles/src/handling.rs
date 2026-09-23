@@ -132,7 +132,16 @@ pub(crate) fn tires(v: &mut Vehicle, bodies: &mut RigidBodySet, colliders: &Coll
         // Preserve legacy brake setting scale, but interpret at the reference 120 Hz.
         // Brake torque is time-scaled and can lock a wheel without reversing its spin.
         let braking = if c.handbrake && !def.steering {
-            1.
+            // On a bike the throttle fights the rear brake, and that fight is
+            // the pivot: brake alone stops you, brake *and* throttle spins the
+            // rear up while it is still sliding, so the bike comes round
+            // without losing its drive. Held at full it anchored the bike and
+            // a 0.8 s tap left it stationary.
+            if d.bike.enabled {
+                (1. - c.throttle.max(0.)).max(0.12)
+            } else {
+                1.
+            }
         } else if d.bike.enabled && !def.steering {
             // `brake` is the front lever on a bike (LT), which is most of the
             // stopping power; the rear gets a share, and `handbrake` above is
@@ -162,7 +171,21 @@ pub(crate) fn tires(v: &mut Vehicle, bodies: &mut RigidBodySet, colliders: &Coll
                 .ground_object
                 .map(|h| colliders[h].friction())
                 .unwrap_or(1.);
-            let capacity = load * d.tire_grip * surface * dt;
+            // A rear wheel held locked under the brake is sliding, and a
+            // sliding tyre gives up grip in *both* directions. Cutting only
+            // its cornering stiffness left it decelerating at nearly a g, so
+            // a pivot rotated the bike 166 degrees and parked it. This is
+            // what turns that into a slide that keeps its momentum.
+            let locked_rear = d.bike.enabled && c.handbrake && !def.steering;
+            // Deliberately mild. Anything lower and the rear lets go far
+            // enough that the bike swaps ends: at 0.35 a 0.8 s tap swept it
+            // 166 degrees and scrubbed 9 m/s down to 2, and raising it to 0.6
+            // was *worse*, because more grip while sideways is more drag. A
+            // held rear brake should step the back out a little, not lose the
+            // corner. A real drift mechanic needs the heading kept on a leash
+            // as well, which this does not yet do.
+            let slide = if locked_rear { 0.75 } else { 1. };
+            let capacity = load * d.tire_grip * surface * slide * dt;
             let inv_long = effective_inverse_mass(&bodies[v.body], p, forward)
                 + ground
                     .map(|h| effective_inverse_mass(&bodies[h], p, forward))
@@ -176,8 +199,8 @@ pub(crate) fn tires(v: &mut Vehicle, bodies: &mut RigidBodySet, colliders: &Coll
             let locked = braking > 0. && omega.abs() < 0.001;
             let mut jx = if locked {
                 (-longitudinal / inv_long.max(1e-6)).clamp(
-                    -braking * d.brake_impulse * 120. * dt,
-                    braking * d.brake_impulse * 120. * dt,
+                    -braking * d.brake_impulse * 120. * slide * dt,
+                    braking * d.brake_impulse * 120. * slide * dt,
                 )
             } else {
                 (*omega * r - longitudinal) / (inv_long + r * r / inertia)
@@ -190,6 +213,11 @@ pub(crate) fn tires(v: &mut Vehicle, bodies: &mut RigidBodySet, colliders: &Coll
             } else {
                 8.
             };
+            // A locked rear wheel has almost no lateral grip -- that is what
+            // makes a handbrake turn a pivot instead of a stop. Without this
+            // the rear keeps full cornering stiffness while its rotation is
+            // held at zero, so the bike simply anchors and halts.
+            let stiffness = if locked_rear { stiffness * 0.2 } else { stiffness };
             let cornering = -load * stiffness * slip_angle * dt;
             let stopping = -lateral / inv_side.max(1e-6) / wheel_count;
             let mut jy = cornering.signum() * cornering.abs().min(stopping.abs());

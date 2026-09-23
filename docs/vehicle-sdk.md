@@ -431,6 +431,119 @@ visible on flat ground:
   flat the normal *is* world up, which is exactly why it read as correct.
   `tests/bike.rs` pins this with a cambered ground plane.
 
+### Berms, and how much of one is already free
+
+A berm is a banked corner, and the useful thing about it is that **most of the
+effect is already there without any code**. The suspension pushes along the
+contact normal; on a berm that normal leans toward the turn centre, so the
+ground supplies centripetal force directly and the tyres never have to. This
+is easy to miss because it cannot be seen on a tilted plane -- there the same
+component points downhill, and the bike simply runs away from the corner
+instead of round it. It only appears on a *curved* bank, which is why
+`tests/bike.rs` builds a bowl rather than a slope.
+
+`berm_assist` adds the measured bank to the rider's lean inside `carve_rate`,
+on the reasoning that a bike leaned `l` on a bank `b` corners as though leaned
+`b + l`. That reasoning is correct and the term is still only worth **0.2**,
+because the ground has already done most of the work. Measured on a 26 degree
+bowl entered at 14 m/s, holding full lock for three seconds:
+
+| `berm_assist` | swept | speed out |
+| --- | --- | --- |
+| 0.00 | 3.50 rad | 20.6 m/s |
+| **0.15** | **4.05 rad** | **18.5 m/s** |
+| 0.30 | 4.78 rad | 11.2 m/s |
+| 0.45 | 5.09 rad | 6.9 m/s |
+| 1.00 | 4.06 rad | 8.1 m/s |
+
+Past about 0.45 the bike sweeps *less* for more command, which is the
+signature of a slide: the carve is asking for a yaw rate the tyres cannot
+convert into a change of direction, so it scrubs instead. The physically exact
+value of 1 is the worst of both -- it leaves a corner at 8 m/s that it entered
+at 14, where no assist at all leaves at 20. A berm should sling you out.
+
+Two smaller things fall out of the same term for nothing. Off-camber is a bank
+of the opposite sign, so it subtracts and the bike pushes wide. And riding
+straight across a camber pulls you downhill, which is what a real bike does.
+
+**The clamp before the tangent is required, not tidy.** `lean_max` is 60
+degrees and a steep berm is another 40; the sum lands past the singularity at
+90, where `tan` returns a large *negative* number. Unclamped, the bike snaps
+into turning the wrong way at exactly the moment the rider has committed
+everything to the corner. At the 80 degree clamp `tan` is already 5.7, far
+more turn than any tyre will hold, so nothing real is given up.
+
+### Steps and stairs
+
+A raycast wheel samples the ground at a single point, so it has no footprint
+and **cannot roll over an edge**. A riser arrives as an instantaneous jump in
+ground height: the suspension compresses in one frame, spikes, and throws the
+bike. A whole flight is worse than one step, because the chassis pitch lags
+the staircase slope, so the frame ends up driven into a riser two steps ahead
+of the front wheel while that wheel is still down on the first tread. Measured
+at 8 m/s into 0.20 m risers, the chassis took a single 1717-unit shove along
+its own heading and the bike went from 11.2 m/s to a standstill inside one
+frame.
+
+**Reshaping the chassis does not fix this**, which is worth stating because it
+is the obvious thing to try. Five colliders were measured over a twelve-step
+flight, averaged across five entry phases so the result was not one lucky run:
+
+| chassis | 0.15 m rise | 0.18 | 0.20 | 0.25 |
+| --- | --- | --- | --- | --- |
+| as shipped | 4/5 | 0/5 | 0/5 | 0/5 |
+| front pulled inside the wheel | 5/5 | 0/5 | 0/5 | 0/5 |
+| front in, belly raised | 0/5 | 0/5 | 1/5 | 0/5 |
+| compact, heavily rounded | 5/5 | 0/5 | 0/5 | 0/5 |
+| **as shipped, `step_assist` 0.3** | **5/5** | **5/5** | **5/5** | **5/5** |
+
+Pulling the front inside the wheel and raising the belly both made things
+*worse* on balance. The chassis has to be moved, not reshaped.
+
+`step_assist` is the tallest step, in metres, the bike will climb. When one is
+found it places the chassis on top of it and hands back the pace the jam took.
+Two details decide whether this is a fix or a cheat:
+
+- **It moves the body rather than pushing it.** Impulses were tried first and
+  do not work: the frame is already pressed into the riser, so the solver
+  cancels whatever forward speed is handed to it, and lifting bodily just
+  raises the jam along with the bike. This is the same thing a character
+  controller does to walk up a stair.
+- **It fires before the impact, and only on a discontinuity.** Two probes
+  ahead of the *leading* wheel -- at 0.12 m and 0.3 m -- must show flat ground
+  and then a rise. A ramp is already climbing under the near probe, so it
+  never triggers; measured against 15, 25, 35 and 45 degree ramps, the
+  trajectory with the assist on is bit-identical to the one with it off. A
+  wall has no top within reach of the far probe, so it stays a wall. Waiting
+  for the jam instead meant taking the hit first, which threw the rider and
+  made clearing a flight a coin flip.
+
+Probing close matters: treads are short, and looking 0.35 m or more ahead
+lands two steps on and reads their combined height as unclimbable.
+
+### Lean is only ever as far as the turn earns
+
+A leaned bike is balancing centripetal acceleration against gravity, so the
+honest angle is `atan(v*w/g)`. `lean_target` clamps to exactly that, using the
+yaw rate measured *last frame* -- not one derived from the lean, so there is no
+circularity -- with a small floor so a turn can still be started from no yaw at
+all.
+
+This is inert everywhere except walking pace, which is the whole point. Held at
+full lock:
+
+| speed | turn rate | justified lean | shown before | shown now |
+| --- | --- | --- | --- | --- |
+| 2.0 m/s | 1.62 rad/s | 18 deg | 35 deg | **18 deg** |
+| 4.0 | 2.80 | 48 | 60 | **49** |
+| 8.9 | 2.52 | 66 | 60 | 60 |
+| 17.5 | 2.14 | 75 | 60 | 60 |
+
+From about 4 m/s up the cap is already past `lean_max`, so full lean stays
+available and the turn rates are unchanged to two decimal places. Below that
+the bike used to be drawn lying over at 35 degrees for a turn that justified
+23, which reads as falling over rather than riding.
+
 ### Pitch is asked for, never stumbled into
 
 Drive and brake torque act at the contact patch, and on a bike with real grip

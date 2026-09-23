@@ -251,6 +251,9 @@ impl Simulation {
                 handling::tires(v, &mut self.world.bodies, &self.world.colliders, h);
                 if v.definition.bike.enabled {
                     bike::apply(v, &mut self.world.bodies, h);
+                    // After the handling, and against the world rather than
+                    // just the bodies: it has to probe the ground ahead.
+                    bike::step_up(v, &mut self.world, h);
                 } else {
                     assists::apply(v, &mut self.world.bodies, h);
                 }

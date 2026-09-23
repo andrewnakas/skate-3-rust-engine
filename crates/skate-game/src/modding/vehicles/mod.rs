@@ -58,6 +58,50 @@ pub(crate) struct Vehicles {
     previous_motion: BTreeMap<u64, interpolation::Motion>,
     rendered_motion: BTreeMap<u64, interpolation::Motion>,
     posture: Posture,
+    follow: Follow,
+}
+
+/// Where the chase camera is looking, smoothed.
+///
+/// The camera used to take its direction straight from the chassis, projected
+/// flat. That works while the bike is upright and fails completely the moment
+/// it is not: halfway through a backflip the forward axis points at the sky,
+/// its horizontal projection is nearly zero, and the direction it normalises
+/// to is noise. The camera snapped through a half turn and back on every flip.
+///
+/// So the yaw is a filtered state rather than a per-frame reading, and what it
+/// follows is *where the bike is going*, not where it is pointing. A whip
+/// swings the bike most of a quarter turn and lands it straight; a camera
+/// bolted to the nose swings through all of that and reads as the world
+/// spinning rather than the bike going sideways.
+#[derive(Default)]
+struct Follow {
+    yaw: f32,
+    ready: bool,
+}
+
+impl Follow {
+    /// Shortest signed angle from `from` to `to`, wrapped to +/-pi. Heading
+    /// crosses the wrap point in the middle of an ordinary corner, and an
+    /// unwrapped difference reads that as most of a rotation the wrong way.
+    fn shortest(from: f32, to: f32) -> f32 {
+        let mut d = (to - from) % std::f32::consts::TAU;
+        if d > std::f32::consts::PI {
+            d -= std::f32::consts::TAU;
+        } else if d < -std::f32::consts::PI {
+            d += std::f32::consts::TAU;
+        }
+        d
+    }
+
+    fn approach(&mut self, target: f32, rate: f32, dt: f32) {
+        if !self.ready {
+            self.yaw = target;
+            self.ready = true;
+            return;
+        }
+        self.yaw += Self::shortest(self.yaw, target) * (1. - (-rate * dt).exp());
+    }
 }
 
 /// How much of each rider posture the ride is currently asking for, 0..1 each.
@@ -89,6 +133,66 @@ impl Posture {
         ease(&mut self.lean, target.lean, 8.);
     }
 }
+#[cfg(test)]
+mod follow_tests {
+    use super::Follow;
+
+    /// The wrap is the whole reason this is not a lerp: a bike pointing just
+    /// west of north and a camera just east of it are two degrees apart, and
+    /// a naive difference calls it 358 and spins the camera the long way.
+    #[test]
+    fn the_shortest_way_round_is_taken_across_the_wrap() {
+        let pi = std::f32::consts::PI;
+        assert!((Follow::shortest(pi - 0.05, -pi + 0.05) - 0.1).abs() < 1e-4);
+        assert!((Follow::shortest(-pi + 0.05, pi - 0.05) + 0.1).abs() < 1e-4);
+        assert!((Follow::shortest(0., 1.) - 1.).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_first_frame_snaps_and_the_rest_ease() {
+        let mut f = Follow::default();
+        f.approach(2., 5., 1. / 60.);
+        assert_eq!(f.yaw, 2., "a fresh camera should start where it is aimed");
+        f.approach(3., 5., 1. / 60.);
+        assert!(f.yaw > 2. && f.yaw < 2.2, "should ease, not jump: {}", f.yaw);
+    }
+
+    /// A backflip spins the chassis through every heading. The camera is fed
+    /// the direction of travel instead, so it should barely move -- this is
+    /// the failure the filter exists to prevent.
+    #[test]
+    fn a_flip_does_not_swing_the_camera() {
+        let mut f = Follow::default();
+        f.approach(0., 5., 1. / 60.);
+        let mut worst: f32 = 0.;
+        for tick in 0..120 {
+            // Travel stays north through the whole rotation.
+            f.approach(0., 1.6, 1. / 60.);
+            worst = worst.max(f.yaw.abs());
+            let _ = tick;
+        }
+        assert!(worst < 0.01, "camera drifted {worst} rad while flipping");
+    }
+
+    #[test]
+    fn a_whip_is_followed_smoothly_rather_than_snapped_to() {
+        let mut f = Follow::default();
+        f.approach(0., 5., 1. / 60.);
+        // Bike sent 70 degrees sideways; the camera should take real time.
+        let target = 1.22_f32;
+        f.approach(target, 1.6, 1. / 60.);
+        assert!(f.yaw < target * 0.1, "snapped to the whip: {}", f.yaw);
+        for _ in 0..90 {
+            f.approach(target, 1.6, 1. / 60.);
+        }
+        assert!(
+            (f.yaw - target).abs() < 0.2,
+            "should have caught up by now: {}",
+            f.yaw
+        );
+    }
+}
+
 impl Vehicles {
     pub(crate) fn occupied(&self) -> bool {
         self.driver.is_some()
@@ -112,28 +216,11 @@ impl Vehicles {
         let q = pose.rotation;
         let def = &self.simulation.vehicles[&i.id].definition;
         let center = pose.translation + Vec3::Y * 0.5;
-        let nose = (q * Vec3::Z).with_y(0.).normalize_or_zero();
-        // Follow where the bike is going rather than where it is pointing. A
-        // whip yaws the bike most of a quarter turn and lands it straight; a
-        // camera bolted to the nose would swing through all of that and read
-        // as the world spinning instead of the bike going sideways.
-        let travel = self
-            .simulation
-            .telemetry(i.id)
-            .map(|(v, _, _)| Vec3::from_array(v).with_y(0.))
-            .unwrap_or(Vec3::ZERO);
-        let forward = if travel.length() > 3. {
-            let travel = travel.normalize();
-            // Never look at the back of the bike: a reversing or backwards
-            // sliding bike keeps the nose-led camera.
-            if travel.dot(nose) > 0. {
-                nose.lerp(travel, 0.75).normalize_or(nose)
-            } else {
-                nose
-            }
-        } else {
-            nose
-        };
+        let _ = q;
+        // `follow.yaw` is filtered in `present`; here it is only read, so the
+        // camera cannot inherit a frame of chassis noise.
+        let (sin, cos) = self.follow.yaw.sin_cos();
+        let forward = Vec3::new(sin, 0., cos);
         Some(
             Transform::from_translation(
                 center - forward * def.camera_distance + Vec3::Y * def.camera_height,
@@ -326,6 +413,7 @@ pub(super) fn clear(world: &mut World) {
         v.steering_visual = 0.;
         v.crash_handoff = false;
         v.posture = Posture::default();
+        v.follow = Follow::default();
         v.previous_motion.clear();
         v.rendered_motion.clear();
         v.remote.clear();
@@ -963,6 +1051,7 @@ pub(crate) fn present(world: &mut World) {
             }
             Some((i.clips.pose(Some(clip), d.time, true)?, extend))
         })();
+        let followed = i.id;
         // The physics body never rolls: the bike's lean lives in `Motion`, and
         // the rider rides the leaned frame, not the upright chassis.
         let body = v.rendered_motion[&i.id].leaned();
@@ -1005,6 +1094,39 @@ pub(crate) fn present(world: &mut World) {
         }
         v.posture = posture;
         v.pose = pose;
+        // Where the camera should be looking, decided once per frame.
+        //
+        // Preference order matters. Travel direction is used whenever the bike
+        // is actually going somewhere, because it survives a flip, a whip and
+        // a slide untouched. The nose is the fallback for a stationary bike,
+        // and it is only trusted while it still has a horizontal direction to
+        // give: past `UPRIGHT_ENOUGH` the projection is mostly rounding error.
+        const UPRIGHT_ENOUGH: f32 = 0.35;
+        let body = v.rendered_motion[&followed].body;
+        let nose = body.rotation * Vec3::Z;
+        let travel = v
+            .simulation
+            .telemetry(followed)
+            .map(|(velocity, _, _)| Vec3::from_array(velocity).with_y(0.))
+            .unwrap_or(Vec3::ZERO);
+        let target = if travel.length() > 2.5 {
+            Some(travel.normalize())
+        } else if nose.with_y(0.).length() > UPRIGHT_ENOUGH {
+            Some(nose.with_y(0.).normalize())
+        } else {
+            // Nose at the sky, going nowhere: hold the last heading rather
+            // than chase a direction that is not there.
+            None
+        };
+        if let Some(target) = target {
+            // Ease harder on the ground, where the camera should stay behind
+            // the bike, than in the air, where a lazy camera is what keeps a
+            // whip or a flip readable instead of nauseating.
+            let airborne = v.simulation.bike_state(followed).is_some_and(|b| b.airborne);
+            let rate = if airborne { 1.6 } else { 5.0 };
+            let yaw = target.x.atan2(target.z);
+            v.follow.approach(yaw, rate, dt);
+        }
     });
     world.resource_scope(|world, mut v: Mut<Vehicles>| {
         let duration = if v.visual_phase == "vanilla" {
