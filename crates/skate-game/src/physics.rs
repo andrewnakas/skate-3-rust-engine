@@ -592,6 +592,10 @@ mod grab_tests;
 #[path = "tests/revert_playback.rs"]
 mod revert_tests;
 
+#[cfg(test)]
+#[path = "tests/footplant_playback.rs"]
+mod footplant_tests;
+
 fn present(
     physics: Res<GamePhysics>,
     history: Res<crate::presentation::Presentation>,

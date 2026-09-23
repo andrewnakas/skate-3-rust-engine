@@ -197,3 +197,41 @@ A revert extends a line rather than opening one, so thrown on its own nothing is
 snapshot stays at zero. That is retail behaviour, not a gap.
 
 Proven by `tests/revert_playback.rs::left_stick_slides_reach_both_reverts`.
+
+## The ground plant family
+
+All four `PushTrick` children are entered from the ground. A ground grab is stricter than an air
+grab: `trick_intentions::produce` advances the ground timers only when the trigger reads
+*exactly* 1.0, so a partial analog value is not a held grab.
+
+| Trick | id | Trigger (held fully) | Push |
+|---|---:|---|---|
+| `fsboneless` | 215 | left | A |
+| `fsfastplant` | 217 | left | X |
+| `bsboneless` | 216 | right | A |
+| `bsfastplant` | 218 | right | X |
+| `hippyjump` | 234 | none | A + X, then **release** |
+
+**The hippy jump is a charge.** Its antic cycles for as long as both pushes are down
+(`B_HIPPYJUMP_ANTIC` into `T_HIPPYJUMP_ANTIC_CYC`) and launches on the release. A button held
+for the whole run never leaves the anticipation, which reads as a missing trick rather than as an
+unfinished one.
+
+Proven by `tests/footplant_playback.rs`.
+
+### Open: the no-comply
+
+`nocomply` (229) is named by `Motion.OnBoard.Trick.PushTrick.NoComply.FootPlant` and has authored
+points, so it is reachable in principle, but no input here has reached it yet.
+`T_PushTrick.xml`'s `PlantingFoot` wants two MotionGraph intents together --
+`HasIntent NewFootPlant` **and** `HasIntent NoComply` -- and a front-foot push followed by an
+ollie scoop produces `Ollie`, not `NoComply`, however the two are spaced: the push enters
+(`B_PUSH_INTO`) and the scoop pops an ordinary ollie straight over the top of it
+(`B_ANTIC_INTO`, `B_OLLIE_G`).
+
+`docs/plants.md` records the intended recipe as "begin a front-foot push, then flick the right
+stick for an ollie during push entry; the graph accepts the Square gesture group". The open
+question is which gesture group `CreateTrickIntentFromGesture` is meant to resolve while a push
+foot is planted, and what publishes `NoComply` rather than `Ollie` from it. The same question
+covers the four `no_comply_*180/360` ids, though those have no VLT record at all and so score
+nothing even once reached.
