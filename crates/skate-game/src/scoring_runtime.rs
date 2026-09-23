@@ -288,6 +288,10 @@ pub(crate) struct Frame {
     pub landing: skate_core::animation::landing_quality::Output,
     pub teleported: bool,
     pub reverting: bool,
+    /// PhysOut -> State byte 70, the ground collector's manual gate at 82DAA8E0.
+    /// 82DB6EC0 fills it from `[base+1888]+56`; this host publishes no such byte, so it
+    /// is always false. It is **not** State+66, the revert's active lifetime.
+    pub manual_block_70: bool,
 }
 pub(crate) struct Runtime {
     pub data: ScoringData,
@@ -338,8 +342,14 @@ pub(crate) struct Runtime {
     pub flip_seen: bool,
     landing_countdown: u32,
     idle_ticks: u32,
+    /// ScoreModule+112. 82DA33E0 counts the consecutive frames the line timer's near-one
+    /// hold actually took effect while the *ground* collector is the active one, and caps
+    /// the hold at `[collector 0x5fc] * 60` frames. Any frame that does not hold resets it.
+    ground_hold_ticks: u32,
     collector_ticks: u32,
-    manual_revert_ticks: u32,
+    /// The ground collector's own counter at +932: frames the manual slot has been
+    /// suppressed by State+70, which readmits it only while the count is <= 6.
+    manual_block_ticks: u32,
     revert_id: Option<usize>,
     sequence_active: bool,
     sequence_score: f32,
@@ -404,8 +414,9 @@ impl Runtime {
             flip_seen: false,
             landing_countdown: 0,
             idle_ticks: 0,
+            ground_hold_ticks: 0,
             collector_ticks: 0,
-            manual_revert_ticks: 0,
+            manual_block_ticks: 0,
             revert_id: None,
             sequence_active: false,
             sequence_score: 0.,
@@ -631,6 +642,12 @@ impl Runtime {
                     .by_id(c.scorable.id)
                     .ok_or("Missing announced scorable")?;
                 self.base_trick_label = Some(d.label.clone());
+                // 825E51A0 resolves the *named* scorable's record and reads its TrickType
+                // from desc+120 to decide whether the name may carry a spin. Setting the
+                // label here without the type left the type at whatever a previous flip
+                // ladder conversion had put there -- 0 for any ordinary trick, which
+                // `decorates_spin` refuses, so no spin ever reached a trick name.
+                self.base_trick_type = d.trick_type;
                 self.stance = [f.switch, f.fakie, f.nollie, false];
                 self.new_trick = true;
                 if self.collector == Collector::Air && !self.air_repetition_set {
@@ -807,6 +824,62 @@ impl Runtime {
         self.flip_bonus_paid = true;
     }
 
+    /// Whether a sequence is open, i.e. whether the collectors are still building one.
+    pub(crate) fn sequence_open(&self) -> bool {
+        self.sequence_active
+    }
+
+    /// The composed name the display is showing, as [`compose_trick_name`] last built it.
+    pub(crate) fn displayed_name(&self) -> &str {
+        &self.trick_name
+    }
+
+    /// The active collector's answer to "does the sequence continue?", vtable slot 5, which
+    /// `82DA37B0` calls every frame and publishes on a no. The six collectors are named in
+    /// `.rdata` at `0x823280F4` and their vtables run from `0x8232812C` in 40-byte strides,
+    /// each with `GetName` at slot 6; the Air table at `0x823281A4` is confirmed by slot 3
+    /// being its Enter `82DA8078` and slot 9 its publisher `82DA9A18`.
+    ///
+    /// ```text
+    /// Other      8274CA90   li r3,0            ; never
+    /// Grind      8281DD70   li r3,1            ; always
+    /// Handplant  8281DD70   li r3,1            ; always
+    /// Air        82DA98C8   r4 || [this+2352] > 5 || ([this+104] & 0x01000000)
+    /// Offboard   82DAC1F8   [this+252] && [this+140] in (-1,332) && [this+316]
+    /// Ground     82DAB2A8   a long OR; see below
+    /// ```
+    ///
+    /// `82DAB2A8`'s terms, in its own order: `[this+116] > 0`, byte `[this+944]`, a revert
+    /// bit `0x20000000`/`0x10000000` while `r4`, the published scoring-trick bit
+    /// `0x01000000`, either carrier slot (`[this+652]`/`[this+540]` with `[this+716]`, and
+    /// `[this+252]`/`[this+140]`), the manual grace `[this+932] <= 6`, and -- again only
+    /// while `r4` -- a speed test on `[[PhysOut+32]+268]` and a VMX compare on
+    /// `[[PhysOut+0]+80]`.
+    ///
+    /// Not ported: `r4` is the display-live bit this host does not publish, so the terms it
+    /// gates are taken unconditionally; `[this+116]`, `[this+944]` and the two speed tests
+    /// are unidentified fields. Every one of those is a *keep going* term, so leaving them
+    /// out can only end a sequence earlier than retail, never later.
+    fn sequence_continues(&self, f: &Frame) -> bool {
+        // The scoring-trick bit is a pulse, not a latch: over a measured session it was set
+        // on 4.8% of frames and never for more than 13 grounded frames in a row. That pulse
+        // is what bridges the gap between a manual's carrier ending and the air beginning.
+        let announced = f.flags & 0x0100_0000 != 0;
+        let carried = self.carriers.iter().any(Option::is_some);
+        match self.collector {
+            Collector::None => false,
+            Collector::Grind | Collector::Handplant => true,
+            Collector::Air => self.collector_ticks > 5 || announced,
+            Collector::Offboard => carried,
+            Collector::Ground => {
+                announced
+                    || carried
+                    || f.flags & 0x3000_0000 != 0
+                    || self.manual_block_ticks > 0 && self.manual_block_ticks <= 6
+            }
+        }
+    }
+
     pub fn advance(&mut self, f: Frame) -> Result<(), String> {
         self.new_trick = false;
         self.modified_trick = false;
@@ -916,7 +989,7 @@ impl Runtime {
             self.collector = next;
             self.grab_chain = 0;
             self.collector_ticks = 0;
-            self.manual_revert_ticks = 0;
+            self.manual_block_ticks = 0;
             self.revert_id = None;
             // Everything below belongs to the *air* collector and is cleared by its own
             // Enter, 82DA8078 -- not by leaving it. Clearing on every transition wiped the
@@ -978,13 +1051,35 @@ impl Runtime {
                 } else {
                     None
                 };
-                if ids[1].is_some() && f.reverting {
-                    self.manual_revert_ticks += 1;
+                // 82DAA8E0, the ground collector's manual slot:
+                //
+                // ```text
+                // r9  = [this+104]               ; the scoring flags word
+                // r10 = [[[this+4]+28]+70]       ; PhysOut -> State, byte 70
+                // r4  = bit4(r9) || bit5(r9)     ; nose or tail manual
+                // if (r4 && r10) { [this+932]++ ; r4 = 0 }
+                // else if (!bit30([holder+1832])) [this+932] = 0
+                // if (r4) r4 &= ([this+932] <= 6)   ; the subfic/subfe pair
+                // ```
+                //
+                // The gate is State+**70**. This port read State+66 instead -- the byte
+                // 82D43B10, RevertGround's Fill, sets for the revert's whole active
+                // lifetime -- so the manual carrier was dropped on every frame of every
+                // revert. With no carrier the sequence went idle, published itself, and
+                // the line then drained the multiplier back to x1: the reported "the score
+                // resets if you connect in a manual". Reading the byte retail reads leaves
+                // the gate clear, which is also what retail does whenever it is clear.
+                //
+                // The reset condition is retail's one deliberate deviation: it resets on
+                // `bit30([holder+1832]) == 0`, the display-live bit this host does not
+                // publish, and an empty line is the nearest state it does.
+                if ids[1].is_some() && f.manual_block_70 {
+                    self.manual_block_ticks = self.manual_block_ticks.saturating_add(1);
                     ids[1] = None;
-                } else {
-                    self.manual_revert_ticks = 0;
+                } else if self.session.line.points <= 0. {
+                    self.manual_block_ticks = 0;
                 }
-                if self.manual_revert_ticks > 6 {
+                if self.manual_block_ticks > 6 {
                     ids[1] = None;
                 }
                 if ids[1].is_some() {
@@ -1119,16 +1214,67 @@ impl Runtime {
         } else {
             1.
         };
-        self.session
+        // 82DA33E0 calls 82DA4C28 twice, and the two calls do *not* share a hold flag.
+        //
+        // ```text
+        // r29 = ([module+4] == [module+16])   ; the active collector is the ground one
+        // r5  = bit30 of [holder+1832]        ; the trick display is live
+        // if (!r5)          r30 = 0           ; no hold at all
+        // else if (!r29)    r30 = 1           ; any other collector holds without a bound
+        // else              r30 = [module+112] < (int)([module+64]+1532 * 60.0)
+        // bl 0x82da4c28     ; r3 = module+40, the line timer, r5 = r30
+        // [module+112] = (returned hold && r29) ? [module+112] + 1 : 0
+        // li r5,0
+        // bl 0x82da4c28     ; r3 = module+44, the combo timer -- never held
+        // ```
+        //
+        // The collector at module+16 is the ground one: 82DA3C68 writes its byte+945 every
+        // frame, and 82DAA8E0, which reads that same byte's object, is what tests the
+        // nose/tail manual bits 0x08000000/0x04000000. Its authored bound is
+        // `0x5fc` = 5.0 seconds times the 60.0 at 0x8303745C, so 300 frames.
+        //
+        // Passing "a collector is active" to both calls, as this did, held the line just
+        // above one point for as long as *any* ground carrier existed -- a manual, a
+        // powerslide, a revert -- so the line never expired and the score and trick name
+        // stayed on screen indefinitely. It also held the multiplier timer, which retail
+        // never does.
+        //
+        // `bit30 of [holder+1832]` is the gate, and it is not a constant: 82DA48B8 sets it
+        // when it republishes the line to the display, 82DA37B0 clears it every frame, and
+        // 82DA37B0 only calls 82DA48B8 while a line is open -- when the active collector
+        // says the sequence has stopped, or while `[module+129]` holds. So once a sequence
+        // has been banked and nothing further is happening, the bit goes clear and the line
+        // gets **no hold at all**: it drains out and the display fades. That is the retail
+        // behaviour of a score left alone.
+        //
+        // This host publishes no display-live bit, so `sequence_active` stands in for it --
+        // the hold exists to stop a line expiring underneath a trick in progress, and that
+        // is exactly when a sequence is open. Taking the bit as always set, as this first
+        // did, kept re-arming the hold long after the last trick and the score sat there.
+        let grounded = self.collector == Collector::Ground;
+        let hold_limit = (self.data.collector.scalar(0x5fc) * 60.) as u32;
+        let hold_line =
+            self.sequence_active && (!grounded || self.ground_hold_ticks < hold_limit);
+        let held = self
+            .session
             .line
-            .advance(f.dt, self.data.line_drain, line_scale, active);
+            .advance(f.dt, self.data.line_drain, line_scale, hold_line);
+        self.ground_hold_ticks = if held && grounded {
+            self.ground_hold_ticks.saturating_add(1)
+        } else {
+            0
+        };
         self.session
             .combo
             .timer
-            .advance(f.dt, self.data.combo_drain, combo_scale, active);
+            .advance(f.dt, self.data.combo_drain, combo_scale, false);
         let bailout = self.collector == Collector::None && self.sequence_active;
-        if self.sequence_active && (bailout || self.idle_ticks >= 3 && self.landing_countdown == 0)
-        {
+        // 82DA37B0 asks the *active collector* whether the sequence continues, through its
+        // vtable+20, and publishes when the answer is no. This port used to publish after
+        // three carrier-less frames instead, which cut a sequence apart at the moment you
+        // popped out of a manual and gave a grind no continuation at all.
+        let continues = self.sequence_continues(&f);
+        if self.sequence_active && (bailout || !continues && self.landing_countdown == 0) {
             if bailout {
                 self.session.holder.cancel_pending();
             }
@@ -1205,6 +1351,7 @@ impl Runtime {
         // reason. A closed display drops the base label so the next air starts clean.
         if self.close_tricks {
             self.base_trick_label = None;
+            self.base_trick_type = 0;
         }
         // Only the Air collector's slot 9 (82DA9A18) ever publishes the spin and the flip,
         // and only while it is the active collector. Every other collector leaves them
@@ -1234,6 +1381,30 @@ impl Runtime {
             || self.published_flip_direction != previous_flip
         {
             self.modified_trick = true;
+        }
+        // Every trace above is edge-triggered, and a line timer pinned just above one
+        // point by the near-one hold looks exactly like a healthy line unless it is
+        // sampled on every tick. 82DA33E0 bounds that hold with the counter at
+        // module+112; this is how we see whether it is running at all.
+        if trace_enabled() {
+            eprintln!(
+                "SCORE_TICK tick={} col={:?} flags={:08x} rev={} mblock={} active={active} idle={} land={} hold={hold_line} groundhold={} line={:.2} line_s={:.2} combo={:.2} mult={:.2} seq={} bail={bailout} close={} name={:?}",
+                f.tick,
+                self.collector,
+                f.flags,
+                f.reverting,
+                f.manual_block_70,
+                self.idle_ticks,
+                self.landing_countdown,
+                self.ground_hold_ticks,
+                self.session.line.points,
+                self.session.line.points / self.data.line_drain,
+                self.session.combo.timer.points,
+                self.session.combo.multiplier,
+                self.sequence_active,
+                self.close_tricks,
+                self.trick_name,
+            );
         }
         Ok(())
     }

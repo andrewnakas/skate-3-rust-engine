@@ -399,8 +399,13 @@ pub(super) fn advance(
         suspend_air: skater.player_input.physical.air.use_air_reckoning_452 != 0,
         landing: skater.landing_quality,
         teleported,
-        // Revert Fill publishes its active lifetime in State66. State70 is unset.
+        // Revert Fill (82D43B10) publishes its active lifetime in State66, which is
+        // what the revert scorable is selected from.
         reverting: skater.player_input.physical.state.flag_66 != 0,
+        // State70 is a different byte, and it is the one 82DAA8E0 gates the manual slot
+        // on. 82DB6EC0 fills it from `[base+1888]+56`, which this host does not publish,
+        // so it stays clear rather than borrowing State66's much longer lifetime.
+        manual_block_70: false,
     })?;
     super::climbing::approach::advance(physics, skater, controls);
     skater.animation_input.finish_output_publication();
