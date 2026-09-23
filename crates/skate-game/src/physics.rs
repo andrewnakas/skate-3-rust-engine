@@ -584,6 +584,10 @@ mod wipeout_tests;
 #[path = "tests/flip_playback.rs"]
 mod flip_tests;
 
+#[cfg(test)]
+#[path = "tests/fingerflip_playback.rs"]
+mod fingerflip_tests;
+
 fn present(
     physics: Res<GamePhysics>,
     history: Res<crate::presentation::Presentation>,

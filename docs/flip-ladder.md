@@ -93,3 +93,25 @@ a probe `board_ground.rs` does not issue at all.
 
 The Air collector's bank had no trace of its own until now; `SCORE_TRICK air ...` was added in
 `Runtime::finish` so the next investigation does not have to infer the components from the total.
+
+## Retail has no late double, triple or quad
+
+Asked and settled 2026-09-23, so it does not get re-opened: the ladder and the late mechanic are
+separate systems in retail and they do not compose. Three independent confirmations.
+
+**The scorable table has no numbered late entries.** `scoring/catalog.rs` carries exactly six late
+ids -- `latekickflip` (105), `lateheelflip` (104), `latebsshuv` (102), `latefsshuv` (103),
+`latebackfootkickflip` (101), `latebackfootheelflip` (100) -- plus `lateflip_darkcatch` (331).
+There is no `latekickflip2/3/4`, where the ordinary flips carry `kickflip2/3/4` at 97, 98 and 135.
+
+**The conversion table confirms it.** `conversions::LINKS[100..=105]` is `(-1, 128)` for all six:
+they link into `ollie`, not into a ladder chain. A late flip has no rung to be converted from.
+
+**The authored state has no cycle.** `Tricks/T_Lateflip.xml` is a single state with one
+`PlayAnimation` and two `WillExpire` exits. `T_Kickflip.xml` is what a ladder looks like -- the
+`Cyc1`/`Cyc2`/`Cyc3` chain and the `End.Out.Out1..3` air-time gates above. `skater_air.pat`
+authors exactly six patterns, `L_F_Kickflip`, `L_B_Kickflip`, `L_F_Heelflip`, `L_B_Heelflip`,
+`L_FS_Shuvit` and `L_BS_Shuvit`, and no held or repeated variant of any of them.
+
+Adding a late ladder is therefore not a port fix; it would be inventing a trick Skate 3 does not
+have, and it would need scorable ids beyond the retail 332, new `LINKS` rows and new clips.
