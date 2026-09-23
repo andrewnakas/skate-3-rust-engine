@@ -32,7 +32,7 @@ fn held_grabs_reach_their_authored_names() {
         // stance-free double grab is what a two-trigger hold reaches.
         (&[0, 1][..], CENTRE, "dblgrab"),
     ] {
-        let run = replay(hands, stick, None, 0, 300);
+        let run = replay(hands, stick, &[], 0, 300);
         assert!(
             run.grabs.iter().any(|g| g.starts_with(grab)),
             "{grab}: hands={hands:?} stick={stick:?} never published it; saw grabs={:?} tricks={:?} over {:?}",
@@ -52,7 +52,7 @@ fn grab_fingerflips_reach_their_authored_tricks() {
         (&[0][..], UP, "tailgrab_fingerflip"),
         (&[1][..], DOWN, "nosegrab_fingerflip"),
     ] {
-        let run = replay(hands, stick, Some("Fingerflip"), 0, 300);
+        let run = replay(hands, stick, &["Fingerflip"], 0, 300);
         assert!(
             run.tricks.iter().any(|t| t == trick),
             "{trick}: the held grab plus scoop never published it; saw tricks={:?} grabs={:?} over {:?}",
@@ -74,7 +74,7 @@ fn grab_to_grab_fingerflip_shuvs_cross_the_board_adjust_branches() {
         (&[1][..], UP, "BS_Varial", "seatbelttonose_fingerflip"),
         (&[0][..], DOWN, "BS_Varial", "crailtotail_fingerflip"),
     ] {
-        let run = replay(hands, stick, Some(scoop), 0, 300);
+        let run = replay(hands, stick, &[scoop], 0, 300);
         assert!(
             run.tricks.iter().any(|t| t == trick),
             "{trick}: the {scoop} scoop never published it; saw tricks={:?} grabs={:?} over {:?}",
@@ -99,7 +99,7 @@ fn one_foot_and_no_foot_variants_reach_their_authored_grabs() {
         (&[1][..], DOWN, X, "nosegrab_onefoot"),
         (&[1][..], DOWN, B, "nosegrab_airwalk"),
     ] {
-        let run = replay(hands, stick, None, buttons, 300);
+        let run = replay(hands, stick, &[], buttons, 300);
         assert!(
             run.grabs.iter().any(|g| g.starts_with(grab)),
             "{grab}: stick={stick:?} buttons={buttons:#06x} never published it; saw grabs={:?} over {:?}",
@@ -125,12 +125,60 @@ fn centred_grab_extras_reach_their_authored_names() {
         (&[0, 1][..], B, "superman"),
         (&[0, 1][..], A | X, "coffin"),
     ] {
-        let run = replay(hands, CENTRE, None, buttons, 300);
+        let run = replay(hands, CENTRE, &[], buttons, 300);
         assert!(
             run.grabs.iter().any(|g| g == grab),
             "{grab}: hands={hands:?} buttons={buttons:#06x} never published it; saw grabs={:?} over {:?}",
             run.grabs,
             run.animations
+        );
+    }
+}
+
+/// The mute and stale grabs are not a stick direction -- `StaleMute` is authored
+/// `active="false"` and reached only by `T_Grab.xml`'s `<transition target="Grabbing.StaleMute"/>`
+/// out of a plain grab's `FingerFlipShuv`. So the recipe is two scoops: an `FS_Varial` out of the
+/// fs/bs grab, which both scores the crossing trick and lands in stale/mute, then a `Fingerflip`
+/// out of what it landed in.
+#[test]
+#[ignore = "requires private stock graphs and animation assets"]
+fn varial_out_of_a_plain_grab_reaches_the_stale_and_mute_family() {
+    for (hands, crossing, grab, fingerflip) in [
+        (
+            &[0][..],
+            "fsgrabtostalegrab_fingerflip",
+            "stalegrab",
+            "stalegrab_fingerflip",
+        ),
+        (
+            &[1][..],
+            "bsgrabtomutegrab_fingerflip",
+            "mutegrab",
+            "mutegrab_fingerflip",
+        ),
+    ] {
+        let run = replay_with(
+            hands,
+            CENTRE,
+            &["FS_Varial", "Fingerflip"],
+            0,
+            CHAIN_BOOST,
+            360,
+        );
+        for expected in [crossing, fingerflip] {
+            assert!(
+                run.tricks.iter().any(|t| t == expected),
+                "{expected}: hands={hands:?} never published it; saw tricks={:?} grabs={:?} over {:?}",
+                run.tricks,
+                run.grabs,
+                run.animations
+            );
+        }
+        assert!(
+            run.grabs.iter().any(|g| g.starts_with(grab)),
+            "{grab}: the varial never landed in it; saw grabs={:?} tricks={:?}",
+            run.grabs,
+            run.tricks
         );
     }
 }
@@ -146,9 +194,12 @@ const UP: [i16; 2] = [0, 32767];
 const DOWN: [i16; 2] = [0, -32767];
 const CENTRE: [i16; 2] = [0, 0];
 
-/// Air time for the pop, the grab settle and the scoop. The flat course leaves about 0.77 s on
-/// its own (see `docs/flip-ladder.md`), which the grab alone consumes.
+/// Takeoff boost for one grab plus one scoop. The flat course leaves about 0.77 s on its own
+/// (see `docs/flip-ladder.md`), which the grab alone consumes.
 const BOOST: f32 = 13.0;
+/// A two-scoop chain needs the settle, both scoops and the gap between them inside one air, and
+/// running out mid-chain lands as a wipeout rather than a miss.
+const CHAIN_BOOST: f32 = 20.0;
 /// Ticks of stick-only hold before the trigger, so the board-adjust branch is the selected leaf
 /// when the grab arrives.
 const STICK_LEAD: u32 = 6;
@@ -156,6 +207,11 @@ const STICK_LEAD: u32 = 6;
 const SETTLE: u32 = 22;
 /// Ticks per authored coordinate, comfortably inside the recognizer's culling window.
 const SCOOP_STEP: u32 = 3;
+/// Ticks holding a finished scoop's last coordinate before the next one starts. This has to
+/// outlast the *animation* the first scoop's transition began, not just the state change: the
+/// grab-to-grab clips are `interruptable="false"`, and a gesture intent lives for a single tick,
+/// so a scoop thrown while `F_FLIP_fs_GRAB_TO_Stale` is still playing is simply dropped.
+const SCOOP_GAP: u32 = 30;
 
 #[derive(Default)]
 struct Outcome {
@@ -166,7 +222,7 @@ struct Outcome {
 
 /// Every scorable the graph can publish from a grab, so an unexpected one is reported by name
 /// rather than as a silent miss. Sourced from `scoring/catalog.rs`.
-const WATCHED: [&str; 34] = [
+const WATCHED: [&str; 42] = [
     "tailgrab",
     "tailgrab_left",
     "tailgrab_right",
@@ -197,17 +253,30 @@ const WATCHED: [&str; 34] = [
     "fsgrab_fingerflip",
     "bsgrab_fingerflip",
     "dblgrab",
+    "mutegrab",
+    "mutegrab_left",
+    "mutegrab_fingerflip",
+    "stalegrab",
+    "stalegrab_left",
+    "stalegrab_fingerflip",
+    "fsgrabtostalegrab_fingerflip",
+    "bsgrabtomutegrab_fingerflip",
     "superman",
     "coffin",
     "fs_onefoot_right",
     "fs_backfoot",
 ];
 
-fn replay(
+fn replay(hands: &[usize], stick: [i16; 2], scoops: &[&str], buttons: u16, ticks: u32) -> Outcome {
+    replay_with(hands, stick, scoops, buttons, BOOST, ticks)
+}
+
+fn replay_with(
     hands: &[usize],
     stick: [i16; 2],
-    scoop: Option<&str>,
+    scoops: &[&str],
     buttons: u16,
+    boost: f32,
     ticks: u32,
 ) -> Outcome {
     let root =
@@ -225,18 +294,30 @@ fn replay(
     // held grab direction with its Y flipped. Pick the authored variant that starts nearest that
     // point: the hold has already walked the pattern's first coordinate, so the flick only has to
     // complete it.
-    let held = [stick[0] as f32 / 32767., -(stick[1] as f32) / 32767.];
-    let scoop: Vec<[f32; 2]> = scoop
-        .map(|name| {
-            let mut variants = authored_all("skater_fingerflip.pat", &root, name);
-            variants.sort_by(|a, b| {
-                distance(a[0], held)
-                    .partial_cmp(&distance(b[0], held))
-                    .unwrap()
-            });
-            variants.swap_remove(0)
-        })
-        .unwrap_or_default();
+    let mut from = [stick[0] as f32 / 32767., -(stick[1] as f32) / 32767.];
+    // The air phase's stick track, one entry per tick: each scoop's coordinates in turn, then a
+    // hold on its last so the state it reached has time to run before the next scoop starts.
+    // Holding rather than centring matters -- centring drops the grab's own `BoardAdjustMag` and
+    // exits the branch mid-trick.
+    let mut track: Vec<[f32; 2]> = Vec::new();
+    for name in scoops {
+        let mut variants = authored_all("skater_fingerflip.pat", &root, name);
+        variants.sort_by(|a, b| {
+            distance(a[0], from)
+                .partial_cmp(&distance(b[0], from))
+                .unwrap()
+        });
+        let chosen = variants.swap_remove(0);
+        for point in &chosen {
+            for _ in 0..SCOOP_STEP {
+                track.push(*point);
+            }
+        }
+        from = *chosen.last().expect("authored scoop has coordinates");
+        for _ in 0..SCOOP_GAP {
+            track.push(from);
+        }
+    }
     let watched: Vec<(&str, _)> = WATCHED.iter().map(|n| (*n, encode(n.as_bytes()))).collect();
     let sample = |p: [f32; 2]| [(p[0] * 32767.) as i16, (-p[1] * 32767.) as i16];
 
@@ -254,10 +335,10 @@ fn replay(
         }
         if tick == 123 {
             for body in physics.board.bodies_mut() {
-                body.rates.linear_velocity.y += BOOST;
+                body.rates.linear_velocity.y += boost;
             }
             for body in skater.skeleton.bodies_mut() {
-                body.rates.linear_velocity.y += BOOST;
+                body.rates.linear_velocity.y += boost;
             }
         }
         let airborne = skater.player_state.current().category() == 200;
@@ -284,15 +365,13 @@ fn replay(
                     triggers[hand] = 255;
                 }
             }
-            let right = if air_ticks < SETTLE || scoop.is_empty() {
+            let right = if air_ticks < SETTLE || track.is_empty() {
                 stick
             } else {
-                let step = ((air_ticks - SETTLE) / SCOOP_STEP) as usize;
-                // Hold the scoop's last coordinate rather than centring: releasing to centre
-                // drops the grab's own BoardAdjustMag and exits the branch mid-trick.
-                scoop
+                let step = (air_ticks - SETTLE) as usize;
+                track
                     .get(step)
-                    .or_else(|| scoop.last())
+                    .or_else(|| track.last())
                     .copied()
                     .map(sample)
                     .unwrap_or(stick)
@@ -338,21 +417,26 @@ fn replay(
         }
 
         let motion = &skater.animation.motion;
-        if std::env::var_os("TRACE_GRAB").is_some() && airborne && air_ticks % 4 == 0 {
+        // `TRACE_GRAB=1` prints the whole air, one line per tick. Every diagnosis in this file
+        // came from reading it: which branch the AG chose, which gesture actually landed, and
+        // which clip was still playing when it did.
+        if std::env::var_os("TRACE_GRAB").is_some() && airborne {
             let ag = |n: &str| controls.action_intents.get(n).copied();
             let mg = |n: &str| motion.animation.motion_intents.get(n).copied();
             eprintln!(
-                "air{air_ticks:>3} AG angle={:?} mag={:?} L={:?} R={:?} | MG up={:?} down={:?} tail={:?} nose={:?} fs={:?} bs={:?} | anim={:?}",
+                "air{air_ticks:>3} right={right:?} | AG angle={:?} mag={:?} L={:?} R={:?} ff={:?} fsv={:?} bsv={:?}                  | MG up={:?} down={:?} ff={:?} ffs={:?} | grab={:?} anim={:?}",
                 ag("BoardAdjustAngle"),
                 ag("BoardAdjustMag"),
                 ag("LeftAirGrab"),
                 ag("RightAirGrab"),
+                ag("FingerFlip"),
+                ag("FS_Varial"),
+                ag("BS_Varial"),
                 mg("BoardAdjustUp"),
                 mg("BoardAdjustDown"),
-                mg("TailGrab"),
-                mg("NoseGrab"),
-                mg("FSGrab"),
-                mg("BSGrab"),
+                mg("FingerFlip"),
+                mg("FingerFlipShuv"),
+                outcome.grabs.last(),
                 motion.animation.current_name
             );
         }

@@ -88,6 +88,27 @@ variant starts nearest the held point, after the input manager's Y negation.
 Proven by `grab_fingerflips_reach_their_authored_tricks` and
 `grab_to_grab_fingerflip_shuvs_cross_the_board_adjust_branches`.
 
+## The mute and stale grabs
+
+Neither is a stick direction. `StaleMute` is authored `active="false"` and reached only by
+`T_Grab.xml`'s `<transition target="Grabbing.StaleMute"/>` out of a plain grab's `FingerFlipShuv`.
+So the recipe is two scoops, stick centred throughout:
+
+| Step | Input | Result |
+|---|---|---|
+| 1 | left trigger (fs) or right (bs) | `fsgrab` / `bsgrab` |
+| 2 | `FS_Varial` scoop | scores `fsgrabtostalegrab_fingerflip` (238) / `bsgrabtomutegrab_fingerflip` (239), and lands in `stalegrab` (78) / `mutegrab` (70) |
+| 3 | `Fingerflip` scoop | scores `stalegrab_fingerflip` (178) / `mutegrab_fingerflip` (177) |
+
+**The gap between the two scoops has to outlast the animation, not just the state change.** The
+grab-to-grab clips (`F_FLIP_fs_GRAB_TO_Stale`) are `interruptable="false"` and a gesture intent
+lives for a single tick, so a scoop thrown while that clip is still playing is simply dropped --
+the AG enters its `FingerFlip` state and publishes the MG intent, and nothing happens. Thirty
+ticks is enough; ten is not. A chain also needs a bigger takeoff boost to fit inside one air,
+and running out mid-chain lands as a wipeout rather than as a missed trick.
+
+Proven by `varial_out_of_a_plain_grab_reaches_the_stale_and_mute_family`.
+
 ## One-foot and no-foot, out of a held grab
 
 Every board-adjust grab carries the same three children, gated on the push buttons rather than on
