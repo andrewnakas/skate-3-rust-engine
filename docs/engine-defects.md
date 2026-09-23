@@ -727,3 +727,55 @@ retail than no voice.
 `SKATE_AUDIO_LANDING_COLLISION=1` restores them. **Recovering the controller term is the real fix;
 delete the switch and default it back on when that lands.**
 
+
+---
+
+## 10. Tricking out of a darkslide kills the session — **diagnosed from a live crash, exact chain known**
+
+Playtested 2026-09-23. Entering a darkslide is fine; throwing a trick *out of* one ends the
+process with
+
+```
+Physical state transition GrindDarkslide -> PhysicsAirSecondary requires its native
+Enter/Exit production adapter; state=GrindDarkslide; tick=3380
+```
+
+**The chain, all five links confirmed.**
+
+1. `MotionGraphIncludes/onboard.xml`'s `DarkSlideTrick` state -- gated on `HasIntent Trick` **and**
+   `IsDark` **and** `PhysFilteredState state="grind"` -- runs
+   `<behaviour name="CreateAttribute" attName="GrindTrick"/>` and forces the board to
+   `FORCE_ANIM_SKATEBOARD`.
+2. `animation/skeleton_input/extended_attributes.rs:147`: `"GrindTrick" => flags2484 |= 0x100000`.
+3. `player/selector/air.rs:138`, `select_grind`: `p.has_2484(0x10_0000)` returns
+   `PhysicalStateId::PhysicsAirSecondary` -- checked second, right after wipeout, so it wins over
+   every other grind exit.
+4. `physics/player_state/registry.rs` does not list `PhysicsAirSecondary` among its supported
+   states, so `can_transition` is false.
+5. `physics/player_state/transition.rs:92` turns that into an `Err`, which `GamePhysics` treats as
+   fatal.
+
+**It is darkslide-specific**, because `IsDark` gates step 1 -- the first occurrence in 67 committed
+playtest logs, which is why it survived this long. Ordinary grind trick-outs never set the bit.
+
+**What it blocks.** The whole darkslide-out family, scorables 321-330
+(`darkslideout_bsstraight/bsleft/bsright/fsstraight/fsleft/fsright`, `darktolightbsshuv`,
+`darktolightfsshuv`, `darktolightheelflip`, `darktolightkickflip`). All ten are named by the
+compiled graph and carry authored points -- see `docs/trick-reachability.md` -- so the only thing
+missing is the physical state their exit lands in.
+
+**What the fix needs.** `PhysicsAirSecondary` is state 202 with its own native lifecycle object at
+`PhysicalPlayer` offset **1716**, distinct from `PhysicsAir` 200 at 1712 (`player/state.rs`'s
+`native_owner_offset`). Its selector contract is already ported and is narrow: it is entered only
+while `flags_2484` bit 20 is set, and `selector/mod.rs:150` leaves it for `PhysicsAir` as soon as
+that bit clears, or for `WipeoutGround` on a wipeout. So it is a short, animation-driven air state
+-- the board is `FORCE_ANIM_SKATEBOARD` throughout -- rather than a second run of the air solver.
+
+Porting it means the registry entry, the `frame.rs` dispatch arm, the `transition.rs` Enter/Exit
+assertions, the `pre_state`/`publication`/`wipeout` arms, and a runtime module. **The one thing
+this repo does not contain is the native Enter/Update/Exit behaviour for the object at 1716** --
+no vtable or method addresses for it appear anywhere, unlike `PhysicsAir200`
+(`82D34388`/`82D346C0`/`82D346A0`, cited in `physics/air_phase.rs`) or `RevertGround102`
+(`vtable 82327330`, cited in `physics/revert_state.rs`). That has to come from the binary before
+the state can be written to this port's standard; guessing it would produce air physics that looks
+right and is not.
