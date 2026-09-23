@@ -25,6 +25,10 @@ but no playtest has exercised it -- that is the checklist, not a defect list: th
 audit proves a leaf publishes the name, not that its state is enterable, so only a
 playback test can promote a row to `proven`.
 
+The `seen` column counts credits in the committed `logs/` only. Many rows below are
+additionally proven by the playback suites, whose per-family controller recipes are
+in `docs/trick-input-recipes.md` -- start there before treating a row as work.
+
 `points, unnamed` has authored points but no crediting path; read its tag before
 treating it as work, since `generic-grind` marks the S2-era ids S3 superseded.
 `no record` has no VLT record at all -- `ScoringData::load` skips those, and its own

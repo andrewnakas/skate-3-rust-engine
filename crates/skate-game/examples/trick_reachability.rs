@@ -420,6 +420,10 @@ fn print_report(
     println!("audit proves a leaf publishes the name, not that its state is enterable, so only a");
     println!("playback test can promote a row to `proven`.");
     println!();
+    println!("The `seen` column counts credits in the committed `logs/` only. Many rows below are");
+    println!("additionally proven by the playback suites, whose per-family controller recipes are");
+    println!("in `docs/trick-input-recipes.md` -- start there before treating a row as work.");
+    println!();
     println!("`points, unnamed` has authored points but no crediting path; read its tag before");
     println!("treating it as work, since `generic-grind` marks the S2-era ids S3 superseded.");
     println!(
