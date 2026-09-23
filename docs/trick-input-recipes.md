@@ -27,7 +27,7 @@ look like a defect in the board-adjust branch. It is not.
 2. **Then the trigger.** `search_transitions` walks up from that leaf, finds `Idle`'s transition,
    and enters `TailGrab` from *inside* the board-adjust branch.
 
-Six ticks of stick lead is enough (`STICK_LEAD` in `tests/fingerflip_playback.rs`).
+Six ticks of stick lead is enough (`STICK_LEAD` in `tests/grab_playback.rs`).
 
 ## Grabs
 
@@ -95,16 +95,49 @@ the stick:
 
 | Addition | Intent | Button |
 |---|---|---|
-| `OneFootRight` | `RightPush` | A |
-| `OneFootLeft` | `LeftPush` | X |
-| `NoFootAirWalk` | `Dismount`, or both pushes at once | B |
+| `OneFootRight` | `RightPush` | A (`0x1000`) |
+| `OneFootLeft` | `LeftPush` | X (`0x4000`) |
+| `NoFootAirWalk` | `Dismount`, or both pushes at once | B (`0x2000`) |
 
-Out of the tailgrab that reaches `tailgrab_airwalk` (172); out of the nosegrab,
-`nosegrab_airwalk` (254). `air_playback.rs::airborne_tailwalk_from_raw_controller_reaches_stock_cycle`
-targets the first of these, but it rebuilds `BoardWorld` for a deeper landing and dies on
-`Canonical world has no authored query metadata` before it gets there -- the same hazard
-`docs/flip-ladder.md` records. Prefer the velocity-boost approach in `fingerflip_playback.rs`,
+| Trick | id | Grab | Button |
+|---|---:|---|---|
+| `tailgrab_onefoot_behind` | 169 | tailgrab | A |
+| `tailgrab_onefoot_front` | 168 | tailgrab | X |
+| `tailgrab_airwalk` | 172 | tailgrab | B |
+| `nosegrab_onefoot_behind` | 167 | nosegrab | A |
+| `nosegrab_onefoot_front` | 166 | nosegrab | X |
+| `nosegrab_airwalk` | 254 | nosegrab | B |
+
+The press has to arrive *after* the grab is holding. Pressed earlier it is an ordinary push and
+never reaches the grab's own children.
+
+`air_playback.rs::airborne_tailwalk_from_raw_controller_reaches_stock_cycle` targets
+`tailgrab_airwalk` too, but it rebuilds `BoardWorld` for a deeper landing and dies on `Canonical
+world has no authored query metadata` before it gets there -- the same hazard
+`docs/flip-ladder.md` records. The recipe above reaches it instead by boosting takeoff velocity,
 which leaves the canonical course's authored query metadata intact.
+
+## The `Grabbing` branch's own extras
+
+These hang off `GrabsTweaks` rather than off a board-adjust direction, so the stick stays centred
+and no stick lead is needed.
+
+| Trick | id | Trigger | Button |
+|---|---:|---|---|
+| `nofoot_air` | 138 | left | B |
+| `christ_air` | 59 | right | B |
+| `fs_onefoot_right` | 162 | left | A |
+| `fs_backfoot` | 163 | left | X |
+| `superman` | 252 | both | B |
+| `coffin` | 60 | both | A + X |
+
+`Superman` and `Coffin` are authored `active="false"` and reachable only through `DBLGrab`'s
+transitions. Superman additionally wants the *rising edge* of `Dismount` (`NewDismount`) on top
+of both triggers, so B has to be pressed while the double grab is already held rather than
+alongside it.
+
+Proven by `one_foot_and_no_foot_variants_reach_their_authored_grabs` and
+`centred_grab_extras_reach_their_authored_names`.
 
 ## Late flips
 

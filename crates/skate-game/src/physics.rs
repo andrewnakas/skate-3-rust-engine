@@ -585,8 +585,8 @@ mod wipeout_tests;
 mod flip_tests;
 
 #[cfg(test)]
-#[path = "tests/fingerflip_playback.rs"]
-mod fingerflip_tests;
+#[path = "tests/grab_playback.rs"]
+mod grab_tests;
 
 fn present(
     physics: Res<GamePhysics>,

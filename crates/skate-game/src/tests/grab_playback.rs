@@ -1,4 +1,5 @@
-//! The grab fingerflips -- "grab shove-its" -- and the grabs they are launched from.
+//! The air grab family: the grabs themselves, the fingerflips ("grab shove-its") thrown out of
+//! them, and the one-foot and no-foot variants added on top.
 //!
 //! A grab is a held trigger plus a right-stick direction, and the authored `BoardAdjust`
 //! branches turn the two into a named grab: `ActionGraphIncludes/BoardAdjustUp.xml` claims
@@ -31,7 +32,7 @@ fn held_grabs_reach_their_authored_names() {
         // stance-free double grab is what a two-trigger hold reaches.
         (&[0, 1][..], CENTRE, "dblgrab"),
     ] {
-        let run = replay(hands, stick, None, 300);
+        let run = replay(hands, stick, None, 0, 300);
         assert!(
             run.grabs.iter().any(|g| g.starts_with(grab)),
             "{grab}: hands={hands:?} stick={stick:?} never published it; saw grabs={:?} tricks={:?} over {:?}",
@@ -51,7 +52,7 @@ fn grab_fingerflips_reach_their_authored_tricks() {
         (&[0][..], UP, "tailgrab_fingerflip"),
         (&[1][..], DOWN, "nosegrab_fingerflip"),
     ] {
-        let run = replay(hands, stick, Some("Fingerflip"), 300);
+        let run = replay(hands, stick, Some("Fingerflip"), 0, 300);
         assert!(
             run.tricks.iter().any(|t| t == trick),
             "{trick}: the held grab plus scoop never published it; saw tricks={:?} grabs={:?} over {:?}",
@@ -73,7 +74,7 @@ fn grab_to_grab_fingerflip_shuvs_cross_the_board_adjust_branches() {
         (&[1][..], UP, "BS_Varial", "seatbelttonose_fingerflip"),
         (&[0][..], DOWN, "BS_Varial", "crailtotail_fingerflip"),
     ] {
-        let run = replay(hands, stick, Some(scoop), 300);
+        let run = replay(hands, stick, Some(scoop), 0, 300);
         assert!(
             run.tricks.iter().any(|t| t == trick),
             "{trick}: the {scoop} scoop never published it; saw tricks={:?} grabs={:?} over {:?}",
@@ -83,6 +84,63 @@ fn grab_to_grab_fingerflip_shuvs_cross_the_board_adjust_branches() {
         );
     }
 }
+
+/// One foot, then the other, then neither. Every board-adjust grab carries the same three
+/// children, gated on the push buttons rather than on the stick: `RightPush` (A), `LeftPush` (X),
+/// and `Dismount` (B) or both pushes together for the no-foot airwalk.
+#[test]
+#[ignore = "requires private stock graphs and animation assets"]
+fn one_foot_and_no_foot_variants_reach_their_authored_grabs() {
+    for (hands, stick, buttons, grab) in [
+        (&[0][..], UP, A, "tailgrab_onefoot"),
+        (&[0][..], UP, X, "tailgrab_onefoot"),
+        (&[0][..], UP, B, "tailgrab_airwalk"),
+        (&[1][..], DOWN, A, "nosegrab_onefoot"),
+        (&[1][..], DOWN, X, "nosegrab_onefoot"),
+        (&[1][..], DOWN, B, "nosegrab_airwalk"),
+    ] {
+        let run = replay(hands, stick, None, buttons, 300);
+        assert!(
+            run.grabs.iter().any(|g| g.starts_with(grab)),
+            "{grab}: stick={stick:?} buttons={buttons:#06x} never published it; saw grabs={:?} over {:?}",
+            run.grabs,
+            run.animations
+        );
+    }
+}
+
+/// The `Grabbing` branch's own extras. These hang off `GrabsTweaks` rather than off a
+/// board-adjust direction, so the stick stays centred and no stick lead is needed. `Superman`
+/// and `Coffin` are both authored `active="false"` and reached only by `DBLGrab`'s transitions:
+/// superman wants the rising edge of `Dismount` on top of both triggers, coffin wants both
+/// pushes instead.
+#[test]
+#[ignore = "requires private stock graphs and animation assets"]
+fn centred_grab_extras_reach_their_authored_names() {
+    for (hands, buttons, grab) in [
+        (&[0][..], B, "nofoot_air"),
+        (&[1][..], B, "christ_air"),
+        (&[0][..], A, "fs_onefoot_right"),
+        (&[0][..], X, "fs_backfoot"),
+        (&[0, 1][..], B, "superman"),
+        (&[0, 1][..], A | X, "coffin"),
+    ] {
+        let run = replay(hands, CENTRE, None, buttons, 300);
+        assert!(
+            run.grabs.iter().any(|g| g == grab),
+            "{grab}: hands={hands:?} buttons={buttons:#06x} never published it; saw grabs={:?} over {:?}",
+            run.grabs,
+            run.animations
+        );
+    }
+}
+
+/// Xbox face buttons as `XboxState::buttons` bits (`input::xbox::convert` maps bits 12..15 to
+/// slots 12..15). A is `RightPush`, X is `LeftPush`, B is `Dismount` -- the three inputs every
+/// board-adjust grab's one-foot and no-foot children are gated on.
+const A: u16 = 0x1000;
+const B: u16 = 0x2000;
+const X: u16 = 0x4000;
 
 const UP: [i16; 2] = [0, 32767];
 const DOWN: [i16; 2] = [0, -32767];
@@ -108,17 +166,21 @@ struct Outcome {
 
 /// Every scorable the graph can publish from a grab, so an unexpected one is reported by name
 /// rather than as a silent miss. Sourced from `scoring/catalog.rs`.
-const WATCHED: [&str; 24] = [
+const WATCHED: [&str; 34] = [
     "tailgrab",
     "tailgrab_left",
     "tailgrab_right",
     "tailgrab_fingerflip",
     "tailgrab_airwalk",
+    "tailgrab_onefoot_front",
+    "tailgrab_onefoot_behind",
     "nosegrab",
     "nosegrab_left",
     "nosegrab_right",
     "nosegrab_fingerflip",
     "nosegrab_airwalk",
+    "nosegrab_onefoot_front",
+    "nosegrab_onefoot_behind",
     "crailgrab",
     "crailgrab_left",
     "crailgrab_right",
@@ -128,14 +190,26 @@ const WATCHED: [&str; 24] = [
     "seatbeltgrab_right",
     "seatbelttonose_fingerflip",
     "rocketair",
+    "nofoot_air",
+    "christ_air",
     "fsgrab",
     "bsgrab",
     "fsgrab_fingerflip",
     "bsgrab_fingerflip",
     "dblgrab",
+    "superman",
+    "coffin",
+    "fs_onefoot_right",
+    "fs_backfoot",
 ];
 
-fn replay(hands: &[usize], stick: [i16; 2], scoop: Option<&str>, ticks: u32) -> Outcome {
+fn replay(
+    hands: &[usize],
+    stick: [i16; 2],
+    scoop: Option<&str>,
+    buttons: u16,
+    ticks: u32,
+) -> Outcome {
     let root =
         std::path::PathBuf::from(std::env::var_os("SKATE3_ASSET_ROOT").expect("SKATE3_ASSET_ROOT"));
     let assets = skate_data::GameAssets::load(&root).unwrap();
@@ -225,8 +299,15 @@ fn replay(hands: &[usize], stick: [i16; 2], scoop: Option<&str>, ticks: u32) -> 
             };
             (right, triggers)
         };
+        // The push/dismount buttons only mean a one-foot or no-foot once the grab is holding;
+        // pressed earlier they are an ordinary push and never reach the grab's own children.
+        let held_buttons = if airborne && air_ticks >= SETTLE {
+            buttons
+        } else {
+            0
+        };
         controller.sample_raw_for_test(skate_core::input::xbox::XboxState {
-            buttons: 0,
+            buttons: held_buttons,
             triggers,
             left: [0; 2],
             right,
