@@ -588,6 +588,10 @@ mod flip_tests;
 #[path = "tests/grab_playback.rs"]
 mod grab_tests;
 
+#[cfg(test)]
+#[path = "tests/revert_playback.rs"]
+mod revert_tests;
+
 fn present(
     physics: Res<GamePhysics>,
     history: Res<crate::presentation::Presentation>,

@@ -167,3 +167,33 @@ Ollie, then run a `skater_air.pat` scoop in the air: `L_F_Kickflip`, `L_B_Kickfl
 the 270-row trick mapping; they reach the MotionGraph as bare intents matched by `HasIntent`.
 Covered by `flip_playback.rs::air_scoops_reach_the_authored_late_flips`, and see that file's doc
 for why there is no late double, triple or quad.
+
+## Reverts
+
+Reverts are neither a flip nor a grab, they live on the **left** stick, and no scoring leaf ever
+spells them. `MotionGraphIncludes/revert.xml`'s `Fs` and `Bs` children are gated on `SlideFs180`
+/ `SlideBs180` from `skaterls.pat`, and each carries
+`<behaviour name="SetScoreAugmentation" augment="FSRevert" mirrorAugment="BSRevert"/>`.
+`ScorePacket::set` turns that into a flag bit -- `FSRevert` is bit 29, `BSRevert` bit 28 -- and
+`scoring_runtime` reads the two bits straight into `revert_id` 4 and 5.
+
+`Revert` is authored `active="false"`; `ground.xml` transitions into it from `Riding.Turning` and
+from `Riding.Sliding`, so it is thrown out of a turn or a powerslide.
+
+**Enter from a deflected stick, not a centred one.** Sweeping the arc from centre produces no
+slide gesture at all. `BackFlip`'s first authored coordinate sits within tolerance of centre, so
+idling has already advanced its node, and the arc's second point completes `BackFlip` one tick
+before the slide's third point completes the slide. Only one pattern wins a file, `permitted`
+then drops `BackFlip` because no grab is held, and `skaterls.pat` yields nothing. Holding the
+pattern's entry coordinate first leaves `BackFlip` parked at its first coordinate -- and is also
+how the trick is really thrown.
+
+**Sweep one coordinate per tick.** The recognizer culls a node after
+`NumTicksPatternNotInRangeBeforeCulling` ticks whose sample is not yet within tolerance of the
+next expected point, and that budget is read **per stick**; the left stick's is tighter than the
+right's. Three ticks per coordinate resets the node mid-pattern.
+
+A revert extends a line rather than opening one, so thrown on its own nothing is banked and the
+snapshot stays at zero. That is retail behaviour, not a gap.
+
+Proven by `tests/revert_playback.rs::left_stick_slides_reach_both_reverts`.
