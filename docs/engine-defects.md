@@ -730,7 +730,7 @@ delete the switch and default it back on when that lands.**
 
 ---
 
-## 10. Tricking out of a darkslide kills the session — **diagnosed from a live crash, exact chain known**
+## 10. Tricking out of a darkslide killed the session -- **fixed 2026-09-23; the state is inferred, not recovered**
 
 Playtested 2026-09-23. Entering a darkslide is fine; throwing a trick *out of* one ends the
 process with
@@ -779,3 +779,32 @@ no vtable or method addresses for it appear anywhere, unlike `PhysicsAir200`
 (`vtable 82327330`, cited in `physics/revert_state.rs`). That has to come from the binary before
 the state can be written to this port's standard; guessing it would produce air physics that looks
 right and is not.
+
+### Fixed by sharing PhysicsAir200's lifecycle -- and what is still unproven
+
+`PhysicsAirSecondary` is now wired at every seam it needs: the registry capability and
+transition pairs, the Enter/Exit dispatch, `frame.rs`'s per-tick advance, `pre_state`'s
+PredictFutureOfDeck list, `publication`'s Fill, and the wipeout probe. At all of them it runs
+**the recovered PhysicsAir200 lifecycle**, and that identification is an inference rather than a
+recovery -- there is no S2 debug build naming an S3-only state, which is the same reason the
+sixth (darkslide) grind family was the last thing ported.
+
+Five checks support it, all re-checkable from the tree:
+
+1. Owner offsets are adjacent, 1712 and 1716, which is how a second instance of one class
+   appears rather than a different class.
+2. `air_phase::enter` already branches on `previous_physics_category_2516 == 400`, the grind
+   family, so entry to air out of a grind was already a recovered path.
+3. Both 200 and `GroundAnimation103` enter through `enable_angular_only`, so this lifecycle does
+   not fight the `FORCE_ANIM_SKATEBOARD` the authored state sets. The crash line recorded
+   `force_mode=2`, which is exactly that mode.
+4. `selector/mod.rs` treats 202 as transient -- it leaves for 200 as soon as `flags_2484` bit 20
+   clears, and for `WipeoutGround` on a wipeout.
+5. 202 is only ever entered while the board is animation-driven, so any solver difference
+   between the two native objects has nothing to act on.
+
+**What would disprove it:** 202's native Update or Fill writing different PhysOut fields than
+200's. The symptom would be wrong air metrics, scoring or audio on darkslide exits -- never a
+crash. If a Skate 3 build with symbols ever turns up, this is the first thing to check, and the
+reasoning above is recorded in `player_state/transition.rs` at the shared arm so it is found
+from the code rather than only from here.

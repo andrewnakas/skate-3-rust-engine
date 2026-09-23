@@ -31,6 +31,7 @@ impl StateRegistry {
                 PhysicalStateId::Sleeping
                     | PhysicalStateId::PhysicsGround
                     | PhysicalStateId::PhysicsAir
+                    | PhysicalStateId::PhysicsAirSecondary
                     | PhysicalStateId::FootPlant
                     | PhysicalStateId::Boneless
                     | PhysicalStateId::HandPlant
@@ -75,6 +76,7 @@ impl StateRegistry {
                 | (
                     PhysicalStateId::PhysicsGround
                         | PhysicalStateId::PhysicsAir
+                        | PhysicalStateId::PhysicsAirSecondary
                         | PhysicalStateId::FootPlant
                         | PhysicalStateId::Boneless
                         | PhysicalStateId::HandPlant
@@ -90,6 +92,7 @@ impl StateRegistry {
                         | PhysicalStateId::LandingOnDeck,
                     PhysicalStateId::PhysicsGround
                         | PhysicalStateId::PhysicsAir
+                        | PhysicalStateId::PhysicsAirSecondary
                         | PhysicalStateId::FootPlant
                         | PhysicalStateId::Boneless
                         | PhysicalStateId::HandPlant
@@ -134,14 +137,10 @@ mod tests {
     /// turns that into a fatal error. Pinning the set here makes adding or removing one a
     /// reviewed edit instead of a crash somebody hits in a playtest.
     ///
-    /// * `PhysicsAirSecondary` (202, owner offset 1716) -- entered whenever `flags_2484` bit
-    ///   20 is set, which `onboard.xml`'s `DarkSlideTrick` does through its `GrindTrick`
-    ///   attribute. Blocks every darkslide trick-out, scorables 321-330. See
-    ///   `docs/engine-defects.md` #10.
     /// * `Skitching` (104) -- holding onto a vehicle.
     /// * `FollowPath` (105) -- scripted/living-world movement.
     #[test]
-    fn the_unported_states_are_exactly_the_documented_three() {
+    fn the_unported_states_are_exactly_the_documented_two() {
         let registry = StateRegistry::new();
         let unported: Vec<PhysicalStateId> = PhysicalStateId::ALL
             .into_iter()
@@ -149,11 +148,7 @@ mod tests {
             .collect();
         assert_eq!(
             unported,
-            vec![
-                PhysicalStateId::Skitching,
-                PhysicalStateId::FollowPath,
-                PhysicalStateId::PhysicsAirSecondary,
-            ],
+            vec![PhysicalStateId::Skitching, PhysicalStateId::FollowPath],
             "unported state set changed; update this list and docs/engine-defects.md"
         );
     }

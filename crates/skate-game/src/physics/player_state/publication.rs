@@ -23,6 +23,7 @@ pub(super) fn publish(physics: &mut GamePhysics, skater: &mut SkaterRuntime) -> 
             state,
             PhysicalStateId::PhysicsGround
                 | PhysicalStateId::PhysicsAir
+                | PhysicalStateId::PhysicsAirSecondary
                 | PhysicalStateId::FootPlant
                 | PhysicalStateId::Boneless
                 | PhysicalStateId::HandPlant
@@ -185,7 +186,10 @@ pub(super) fn publish(physics: &mut GamePhysics, skater: &mut SkaterRuntime) -> 
         physical.ground.flag_318 = u8::from(output.ground_32.is_pinning);
         physical.off_board.flag_304 = u8::from(output.is_grabbing_object_72_304);
         physical.animation.manual_opposition_168 = u8::from(output.manual_opposition_56_168);
-    } else if state == PhysicalStateId::PhysicsAir {
+    } else if matches!(
+        state,
+        PhysicalStateId::PhysicsAir | PhysicalStateId::PhysicsAirSecondary
+    ) {
         let air = skate_core::air::state::fill_physics_output(&skater.air_state);
         physical.air.landing_normal_144 = air.landing_normal.map(f32::to_bits);
         physical.air.jump_height_200 = air.jump_height;
