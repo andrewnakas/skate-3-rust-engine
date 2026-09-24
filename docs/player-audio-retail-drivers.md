@@ -771,3 +771,164 @@ is set. All of them land in `sub_824D2318` / `sub_824D20E8`, the manager this po
   `+660`, ids 95/113. The deck/board impact, not the body.
 - `sub_824DC2B0` — reads `+528..+556` and `+560..+580`; the body *scrape/slide* loop, already
   ported as `c_body_slide`.
+
+## 11. Measured retail transfer functions (2026-09-23)
+
+Extracted from `<drive>:\skate3-retail-captures\extract` (`state.tsv` joined to `board.tsv` and
+`updates/*.tsv` by mixer frame). These are the curves to compare a Rust playtest against; the
+percentile summaries earlier in this document are the same data without the speed axis.
+
+### Rolling: the grain players against ground speed (`+208`)
+
+Truck 0, both players, 18,545 frames. `A` is the primary player, `B` the one offset in the grain
+scan.
+
+| km/h | gain A | gain B | B/A | position A | position B |
+|---|---|---|---|---|---|
+| 0 | 0.0047 | 0.0006 | −18.1 dB | 0.002 | 0.001 |
+| 5 | 0.0613 | 0.0118 | −14.3 dB | 0.022 | 0.010 |
+| 10 | 0.1245 | 0.0595 | −6.4 dB | 0.121 | 0.043 |
+| 15 | 0.0721 | 0.0989 | **+2.7 dB** | 0.140 | 0.063 |
+| 20 | 0.1700 | 0.0078 | −26.8 dB | 0.407 | 0.308 |
+| 25 | 0.0950 | 0.0637 | −3.5 dB | 0.340 | 0.241 |
+| 30 | 0.1121 | 0.0567 | −5.9 dB | 0.394 | 0.295 |
+| 35 | 0.0829 | 0.0373 | −6.9 dB | 0.515 | 0.415 |
+| 40 | 0.1214 | **0.0000** | silent | 0.634 | 0.534 |
+| 45 | 0.0303 | **0.0000** | silent | 0.596 | 0.496 |
+
+Two things this settles:
+
+* **`position B = position A − 0.100`, exactly**, at every speed where both run. That confirms
+  `SECOND_OFFSET` (`grain/board.rs:111`) and the sign it is applied with.
+* **The B player is a *turning* layer, not a speed layer.** It peaks at 15 km/h — where a line has
+  the most carving in it — and is **silent at 40 km/h and above**. Gain A, meanwhile, stays roughly
+  flat at 0.08–0.17 from 10 km/h up; what changes with speed is the *position*, 0.12 → 0.63, which
+  is the Bezier walking further into the grain recording.
+
+That shape is what `f1164` predicts: `clamp(|COM velocity| × 0.24, cap) × turn_204`, slewed. Retail's
+`+204` is zero in **87%** of frames (n = 18,553, range −1..+1), so the B player is off during
+ordinary straight rolling however fast it is.
+
+**Why it matters.** If a port's turn input is non-zero most of the time, `f1164` stays up, the B
+player runs permanently, and because `gain_A` is scaled by `(1 − max(f1164, f1168))` the two layers
+sit at comparable level — the same grain recording played from two positions 0.1 apart. That is a
+doubled, phasey bed that gets worse with speed, and it is what "rolling fast sounds echoey" would
+sound like. This engine feeds `turn` from the animation `Turn` attribute
+(`physics/audio_observation.rs:336`), and every other consumer — `ControlFeedback.turn`
+(`animation_phase.rs:388`) and `StraightenInput.turn` (`ground_runtime/input.rs:186`) — reads the
+same field, so there is no better-recovered value sitting unused. **Whether it is wrong is
+empirical and needs a `SKATE_AUDIO_TRACE` playtest to settle: compare our `+204` against the 87 %
+figure above.**
+
+### Wind: `SenseOfSpeed_wind` against COM speed (`+212`)
+
+Posted frames only — the object is released below its 15 km/h bound.
+
+| km/h | w3 intensity | `clamp01((kmh−15)/40)×1000` | w7 level | dBFS | n |
+|---|---|---|---|---|---|
+| 15 | 51 | 0 | 210 | −43.9 | 4472 |
+| 20 | 154 | 125 | 2681 | −21.7 | 2203 |
+| 25 | 272 | 250 | 678 | −33.7 | 2050 |
+| 30 | 442 | 375 | 975 | −30.5 | 2631 |
+| 35 | 509 | 500 | 1521 | −26.7 | 1245 |
+| 40 | 624 | 625 | 3300 | −19.9 | 222 |
+| 45 | 683 | 750 | 683† | −20.4 | 55 |
+| 50 | 906 | 875 | 8246 | −12.0 | 34 |
+| 55 | 964 | 1000 | 8091 | −12.1 | 37 |
+
+† small n; the 45 and 50 km/h rows carry 55 and 34 frames.
+
+The intensity column tracks the ported formula within the error of a 5 km/h bin, so `w3` is right.
+The loudness is not in `w3` at all — it is **`w7`, the MixMap `level(4)`, a 32 dB ramp** from −44 dBFS
+at the 15 km/h post to −12 dBFS at 55. `SFXObj_SenseOfSpeed`'s outputs depend on state controller
+ids 7, 8, 9 and 14 (`mixmap_dump`'s dependency walk), which are the speed scales this port already
+writes — so wind level should follow once the speeds do. Compare a playtest's `w7` against this
+column before touching anything in `speed.rs`.
+
+### Validated headlessly, 2026-09-23: the position path is correct once surfaces are real
+
+`player_audio/headless.rs::headless_rolling_speed_and_surface_sweep` drives the retail path at a
+chosen speed and surface tag, which a playtest cannot do: retail's table above averages a session
+that crossed many surfaces, and the position is a Bezier of `speed / maxKmh` with `maxKmh` **per
+surface**. Position at one speed, by surface (A player, `SurfacePolicy::Retail`):
+
+| surface | 20 km/h | 30 km/h | 40 km/h |
+|---|---|---|---|
+| material 2 | 0.145 | 0.321 | 0.528 |
+| material 3 | 0.255 | 0.481 | 0.710 |
+| material 16 | 0.344 | 0.612 | 0.851 |
+| **material 41** | 0.328 | 0.487 | **0.641** |
+| material 53 | 0.145 | 0.321 | 0.528 |
+| **retail, mixed** | **0.407** | **0.394** | **0.634** |
+
+Retail's mixed average falls inside the per-surface spread at every speed, and material 41 — the
+most common surface in the University traces — lands within 0.007 of it at 40 km/h. **So the
+Bezier, `SECOND_OFFSET` and the per-surface `maxKmh` lookup are all right.** A playtest pinned to
+one surface reads as a position error that is really a surface difference; do not chase it without
+controlling the surface.
+
+**Retracted 2026-09-24: the A player's gain is not demonstrably off.** The paragraph below read a
++2.6 dB gain-A error out of a traced session. That comparison is confounded the same way the
+position one was, and the direct measurement does not support it.
+
+`gain_A = (1 - max(f1164, f1168)) x level(1)/32767 x ...`, so with turn and brake at zero the
+headless sweep measures `level(1)` itself: **0.215-0.254**, flat across all five surfaces. Retail's
+own `level(1)` is in the capture — `vf.tsv` slot 60, id 1, board controller `4A26A8A0`, single
+caller `0x824C6FEC` inside `sub_824C6BD8`, 19,304 reads:
+
+| p10 | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| 0 | 1 | **7859** | 10924 | 17536 |
+
+The near-zero median is the capture's idle and stationary time. The active-rolling value, p90, is
+**7859/32767 = 0.240** — inside the port's 0.215-0.254 band. So the MixMap output feeding the
+rolling bed matches retail, and what differs in a session is the `(1 - max(f1164, f1168))` term,
+which depends on turn, brake and the **per-surface intensity cap** — and the traced session was
+pinned to concrete with `SKATE_AUDIO_SURFACES=concrete` while retail's crossed many surfaces.
+
+Before re-opening this, measure `f1164` directly on both sides at a matched surface; do not infer a
+gain error from a session-average comparison again. *(Original paragraph retained below.)*
+
+**What was recorded as off: the A player's gain.** Measured in a real traced session (30,060 frames,
+`tools/audio_compare.py`), gain A is 0.1507 at 30 km/h against retail's 0.1121 — **+2.6 dB** — and
+runs 3-5 dB high from 25 km/h up. It is *not* surface-dependent (the sweep gives an identical
+0.215/0.226/0.254 on all five surfaces), so it is the `(1 - max(f1164, f1168)) x level(1)/32767`
+term, not the grain selection. Note the headless figure looks worse (~+8 dB) only because the
+fixture holds turn and brake at zero, which leaves `f1164`/`f1168` at zero and gain A at its
+ceiling; the traced session is the fair comparison.
+
+**Harness caveat.** The sweep faults with `SkateBoard process: at 0x40040000: no segment covers
+this address` on its **eleventh** rung, in ascending *or* descending speed order, so it is
+cumulative rather than speed-dependent — roughly 900 frames of teleporting the speed every 90
+frames. The 30,060-frame traced playtest shows no such fault and no observation overflow, so treat
+it as an artifact of the synthetic discontinuities, not a defect in play. Keep sweeps to under ten
+rungs per worker (`SKATE_SWEEP_SPEEDS` overrides the ladder).
+
+### The wind is correct, and how the bin-average comparison lied (2026-09-24)
+
+`SenseOfSpeed_wind` w7 **is** the MixMap `level(4)` — confirmed in the capture as controller
+`4A26A920`, caller `0x824E7FFC` inside `sub_824E7CB0`, 13,333 reads, exactly the number of wind
+packets. So the packet table above is already the direct comparison.
+
+Measured at **matched instantaneous speed** (retail binned to +/-0.5 km/h, median; this engine from
+`headless_rolling_speed_and_surface_sweep` at the exact speed):
+
+| km/h | retail n | retail median | this engine | error |
+|---|---|---|---|---|
+| 25 | 715 | 343 | 343 | **+0.0 dB** |
+| 30 | 947 | 730 | 697 | −0.4 dB |
+| 35 | 241 | 1194 | 1250 | +0.4 dB |
+| 40 | 67 | 2017 | 2081 | +0.3 dB |
+
+**The wind level tracks retail within 0.4 dB across its whole range.** Two earlier readings in this
+document claimed otherwise — first "much too quiet", then "~3 dB hot" — and both were artifacts of
+the comparison, not the engine.
+
+**The methodological trap, worth avoiding for every other family.** Retail's per-speed distribution
+is strongly right-skewed: at 40 km/h its mean is 3258 against a median of 2017, half a factor of
+two apart. Binning at +/-2.5 km/h and comparing *means* therefore inflates retail by 3-6 dB, and
+because the underlying curve is convex in speed a wide bin inflates it again. Use **narrow bins and
+medians at a matched instantaneous speed**, and compare against a headless rung driven at that
+exact speed. A session-average-versus-session-average comparison has now produced three false
+findings in this document (the grain position, the A player's gain, and the wind), each of which
+survived until it was measured this way.

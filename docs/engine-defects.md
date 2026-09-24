@@ -167,15 +167,48 @@ next playtest can answer the open questions instead of re-deriving them:
 **Fixed when.** A playtest `BC` trace on a stock map shows `mat560` resolving, and the owner has
 A/B'd a bail against retail.
 
-## 5. Surfaces are not implemented — **known, deliberate**
+## 5. Surfaces — **switched on 2026-09-23 for retail maps; portable maps still wrong**
 
-Everything runs on default surface 2 (concrete_rough). Retail routes rolling grains, seam patterns,
-wheel-pop sample categories, grind timbre and skid sounds per surface. Until surfaces exist, all of
-those are correct-but-monotonous: the right sound for concrete, everywhere, including on wood,
-metal and grass.
+*Originally: everything ran on default surface 2 (concrete_rough), which made rolling grains, seam
+patterns, wheel-pop categories, grind timbre and skid sounds correct-but-monotonous — the right
+sound for concrete everywhere, including wood, metal and grass. The exit condition was "the engine
+publishes real per-wheel audio materials and the map's seam pattern". It does.*
 
-**Fixed when.** The engine publishes real per-wheel audio materials and the map's seam pattern
-(`surface_tag >> 12 & 0xF`), so the already-ported per-surface tables get exercised.
+**Verified before flipping it.** `WorldTriangle.tag` carries the retail RWCM per-triangle
+`surface: u16` verbatim — decoded at `crates/skate-data/src/retail_collision.rs:186-190`, forwarded
+at `crates/skate-game/src/skate_world.rs:172`, read back through `board_world.rs:236` →
+`riding_outputs.rs:301` → `board_ground.rs:90` as `tag & 0x7f`. The `& 0x7f` split is confirmed
+independently by the vendor extraction tool
+(`tools/vendor/university/tools/vanilla_map_extraction/blender/import_hawaiian_dream.py:480`), and
+`SKATE_AUDIO_OBSERVE=1` traces on University show a dozen distinct ids — 1, 3, 4, 5, 8, 16, 17,
+41, 42, 53, 66, 79 — with 41 and 3 dominant. The seam pattern (`tag >> 12 & 0xF`) is published too
+(`board_ground.rs:92`); the note in `docs/player-audio-retail-drivers.md:92` calling it "discarded"
+is stale.
+
+`BoardConfig::from_env` now defaults to `SurfacePolicy::Retail`.
+**`SKATE_AUDIO_SURFACES=concrete` restores the pinned behaviour** so the two can be A/B'd in one
+session.
+
+Landed with it: `Board::rolling_kmh`'s out-of-range fallback was `0.0`, which makes `speed_word`'s
+`v / kmh` infinite and pegs the rolling speed word at its 10000 clamp for every speed. It was
+unreachable while every surface was forced to 2 and becomes reachable the moment the non-grain
+selectors (9–12) can be chosen. It is now `DEFAULT_ROLLING_KMH` (45.0), which is what
+`sub_824C6B30(-1)` returns. The owner's vault array has 16 entries —
+`[70, 65, 65, 70, 100, 45, 45, 45, 45, 35, 45, 45, 45, 45, 45, 45]` km/h — so every selector is
+covered and nothing was actually hitting the bad path.
+
+**Still wrong: portable `.skate` maps.** `skate_world.rs:324` computes the correctly packed
+`m.audio | (m.physics << 7) | (m.pattern << 12)` but stores it **only** in `packed_surfaces`; the
+triangle's `tag` at `:336` takes `source.surface`, which the Blender exporter writes as a running
+per-object counter (`tools/vendor/university/tools/blender_owned_map/.../exporter.py:3127`,
+`:3443`). So on a non-RWCM map `tag & 0x7f` is the low seven bits of an object index and the real
+audio id never reaches the wheel lines. `skate_world.rs:1331-1346` asserts `packed_surfaces` and
+nothing asserts `tag`, which is how the two drifted. Fix `tag` to take the packed value and assert
+it.
+
+Also expected and not a decode failure: RWCM units with bit `0x80` clear decode to `surface = 0` →
+material "none" (143), and if all four wheels sit on such triangles the vote falls back to surface
+1 (`ground_runtime/surface.rs:37`).
 
 ## 6. Physics NaN torque crash on landing — **seen once, no repro**
 
@@ -227,7 +260,14 @@ four launches before it never hit it. Audio was up and healthy at the time (`pla
 241 Treatment packets traced), so it is a renderer-side race on surface destruction, not audio.
 Intermittent, so it needs repeated launches or a GPU-validation run to pin down.
 
-## 9. Rail / grind landing sounds are not driven — **known gap, needs engine inputs**
+## 9. Rail / grind landing sounds are not driven — **mostly closed; only `PopRoll` is left**
+
+*(Header corrected 2026-09-23. The grind onset **is** posted and voiced now --
+`ContactsOwner::grind_onset` then `ContactVoicePlayer::post_grind_onset`,
+`contact_voices.rs:731-814` -- so a rail landing is no longer silent. What remains dropped with
+a label is `ContactSound::PopRoll` (`contact_voices.rs:581-586`), which still needs
+`[manager+668]` / `sub_82486EF0`. The rest of this entry is the original investigation and is
+still the reference for the chain.)*
 
 Landing *onto* a rail makes no grind-onset sound. `ContactSound::GrindOnset` and
 `ContactSound::PopRoll` are deliberately dropped in `player_audio/contact_voices.rs` rather than
@@ -724,8 +764,11 @@ step measured +0.5 dB against retail's +4.8. A/B'd by the owner at the same trim
 correct". So they default **off**, because a voice at a knowingly wrong level is further from
 retail than no voice.
 
-`SKATE_AUDIO_LANDING_COLLISION=1` restores them. **Recovering the controller term is the real fix;
-delete the switch and default it back on when that lands.**
+**Corrected 2026-09-23: this is stale.** Commit `0bfcb22` flipped the default back **on** when
+`collision_controller_scale` supplied the missing controller term from retail's captured reads,
+so today the switch reads `SKATE_AUDIO_LANDING_COLLISION=0` to turn them *off*
+(`contact_voices.rs:377`). That median table is itself a stand-in -- see defect 13 below, which
+recovers the authored values it approximates.
 
 
 ---
@@ -840,3 +883,298 @@ happening. Skitching has no sibling at 1772, is long-lived and physics-active, a
 **Do it with the Skate 2 symbols instead.** Skitching is an S2 feature, so unlike the S3-only
 `PhysicsAirSecondary` the debug build that named the rest of this port names it too. Port it when
 there is traffic to test against, and take the names from there rather than guessing.
+
+---
+
+## 12. Heavy landings were silent on three surface categories out of four — **fixed 2026-09-23**
+
+Filed after the owner reported that landings "all sound alike" and that *this port's* low ollies
+sound unlike retail's while its bigger drops sound about right.
+
+### Measured first, both sides
+
+Retail's own landing curve, from `.local/captures/retail-lowollie-20260920-205434.log` — `OUT`
+block peaks over the twelve frames after `Class_Treatment` word 7 returns to zero, binned by the
+air time that word carried (35 landings):
+
+| air ms | n | retail mean dBFS |
+|---|---|---|
+| 0–120 | 4 | −8.0 |
+| 120–500 | 16 | −5.2 |
+| 500–1000 | 6 | −2.5 |
+| 1000+ | 9 | **+2.0** |
+
+**Use means, not p50s, and do not over-read them.** Retail's peaks scatter about **8 dB inside a
+single air-time band** — the 1000 ms+ band alone runs −2.8, −2.0, −1.2, −1.2, +2.3, +4.3, +4.6,
++6.8, +7.0 — so a p50 over the three or four landings a narrow band holds lands near its maximum.
+An earlier revision of this entry binned narrowly and quoted p50s, which put the top band at +6.8
+and overstated the shortfall below by about 5 dB.
+
+This engine, through its own worker over the same rungs
+(`player_audio/headless.rs::headless_landing_ladder_matches_retails_curve`, native six-channel
+peak — the meter the recomp's output pass logs, so the two compare directly):
+
+| air ms | this engine | retail | error |
+|---|---|---|---|
+| 50 | −7.1 | −8.0 | +0.9 |
+| 100 | −4.7 | −8.0 | +3.3 |
+| 150 | −4.7 | −5.2 | +0.5 |
+| 250 | −4.7 | −5.2 | +0.5 |
+| 450 | −4.8 | −5.2 | +0.4 |
+| 800 | −2.8 | −2.5 | −0.3 |
+| **1200** | **−3.7** | **+2.0** | **−5.7** |
+
+Every rung is within about 1 dB except the two ends. The range is the problem: **4.3 dB across the
+whole ladder against retail's 10 dB**, and a 1.2 s drop comes out *quieter* than a 0.8 s one when
+it should be louder. That is what "all landings sound alike" is.
+
+The rungs feed retail's own median jump height per band (`Class_Treatment` word 9 =
+`height × 166.667`: 0.28 / 0.37 / 1.00 / 1.81 m), because holding it constant mismeasures the
+heavy end. Doing so changed no rung by a measurable amount, which is itself a result: the
+Treatment layer is not what carries a landing's weight here.
+
+### The bug: `sub_824BA3F0`'s mode mask was inverted
+
+`LandingTuning::class_sample` chose the mode array as `if class >= 2 { category } else { 0 }`.
+Retail does the opposite. From the lifted code at `0x824BA420` (`skate3_recomp.11.cpp:25062`):
+
+```text
+cmpwi  cr6,r31,2        ; r31 = kind
+bgt    cr6,loc_824BA444 ; kind > 2 skips the mask entirely
+li     r11,2
+subfc  r9,r11,r25       ; r25 = class; carry = (class >= 2)
+subfe  r7,r10,r8        ; r7 = ~0 + carry -> 0 when carry, 0xFFFFFFFF when not
+and    r3,r7,r3         ; category &= r7
+```
+
+`and` with 0 **clears** the category, so a class-2 landing reads mode 0 and the lighter classes
+read their category.
+
+It mattered because `Skate_Collisions.bnk` authors the class-2 slot in mode 0 only. Modes 1, 2 and
+3 point at containers 204, 193 and 215, whose records (`0x02a0..=0x02a2`, `0x0277..=0x0279`) hold
+**zero groups and a zero duration** — 27 such placeholder records in nine runs of exactly three,
+out of 871. With the polarity inverted, every heavy landing on categories 1, 2 and 3 resolved to
+one of those and played **nothing**. Measured through
+`crates/skate-game/examples/landing_sample_levels.rs`, before and after:
+
+| | class 2, cat 0 | cat 1 | cat 2 | cat 3 |
+|---|---|---|---|---|
+| before | 6 members, +12.2 dB | **0 members** | **0 members** | **0 members** |
+| after | 6 members, +12.2 dB | 6, +12.2 | 6, +12.2 | 6, +12.2 |
+
+`class_sample` had **no test**, which is how it survived; there is one now
+(`a_class_two_landing_reads_mode_zero_and_the_lighter_classes_read_their_category`).
+
+The headless ladder above does **not** move, because its fixture sits on category 0 — the one
+combination that was already correct. The fix bites in play, where the per-wheel material varies
+(University traces show ids 1, 3, 4, 5, 8, 16, 17, 41, 42, 53, 66, 79). Extending the ladder to
+sweep categories is the obvious follow-up, and would have caught this.
+
+### Still open: the remaining ~8 dB of the class step
+
+With the polarity fixed the ladder is unchanged, so the 5.7 dB shortfall at class 2 is a separate
+problem. What it is **not**, each checked:
+
+* Not a missing class. The class resolves 0/0/0/0/1/2 across the rungs (the landing diagnostic now
+  prints it).
+* Not missing voices. `SKATE_AUDIO_VOICE_TRACE=1` counts 71 opens at the class-2 rung against 72
+  at class 1.
+* Not the member delays. The class-2 container's members draw 0–154 ms against samples 475–890 ms
+  long, so they do overlap.
+* Not extra retail voices. `sub_824BA630` calls `sub_824B8D48` exactly once.
+* Not the Treatment layer — see the jump-height note above.
+
+What it looks like instead is **a ceiling on the mechanism**. A landing is four or five voices of
+similar level, and only one of them — the class voice — varies with the class. Its own variation
+is the member-gain step (0.838 → 0.842, i.e. +0.04 dB on the loudest member; +1.1 dB on the sum)
+plus `landing_send_scale`'s +1.4 dB, so about **+2.5 dB on one voice out of four or five**, which
+comes out under +1 dB at the output. Retail moves the whole landing by ~10 dB. So retail's step is
+carried by something this port applies flat, and neither the send (a 3.0 dB spread, probed) nor
+the samples (a 5.8 dB spread, measured) is big enough on its own.
+
+**Use RMS, not peak.** Retail's landing *peak* scatters 25.8 dB inside a single air band, so it
+cannot resolve a 5 dB effect. Its block **RMS** — the `rms` field of the same `OUT` line, which
+`trace::output` also writes — is clean and monotonic:
+
+| air ms | n | retail RMS | this engine (mean of 6 landings) | error |
+|---|---|---|---|---|
+| 0–120 | 4 | −22.9 | −20.5 / −19.5 | +2.4 / +3.4 |
+| 120–500 | 16 | −20.8 | −19.5 | +1.3 |
+| 500–1000 | 6 | −17.4 | −17.9 | −0.5 |
+| 1000+ | 9 | **−12.8** | **−18.8** | **−6.0** |
+
+Retail rises 10.1 dB from the lightest band to the heaviest. This engine rises 2.6 dB and then
+*falls* at class 2. The 500–1000 ms band matches within half a dB, so the path is not broadly
+wrong — the heavy end is.
+
+**Retail's own send is measured and this port already matches it.** The capture records 70 `VF`
+reads by `0x824B8E88` — `sub_824B8D48`'s read of the landing voice's owner send, two per landing.
+Matched to each landing's class by air time:
+
+| class | n | min | p50 | max |
+|---|---|---|---|---|
+| 0 | 33 | 2572 | **2584** | 3650 |
+| 2 | 13 | 2578 | **3646** | 3650 |
+
+(The stray extremes are the second read of the pair, taken across the frame that writes input 2.)
+That is exactly `LANDING_SEND_BY_CLASS` and exactly what `contacts_input_probe` measured, so the
+send path here is correct and is **not** where the missing step is.
+
+**The class step the authored data can actually supply is about +1.4 dB, and that is the whole
+problem.** An earlier revision of this entry claimed the content steps +6.5 / +11.2 / +12.2 dB
+across the classes, measured over 400 draws. That was an artifact: a fresh `SpliceState` always
+picks the same kid of a container, so 400 draws measured one kid 400 times. What matters is the
+mean over a *live* state, and by kid count the class-2 container is **not** the louder one:
+
+| class | container | kids | children per kid | mean |
+|---|---|---|---|---|
+| 1 | 181 | 11 | 5,6,5,5,6,7,7,6,6,5,5 | **5.73** |
+| 2 | 182 | 4 | 6,5,5,5 | **5.25** |
+
+Confirmed in the game path: `SKATE_AUDIO_VOICE_TRACE=1` counts **41.7** voice opens per landing at
+the 800 ms rung against **39.8** at 1200 ms — class 2 opens *fewer*, despite its script being
+longer. So the only real class step is `landing_send_scale`'s +1.4 dB, partly cancelled by the
+smaller container, which is why the measured class 1 → class 2 step is −0.9 dB.
+
+**Retail gets +5.4 dB there (−17.4 → −12.8) from something this port does not model.** Neither the
+send (3.0 dB across all three classes, and measured as correct above) nor the samples (no step)
+accounts for it. Ruled out along the way: the MixMap (sweeping Contacts input 2 from 0 to 32767
+raises outputs 3 and 15 and pulls *nothing* down); the measurement window (a 1.0 s RMS window puts
+class 1 and class 2 equal at −25.8, so it is not energy spread over longer samples); the record
+layout (the unparsed record words +0, +28 and +32 are all zero, so `value_range` really is 0 and
+the container value is a constant 1.0); and delayed members being dropped (`drain` collects every
+handle into `self.live` and ticks them).
+
+The remaining candidate is `sub_824BA630`'s own call to `sub_82486EF0` — the contact message whose
+`+0x20`/`+0x24` level words this port leaves at zero (`contact_voices.rs:726-730`). That is the
+one term in the landing that is both unported and per-landing. Recover it before touching any gain.
+
+**The arithmetic of the dilution.** A landing's voice gains here, with `CONTACT_TRIM` 0.625 and
+`LANDING_TRIM` 0.274 both applied:
+
+| voice | class 0 | class 2 |
+|---|---|---|
+| fixed impact `0x447` | 0.124 | 0.124 (constant) |
+| ladder `0x35C`…`0x35F` | ~0.12 | ~0.12 (constant) |
+| class voice | 0.759 × 0.708 × trims = **0.092** | 0.842 × 1.000 × trims = **0.144** |
+| two collision voices | 0.030 / 0.050 | 0.030 / 0.050 |
+| **sum** | **0.336** | **0.388** |
+
+The class voice's own step is a healthy +3.9 dB, but it is under a third of the stack, so the total
+moves **+1.2 dB** — which is what the ladder measures, to a tenth of a dB. The two constant voices
+are what hold the step down, and the same two are what make the 50–100 ms rungs 0.9–3.3 dB *too
+loud*. One cause, both ends of the error.
+
+So the question is why retail's constant voices do not dominate its landing the same way. Note
+that `sub_824BA630` makes **no** `vfunc60` read of its own in the capture — the only landing-time
+reads are `0x824B8E88` (the class voice) and `0x824B9E48` (the pop) — so retail's impact and
+ladder voices take no owner send either, and should be at their authored member gain just as they
+are here. The next measurement is therefore the **member resolution**: container 182 has four
+record kids and this port resolves six members from it, so check `pick`'s mode-2 selection and
+`plays()` against `sub_82975A60` / `sub_829757D0`, and confirm how many members retail actually
+opens for the impact and ladder containers versus the class one. `LANDING_TRIM` is a blanket
+constant over all three and is the obvious thing to be wrong if retail's are not equal.
+
+## 13. The contact bus has no emitter, so every contact voice takes a constant level
+
+`sub_824D2318` gives a contact voice `controllerOutput × messageLevel × materialLevel`, and this
+port supplies the controller term from `collision_controller_scale`'s table of medians scraped
+from retail captures, because "every one of these outputs reads 0" in the live runtime.
+
+**Why they read 0, found 2026-09-23.** `mixmap_dump`'s dependency walk says `SFXObj_Collision`'s
+outputs depend on `40010010.7`, `60010000.9`, `60010800.9` and `60030000.99` — and *not* on the
+Collision controller's own inputs 0/1, which is why `collision_output_probe`, which sweeps exactly
+those, has always seen zeros. A new probe
+(`crates/skate-audio-core/examples/player_input_probe.rs`) drove each candidate against the real
+MixMap under the retail preroll:
+
+* Contacts inputs 7 and 8, Collision inputs 0 and 1, and the remote player's state id 9 move
+  **nothing**.
+* VU id 0 — which `FREE_SKATE_MUSIC_VU` pins at 32767, and which was suspected of holding the mix
+  down — moves `SkateBoard level(7)` from 858 to 861 across its whole range: **0.03 dB**. Ruled
+  out; leave the pin alone.
+* **Bit 0 of input 15 of the Collision object's own 3D-position controller `60030000`** switches
+  the entire bus on. `ObjPos::update` (`mixmap/inputs.rs:517-529`) or-s that bit in when the
+  emitter has a position. **This port never creates a 3D emitter for the collision object**, so
+  the bit is never set.
+
+With it set the ten category outputs come alive, and they are **distance-attenuated** —
+attenuation contact sounds in this port do not have at all:
+
+| distance | cat 0 (out 13) | dB vs near field |
+|---|---|---|
+| 0–1 m | 10325 | 0.0 |
+| 3 m | 9118 | −1.1 |
+| 10 m | 5277 | −5.8 |
+| 30 m | 402 | −28.2 |
+| 100 m | 0 | silent |
+
+Near-field values against the medians they would replace. The two agree on shape, and the medians
+read about 1.3 dB low because retail's captured reads average over distance — which is itself
+evidence the attenuation is real:
+
+| cat | out | probe @0 m | median stand-in | delta |
+|---|---|---|---|---|
+| 0 | 13 | 10325 | 8869 | +1.3 dB |
+| 1 | 14 | 24657 | 22153 | +0.9 dB |
+| 2 | 15 | 9202 | 6079 | +3.6 dB |
+| 3 | 16 | 9202 | 7923 | +1.3 dB |
+| 4 | 17 | 16365 | 14669 | +1.0 dB |
+| 5 | 18 | 9202 | 7923 | +1.3 dB |
+| 6 | 12 | 9202 | 8126 | +1.1 dB |
+| 7 | 19 | 9202 | 7923 | +1.3 dB |
+| **8** | **21** | **4110** | **7923** | **−5.7 dB** |
+| 9 | 20 | 9202 | 7913 | +1.3 dB |
+
+**Fixed when** the contact-sound manager is given a real emitter. `contact_voices.rs:726-730`
+already records that the contact message's world-position field is left at zero, and that same
+position is what `ObjPos::update` needs. Drive `60030000` from it each frame the way `sound.rs`
+drives `SKATER_POSITION_CONTROLLER` / `BOARD_POSITION_CONTROLLER`, then read the category output
+in `collision_controller_scale`'s place and delete the table.
+
+
+## 14. The landing class step, re-measured properly — **real, and the only rolling/landing defect left**
+
+Defect 12 measured this from one capture with wide air-time bins and means. Five other findings in
+this project died to exactly that method (see `player-audio-retail-drivers.md` §11's note). This
+one survives it.
+
+**Method.** 60 landings pooled from three captures — `retail-lowollie-20260920-205434.log`,
+`retail-nomusic-20260920-082353.log` and `retail-levels-20260920-004114.log` — taking the **median**
+block RMS in the twelve frames after `Class_Treatment` word 7 returns to zero. The engine's column
+is `headless_rolling_speed_and_surface_sweep`'s sibling, the landing ladder, at the same window.
+
+| air ms | n | retail median | this engine | error |
+|---|---|---|---|---|
+| 0–150 | 5 | −22.6 | −20.5 | +2.1 |
+| 150–350 | 6 | −18.3 | −19.5 | −1.2 |
+| 350–600 | 15 | −19.3 | −19.4 | **+0.1** |
+| 600–900 | 25 | −14.1 | −17.9 | **−3.8** |
+| 900–1300 | 9 | −12.0 | −18.8 | **−6.8** |
+
+Retail spans **10.6 dB** from its lightest band to its heaviest; this engine spans **2.6 dB**. The
+mid-range matches to a tenth of a dB, so nothing is broadly wrong — the deficit is entirely at the
+heavy end and grows with air time.
+
+**What the authored data can supply, and why it is not enough.** The send is +3.0 dB across the
+three classes and is *correct* — retail's own reads at `0x824B8E88` measure 2584 at class 0 and
+3646 at class 2, exactly what `LANDING_SEND_BY_CLASS` encodes. The sample content supplies no step
+at all: by container kid count the class-2 container averages **fewer** members than the class-1
+one (5.25 against 5.73), and the game path confirms it — 39.8 voice opens per landing at class 2
+against 41.7 at class 1. Net authored step is about +1.4 dB, partly cancelled. Retail moves the
+landing by 8–10 dB.
+
+**Ruled out** (each measured, not argued): the MixMap (sweeping Contacts input 2 from 0 to 32767
+raises outputs 3 and 15 and pulls nothing down); the measurement window (a 1.0 s RMS window puts
+classes 1 and 2 equal); the record layout (the unparsed record words are all zero, so the container
+value really is a constant 1.0); dropped delayed members (`drain` collects every handle and ticks
+them); and the Treatment layer (feeding retail's own per-band jump heights changed no rung).
+
+**Where to look next.** `components/contacts.rs:398` lists as unported *"the landing voices past
+the first"*, with vault fields `F262042EAA295711` = 860 and `1E86469556ACD80A` = 862 — that is
+`0x35C` and `0x35E`, the **ladder** samples — behind thresholds 0.1 / 0.3 / 0.65 / 0.75 / 1.0 in
+landing-weight units. Five thresholds on a term that currently plays one voice is the right shape
+for a missing 7 dB. **But note the call structure does not obviously support it**: in the lifted
+`sub_824BA630`, `sub_824B8D48` and `sub_82486EF0` each appear exactly once, so any extra voices are
+not started by a loop there. Read the function properly before acting; do not infer voice counts
+from call counts.
