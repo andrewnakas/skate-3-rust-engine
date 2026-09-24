@@ -354,12 +354,36 @@ impl LandingTuning {
 
     /// `sub_824BA3F0`: the sample for the `sub_824B8D48` voice.
     ///
-    /// The index is `3 × kind + class`, and the mode is the surface category
-    /// ([`surface_category`]) — but only for a class-2 landing: `sub_824BA3F0` masks the mode with
-    /// `class >= 2`, so a light or medium landing always reads mode 0. A landing calls
-    /// `sub_824B8D48(this, 0, max_class, 0)`, i.e. `kind = 0`.
+    /// The index is `3 × kind + class`; the mode is the surface category
+    /// ([`surface_category`]) **except on a class-2 landing, where it is forced back to 0**. A
+    /// landing calls `sub_824B8D48(this, 0, max_class, 0)`, i.e. `kind = 0`.
+    ///
+    /// The polarity is the retail one, read off the lifted code at `0x824BA420`
+    /// (`skate3_recomp.11.cpp`), because it was inverted here until 2026-09-23 and that inversion
+    /// silenced every heavy landing on three surface categories out of four:
+    ///
+    /// ```text
+    /// cmpwi  cr6,r31,2        ; r31 = kind
+    /// bgt    cr6,loc_824BA444 ; kind > 2 skips the mask entirely
+    /// li     r11,2
+    /// subfc  r9,r11,r25       ; r25 = class; carry = (class >= 2)
+    /// subfe  r7,r10,r8        ; r7 = ~0 + carry -> 0 when carry, 0xFFFFFFFF when not
+    /// and    r3,r7,r3         ; category &= r7
+    /// ```
+    ///
+    /// `and` with 0 *clears* the category, so class 2 reads mode 0 and the lighter classes read
+    /// their category — the opposite of what the comment here used to claim. It matters because
+    /// `Skate_Collisions.bnk` authors the class-2 slot only in mode 0: modes 1, 2 and 3 point at
+    /// containers 204, 193 and 215, whose records (`0x02a0..=0x02a2`, `0x0277..=0x0279`) carry
+    /// **zero groups and a zero duration** — 27 such placeholder records in nine runs of three.
+    /// Reading them for a heavy landing yields no members at all, which measured as a 1.2 s drop
+    /// landing 10.5 dB below retail and *quieter than* a 0.8 s one.
     pub fn class_sample(&self, kind: u32, class: u32, category: u8) -> Option<u16> {
-        let mode = if class >= 2 { usize::from(category) } else { 0 };
+        let mode = if kind > 2 || class < 2 {
+            usize::from(category)
+        } else {
+            0
+        };
         let index = 3 * kind as usize + class as usize;
         self.class_modes.get(mode)?.get(index).copied()
     }
@@ -421,6 +445,42 @@ mod tests {
     }
 
     #[test]
+    /// `sub_824BA3F0`'s mode mask, in the direction the lifted code actually has it: the surface
+    /// category selects the mode for a light or medium landing, and a class-2 landing is forced
+    /// back to mode 0. The inverse — which this port shipped until 2026-09-23 — reads
+    /// `Skate_Collisions.bnk`'s empty placeholder records for a heavy landing on categories 1..3
+    /// and plays nothing at all.
+    #[test]
+    fn a_class_two_landing_reads_mode_zero_and_the_lighter_classes_read_their_category() {
+        let landing = LandingTuning {
+            sample: 0,
+            ladder: [[0; 2]; 2],
+            ladder_seconds: 0.75,
+            class_modes: [
+                (0..13).map(|i| 0x100 + i).collect(),
+                (0..13).map(|i| 0x200 + i).collect(),
+                (0..13).map(|i| 0x300 + i).collect(),
+                (0..13).map(|i| 0x400 + i).collect(),
+            ],
+        };
+        // kind 0, classes 0 and 1: the category picks the row.
+        for category in 0..4u8 {
+            let row = 0x100 + 0x100 * u16::from(category);
+            assert_eq!(landing.class_sample(0, 0, category), Some(row));
+            assert_eq!(landing.class_sample(0, 1, category), Some(row + 1));
+        }
+        // kind 0, class 2: every category collapses to mode 0.
+        for category in 0..4u8 {
+            assert_eq!(
+                landing.class_sample(0, 2, category),
+                Some(0x102),
+                "class 2 must read mode 0 whatever the category"
+            );
+        }
+        // `bgt cr6,loc_824BA444`: a kind above 2 skips the mask, so the category survives.
+        assert_eq!(landing.class_sample(3, 2, 1), Some(0x20b));
+    }
+
     fn the_sample_follows_the_class_the_category_and_the_dlc_case() {
         let t = tuning();
         assert_eq!(t.sample(0, 0, false), Some((COLLISIONS_BANK, 0x449)));

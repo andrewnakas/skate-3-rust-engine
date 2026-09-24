@@ -875,7 +875,8 @@ impl ContactVoicePlayer {
         let level_a = scale_level(level_surface, self.landing_gain_a);
         let level_b = scale_level(level_board, self.landing_gain_b);
         self.report(&format!(
-            "Landing surface={surface} board={board} tier={tier} air={air_time:.3} weight={weight:.3} levels={level_a}/{level_b}"
+            "Landing surface={surface} board={board} class={:?} tier={tier} air={air_time:.3} weight={weight:.3} levels={level_a}/{level_b}",
+            request.landing_class
         ));
         // Retail's own guard: either level at 0 and there is no message.
         if level_a == 0 || level_b == 0 {
@@ -1128,7 +1129,10 @@ impl ContactVoicePlayer {
                 (sample != 0).then_some((self.landing.bank(), sample, OneshotBus::Default))
             }
             // `sub_824B8D48` via `sub_824BA3F0`: index `3 × kind + class` with `kind = 0` for a
-            // landing, and the mode is the surface category only for a class-2 landing.
+            // landing, and the mode is the surface category *except* on a class-2 landing, where
+            // `and r3,r7,r3` clears it back to 0. See [`LandingTuning::class_sample`], which
+            // carries the lifted code: this comment had the polarity backwards until 2026-09-23,
+            // and the heaviest landings were silent on three categories out of four as a result.
             //
             // The class is the largest `+448` bucket over the wheels that are in contact
             // (`+464`), exactly as `sub_824BA630`'s tail computes it for MixMap input 2. Retail
