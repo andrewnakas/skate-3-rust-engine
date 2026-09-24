@@ -808,3 +808,35 @@ Five checks support it, all re-checkable from the tree:
 crash. If a Skate 3 build with symbols ever turns up, this is the first thing to check, and the
 reasoning above is recorded in `player_state/transition.rs` at the shared arm so it is found
 from the code rather than only from here.
+
+---
+
+## 11. Skitching is unported, and deliberately left that way — **decided 2026-09-23**
+
+State 104 has no adapter, so `registry.rs` pins it alongside `FollowPath` as the two remaining
+unported states. That is a decision, not an oversight.
+
+**Nothing is recovered.** Only two fragments carry native addresses -- `82D8BBB8`
+(`condition_is_off_ground_skitching`) and `82BBBC88` (the `state == 104` graph query). There is no
+Enter/Update/Exit for the object at offset 1772. The graph half is stubbed to match:
+`EnterSkitchingBehaviour`, `SkitchingBehaviour` and `SkitchShimmyingBehaviour` parse but have no
+execute arm, and `IsSkitchShimmying`, `IsSkitchingWithAbsorb` and `SkitchingPosition` are three of
+the seven unimplemented graph conditions.
+
+**Nothing can enter it.** Entry needs `flags_2476` bit 21 (`is_grabbing_object_72_304`, itself from
+the riding state's `flag_2729`) together with `flags_2480` bit 22, and `skitch_value_40` is the
+grabbed object's id. The living-world vehicle AI that would supply one is entirely unported --
+`ContinueFollowingLane`, `WanderOnRoad`, `ContinuePullingOver` and the rest have no
+implementation -- and `MovingObjectRegistry::register("ram:/world/objects/car")` appears only
+inside a unit test. The `skate-vehicles` SDK is a separate simulation the player rides; it has no
+grab or skitch interaction.
+
+**Why not infer it the way `PhysicsAirSecondary` was.** That worked because the inference was both
+constrained and *checkable*: adjacent owner offsets, an already-recovered air lifecycle that fit,
+a transient animation-driven state with little physics to get wrong, and a crash that stopped
+happening. Skitching has no sibling at 1772, is long-lived and physics-active, and -- decisively
+-- cannot be entered, so an inferred implementation could never be shown right or wrong.
+
+**Do it with the Skate 2 symbols instead.** Skitching is an S2 feature, so unlike the S3-only
+`PhysicsAirSecondary` the debug build that named the rest of this port names it too. Port it when
+there is traffic to test against, and take the names from there rather than guessing.
