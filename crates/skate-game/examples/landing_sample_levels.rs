@@ -109,11 +109,25 @@ fn voice(banks: &SpliceBanks, bank: &str, sample: u16, label: &str, starts: &[us
         Some((eff, peak, _)) => format!("  peak {:+6.1} dBFS -> {:+6.1} dBFS", db(peak), db(eff)),
         None => String::from("  (not decoded)"),
     };
+    // Whether the members *stack* is the question the sum cannot answer: a sum of 4.055 across six
+    // members is only +12.2 dB if they overlap. `play_oneshot` holds a member for its `delay`
+    // before opening it, so a spread of delays wider than the samples are long means the peak
+    // never sees more than one of them.
+    let delays: Vec<String> = members
+        .iter()
+        .map(|m| format!("{:.3}", m.values.delay))
+        .collect();
+    let widest = members.iter().fold(0.0f32, |a, m| a.max(m.values.delay));
     println!(
         "  {label:<22} sample {sample:#06x}  members {:<2}  loudest gain {loudest:.3} ({:+6.1} dB)  sum {sum:.3} ({:+6.1} dB){decoded}",
         members.len(),
         db(loudest),
         db(sum),
+    );
+    println!(
+        "  {:<22} delays [{}] s, widest {widest:.3} s",
+        "",
+        delays.join(" ")
     );
 }
 
@@ -205,10 +219,86 @@ fn main() {
             }
         }
     }
+    // DIAGNOSTIC: a zero-group record still carries its five floats. If those carry a redirect
+    // (to another record, or to another bank) that is what the empty class-2 rows really mean;
+    // if they are the same shape as a normal record's, the records are authored-silent.
+    if let Some(splc) = banks.bank(bank) {
+        // DIAGNOSTIC: 12 of a record's 36 bytes are unparsed (+0..+3 and +28..+35). If the
+        // container gain base/range live there rather than at +12/+16, `container_value` returns a
+        // constant 1.0 and every landing comes out the same level -- which is what the ladder
+        // measures (2.5 dB of landing-to-landing spread against retail's 8 dB).
+        if let Some(raw) = banks.bank_bytes(bank) {
+            use skate_audio_formats::splc::{HEADER_BYTES, RECORD_BYTES};
+            let f = |at: usize| f32::from_be_bytes(raw[at..at + 4].try_into().unwrap());
+            let u = |at: usize| u32::from_be_bytes(raw[at..at + 4].try_into().unwrap());
+            println!("  raw record words (+0 +4 +8 +12 +16 +20 +24 +28 +32), floats beneath:");
+            for i in [0x024eusize, 0x024f, 0x0298, 0x029b, 0x026e, 0x0277] {
+                let at = HEADER_BYTES + RECORD_BYTES * i;
+                let words: Vec<String> = (0..9).map(|k| format!("{:08x}", u(at + 4 * k))).collect();
+                let floats: Vec<String> =
+                    (0..9).map(|k| format!("{:>8.3}", f(at + 4 * k))).collect();
+                println!("    rec {i:#06x}  {}", words.join(" "));
+                println!("              {}", floats.join(" "));
+            }
+        }
+        println!("  zero-group records vs their neighbours (id, children, the five fields):");
+        let show = |i: usize| {
+            let r = &splc.records[i];
+            println!(
+                "    rec {i:#06x} id {:#06x} ch {:2}  u8 {:12.5}  base {:12.5}  range {:12.5}  u20 {:12.5}  u24 {:12.5}",
+                r.id,
+                r.children,
+                r.unknown_8,
+                r.value_base,
+                r.value_range,
+                r.unknown_20,
+                r.unknown_24
+            );
+        };
+        for i in [0x0277usize, 0x0278, 0x0279, 0x02a0, 0x02a1, 0x02a2] {
+            show(i);
+        }
+        println!("    -- normal ones for comparison --");
+        for i in [0x026eusize, 0x029b, 0x024e, 0x0298] {
+            show(i);
+        }
+    }
     // DIAGNOSTIC: every mode row, not just the one `class_sample` would pick, so a row that is
     // entirely unresolvable is distinguishable from a single bad id.
     for (mode, row) in landing.class_modes.iter().enumerate() {
         println!("  mode {mode} ids {:04x?}", row);
+    }
+    // DIAGNOSTIC: one draw is not the answer -- the container picks one record kid of several and
+    // each group draws one member, so the resolved gain varies per landing. Average many draws to
+    // see whether the *authored content* actually steps with the class, independently of the
+    // 3.0 dB send that `landing_send_scale` applies on top.
+    println!("  resolved gain over 400 draws (the content's own class step, send excluded):");
+    for class in 0..3u32 {
+        let mut sums = Vec::new();
+        let mut counts = Vec::new();
+        for seed in 1..401u32 {
+            let Some(sample) = landing.class_sample(0, class, 0) else {
+                continue;
+            };
+            let mut state = SpliceState::default();
+            let mut rand = Rand::new(seed);
+            if let Ok(members) = banks.resolve(bank, sample, &mut state, &mut rand) {
+                sums.push(members.iter().map(|m| m.values.gain).sum::<f32>());
+                counts.push(members.len() as f32);
+            }
+        }
+        if sums.is_empty() {
+            continue;
+        }
+        let mean = sums.iter().sum::<f32>() / sums.len() as f32;
+        let members = counts.iter().sum::<f32>() / counts.len() as f32;
+        sums.sort_by(f32::total_cmp);
+        println!(
+            "    class {class}: mean gain {mean:.3} ({:+5.1} dB)  min {:.3}  max {:.3}  mean members {members:.2}",
+            db(mean),
+            sums[0],
+            sums[sums.len() - 1],
+        );
     }
     for class in 0..3u32 {
         for category in 0..4u8 {

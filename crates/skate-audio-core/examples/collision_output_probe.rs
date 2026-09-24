@@ -1,5 +1,12 @@
 //! Which Contacts controller outputs move when the landing-weight input moves?
 //!
+//! **This example's premise is wrong, kept because the negative result is worth having.**
+//! `mixmap_dump`'s dependency walk shows the Collision controller's outputs do not depend on
+//! its own inputs 0 and 1 at all -- which is exactly what this sweeps -- so the zeros it prints
+//! are not evidence that the bus is dead. The switch is bit 0 of input 15 of the Collision
+//! object's 3D-position controller `60030000`; see `player_input_probe.rs` and defect 13 in
+//! `docs/engine-defects.md`.
+//!
 //! `ContactsInputs::process` writes input 2 from the landing class (1 -> 16000,
 //! 2 -> 32767, else 0), but the landing one-shot takes a constant gain, so a
 //! curb drop and a roof gap open at the same level. To route the one-shot
