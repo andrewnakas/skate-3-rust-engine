@@ -176,10 +176,12 @@ pub(crate) fn output(native: &[f32], channels: usize, stereo: &[f32]) {
 pub(crate) fn state(a: &AudioState, inputs: &RetailAudioInputs) {
     with(|t| {
         t.line(format_args!(
-            "AS st={} cat={} v208={:.3} wheels200={} tilt264={:.4} air332={} grind341={} feet615={} feet616={} slip232={:.4} trick348={} bail676={} walk716={} down724={} down725={} land448={:?} landed464={:?}",
+            "AS st={} cat={} v208={:.3} com212={:.3} turn204={:.4} wheels200={} tilt264={:.4} air332={} grind341={} feet615={} feet616={} slip232={:.4} trick348={} bail676={} walk716={} down724={} down725={} land448={:?} landed464={:?}",
             inputs.state,
             inputs.state_category,
             a.ground_speed_208,
+            a.com_speed_212,
+            a.turn_204,
             a.wheel_count_200,
             a.deck_tilt_264,
             u8::from(a.in_known_air_332),
@@ -197,6 +199,40 @@ pub(crate) fn state(a: &AudioState, inputs: &RetailAudioInputs) {
         ));
     });
     body(a);
+}
+
+/// The board's four grain-player records, in the retail capture's `BD` sense.
+///
+/// The capture's own `BD` line carries the whole `GrainPlayer` object; this carries the four words
+/// the owner writes into it each frame (`sub_824C6BD8`), which is what
+/// `docs/player-audio-retail-drivers.md` §11 tabulates against ground speed. Without it a playtest
+/// cannot be compared against that table at all, and the B player's gain is the one number that
+/// says whether the offset second layer is running when retail's would be silent.
+///
+/// `a`/`b` are the two players of a truck: `GR <truck> a=<gain>,<pitch>,<position> b=...`.
+pub(crate) fn grain_records(truck: usize, a: (f32, f32, f32), b: (f32, f32, f32)) {
+    if truck < 2 {
+        // Kept whether or not a trace file is open: the headless sweep reads these back directly
+        // rather than parsing its own trace, and a trace file is a playtest concern.
+        *LAST_GRAIN[truck].lock().unwrap_or_else(|p| p.into_inner()) = Some((a, b));
+    }
+    with(|t| {
+        t.line(format_args!(
+            "GR {truck} a={:.6},{:.4},{:.4} b={:.6},{:.4},{:.4}",
+            a.0, a.1, a.2, b.0, b.1, b.2
+        ));
+    });
+}
+
+type GrainPair = ((f32, f32, f32), (f32, f32, f32));
+static LAST_GRAIN: [Mutex<Option<GrainPair>>; 2] = [Mutex::new(None), Mutex::new(None)];
+
+/// The last `{gain, pitch, position}` pair written for a truck, for the headless sweeps.
+pub(crate) fn last_grain_records(truck: usize) -> Option<GrainPair> {
+    *LAST_GRAIN
+        .get(truck)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
 }
 
 /// The ragdoll contact fields, on their own line and only while a bail is doing something.

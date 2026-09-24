@@ -106,7 +106,8 @@ pub(crate) enum SurfacePolicy {
     /// `sub_824C82A8` through the vault's AudioSurfaceMap.
     Retail,
     /// Retail's no-contact result (14) is kept; every other result becomes this surface. The
-    /// accepted default is 2 (concrete_rough).
+    /// accepted default is 2 (concrete_rough). Kept as the `SKATE_AUDIO_SURFACES=concrete`
+    /// fallback so the two can be A/B'd in one session.
     Default(u32),
 }
 
@@ -128,7 +129,36 @@ impl Default for BoardConfig {
             local: true,
             first_player: true,
             global_flag: false,
-            surfaces: SurfacePolicy::Default(2),
+            surfaces: SurfacePolicy::Retail,
+        }
+    }
+}
+
+impl BoardConfig {
+    /// The live configuration, with the surface policy taken from the environment.
+    ///
+    /// Retail routes each truck's rolling grain, seam pattern, skid and grind timbre through the
+    /// vault's `Sk8::AudioSurfaceMap` from the per-wheel material. This port pinned every
+    /// in-contact surface to 2 (concrete_rough) while the engine's materials were not trusted;
+    /// they now are. `WorldTriangle.tag` carries the retail RWCM per-triangle `surface: u16`
+    /// verbatim (`skate-data/src/retail_collision.rs:186-190` →
+    /// `skate-game/src/skate_world.rs:172`), and `SKATE_AUDIO_OBSERVE=1` traces on University show
+    /// a dozen distinct ids — 1, 3, 4, 5, 8, 16, 17, 41, 42, 53, 66, 79 — with 41 and 3 dominant.
+    ///
+    /// `SKATE_AUDIO_SURFACES=concrete` restores the pinned behaviour for an A/B.
+    ///
+    /// **Portable `.skate` maps are a known exception** and still wrong: `skate_world.rs:324`
+    /// packs the real id into `packed_surfaces` but the triangle's `tag` at `:336` takes
+    /// `source.surface`, which the Blender exporter writes as a per-object counter. Riding one of
+    /// those gives surfaces derived from an object index. Recorded in `docs/engine-defects.md` 5.
+    pub(crate) fn from_env() -> Self {
+        let surfaces = match std::env::var("SKATE_AUDIO_SURFACES").as_deref() {
+            Ok("concrete") => SurfacePolicy::Default(2),
+            _ => SurfacePolicy::Retail,
+        };
+        Self {
+            surfaces,
+            ..Self::default()
         }
     }
 }
@@ -353,7 +383,14 @@ impl BoardVault {
         if layer < 0 {
             return DEFAULT_ROLLING_KMH;
         }
-        self.rolling_kmh.get(layer as usize).copied().unwrap_or(0.0)
+        // `sub_824C6B30(-1)`'s own fallback, not 0.0: a zero divisor makes `speed_word`'s
+        // `v / kmh` infinite and pegs the speed word at its 10000 clamp for every speed. The
+        // owner's vault array has 16 entries so every selector is covered, but the fallback has
+        // to be the retail one for a shorter array not to fail silently.
+        self.rolling_kmh
+            .get(layer as usize)
+            .copied()
+            .unwrap_or(DEFAULT_ROLLING_KMH)
     }
 }
 
@@ -1821,6 +1858,11 @@ impl Component for Board {
                 boost_kmh: primary.boost_kmh,
             };
             let [a, b]: [GrainRecord; 2] = grain_board::board_records(&tuning, &input);
+            super::super::trace::grain_records(
+                t,
+                (a.gain, a.pitch, a.position),
+                (b.gain, b.pitch, b.position),
+            );
             let [pa, pb] = self.trucks[t].players;
             let mut grains = tick.runtime.grains();
             grains.set_record(pa, a).map_err(|e| e.to_string())?;

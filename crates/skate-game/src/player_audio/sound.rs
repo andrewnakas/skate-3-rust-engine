@@ -396,7 +396,7 @@ pub(crate) fn build(
             &mut tick,
             BoardVault::load(assets)?,
             &grains,
-            BoardConfig::default(),
+            BoardConfig::from_env(),
         )?
     };
     let (wheels_vault, wheel_members) = wheels::load(assets, cache)?;
